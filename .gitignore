@@ -1,0 +1,26 @@
+node_modules/
+.turbo/
+dist/
+coverage/
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+
+# 本地素材只作为迁移来源，按需挑选后再提交。
+素材/
+
+# 本地编辑器与操作系统文件。
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 一次性本地提取和锁文件生成目录。
+.e3-archive-stage/
+.e3-exact/
+.lock-stage/
+.meliora-gitignore.keep

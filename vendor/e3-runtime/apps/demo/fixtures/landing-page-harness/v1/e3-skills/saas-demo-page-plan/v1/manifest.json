@@ -1,0 +1,80 @@
+{
+  "contractVersion": "formal-r3-e3-s0-skill-package-manifest-v1",
+  "packageId": "repo-saas-demo-page-plan",
+  "packageVersion": "1.0.0",
+  "resource": {
+    "resourceId": "saas-demo-page-plan-recipe",
+    "relativePath": "SKILL.md",
+    "mediaType": "text/markdown; charset=utf-8",
+    "contentHash": "79f4528b0ccdbd736c69e592d5480695a9c34961a997d562aa6f34b59b56bb19"
+  },
+  "definition": {
+    "contractVersion": "formal-r3-skill-definition-v1",
+    "skillId": "saas-demo-page-plan",
+    "skillVersion": "1.0.0",
+    "title": "SaaS Demo Page Plan",
+    "purpose": "Produce one bounded, evidence-aware plan for a SaaS demo booking page without Canvas writes.",
+    "mode": "prompt_recipe",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal"],
+      "properties": {
+        "goal": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answer"],
+      "properties": {
+        "answer": { "type": "string", "minLength": 1, "maxLength": 16000 }
+      }
+    },
+    "requiredTools": [
+      {
+        "toolId": "canvas_inspect",
+        "versionRange": "h1-effective-facts-inspect-v1",
+        "requiredEffect": "private_read"
+      }
+    ],
+    "optionalTools": [],
+    "requiredUxContracts": [
+      {
+        "contractId": "ux-effective-facts-read",
+        "versionRange": "1.0.0"
+      }
+    ],
+    "requiredCapabilities": ["canvas.read.effective-facts.h1"],
+    "promptFragments": [
+      {
+        "resourceId": "saas-demo-page-plan-recipe",
+        "contentHash": "79f4528b0ccdbd736c69e592d5480695a9c34961a997d562aa6f34b59b56bb19"
+      }
+    ],
+    "workflowDefinitionRef": null,
+    "dependencies": [],
+    "budgets": {
+      "maxToolCalls": 1,
+      "maxNestedSkillDepth": 0,
+      "maxContextBytes": 32768,
+      "maxWallTimeMs": 20000
+    },
+    "evidencePolicy": {
+      "requiredReceiptEffects": ["canvas-read-observed"],
+      "completionRubricRef": "saas-demo-page-plan-rubric",
+      "claimPolicyId": "canvas-read-observed"
+    },
+    "unavailablePolicyId": "h1-unavailable-rule"
+  },
+  "rubric": {
+    "rubricId": "saas-demo-page-plan-rubric",
+    "version": "1.0.0",
+    "requirements": [
+      "actual_same_run_canvas_read_receipt_for_page_fact_claims",
+      "explicit_unknowns_when_evidence_is_missing",
+      "no_canvas_write_or_publish_claim",
+      "plan_covers_audience_message_sections_cta_constraints"
+    ]
+  }
+}

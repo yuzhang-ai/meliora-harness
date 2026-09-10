@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "react"]
+  },
+  "include": [
+    "apps/demo/lib/**/*.ts",
+    "apps/demo/config/**/*.ts",
+    "packages/core/globals.d.ts"
+  ]
+}
