@@ -126,11 +126,12 @@ WP-A read-only runtime + WP-C store
 | BoardUI 参考核验 | 你 + Codex | Completed | 页面结构与可见状态已核对 |
 | 干净 E3 来源基线 | 你 + Codex | Completed locally | orphan main + source commit provenance |
 | E3 独立闭包与回归 | 你 + Codex | Verified locally | typecheck + 5 组 characterization tests |
-| Contract-first PR | 你 + Codex | Ready for PR | 正式 packages 契约已建立；DeepSeek/Kimi Codec、Action Gate、Memory Store contract tests 与独立 G3 复审通过 |
-| Web Shell | 张子恒 | Backlog | 依赖 fixtures |
-| Store/Server skeleton | 秦峻溥 | Backlog | 依赖 Store contract |
+| Contract-first PR | 你 + Codex | Merged | PR #3 已合并至 main `3f2e24f0`；CI、全量 check 与独立审查通过 |
+| Read-only Runtime | 你 + Codex | Ready for PR | Issue #4；五个只读工具与真实 Host/Store/Run loop 集成门禁通过，独立安全复审 PASS |
+| Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
+| Store/Server skeleton | 秦峻溥 | Ready | Issue #2；基于合并后的 SessionStorePort 开工 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice 已在 `feat/runtime-contracts` 本地分支达到 Ready for PR。获得提交/推送授权后，先在干净安装环境复跑 CI 并建立小 PR；随后并行启动只读 Workspace Host skeleton、Provider 错误 fixtures，以及 Web/Store 两条消费契约的工作包。
+Contract-first slice 已通过 PR #3 合并到 `main`。`feat/runtime-read-only-loop` 已完成 Issue #4 的五个只读工具、Workspace Host、Provider 错误 fixtures、最小 Run loop 与真实无密钥集成门禁，下一步建立小 PR 并等待 CI；张子恒、秦峻溥分别从 Issue #1、#2 的冻结契约并行开工。
