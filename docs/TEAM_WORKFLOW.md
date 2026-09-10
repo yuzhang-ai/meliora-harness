@@ -1,7 +1,7 @@
 # 团队施工与 GitHub 规范
 
 > 状态：Active
-> 版本：v0.1
+> 版本：v0.2
 > 权威范围：三人分工、上下文交接、分支、PR、Issue 和集成顺序
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../MELIORA_MASTER_PLAN.md)
@@ -49,11 +49,13 @@ docs/architecture
 Task title
 Owner
 Base SHA
+Decision baseline
 Required docs
 Problem
 In scope
 Out of scope
 Allowed directories
+Non-negotiables
 Contracts consumed
 Contracts produced
 Fixtures
@@ -61,6 +63,12 @@ Acceptance checks
 Commands
 Security constraints
 Dependencies
+Risk level
+Agent role
+Independent reviewer
+Drift questions
+Evidence required
+Write authority
 Expected PR
 ```
 
@@ -91,7 +99,35 @@ Acceptance: contract tests, migration tests, recovery tests, sensitive field sca
 Expected PR: adapter + migration + tests + verification evidence
 ```
 
-## 4. 分支与 PR
+## 4. Codex 多 Agent 开发工作制
+
+Codex 主 Agent 是开发编排与交付的唯一总控。主 Agent 负责读取权威文档和当前 Git 状态、冻结任务契约、拆分工作包、安排依赖和合并顺序、控制并发写入范围、回收子 Agent 结果、解决冲突、最终验证并向用户汇报。子 Agent 的结论是输入，不自动成为项目决策。
+
+除非任务或用户另有要求，开发子 Agent 默认使用 `gpt-5.6-terra` + `high` reasoning。每个子 Agent 只领取一个清晰、可独立验收的角色：
+
+- 研究/架构审查：核对现有实现、权威文档、依赖和方案边界。
+- 实现：只在 Context Packet 允许的目录内完成一个工作包并提供验证证据。
+- 独立代码审查：不修改自己刚完成的实现，检查缺陷、契约和安全边界。
+- 偏航检查：对照总纲、当前阶段和专项文档判断方向是否漂移。
+- 验证：复跑测试、fixture、build、浏览器或恢复场景，不以实现者口头结论替代证据。
+
+实施与最终独立审查不得由同一个子 Agent 完成。多个实现 Agent 并发时必须拥有互不重叠的目录或文件；共享契约仍遵守 Contract-first 和同一时间只有一个 Ready PR 的规则。子 Agent 未获主 Agent 明确授权不得提交、推送、部署、改变共享契约、扩大目录范围或执行破坏性操作。
+
+子 Agent 回收格式统一为：`PASS / HOLD / FOLLOW-UP`、证据、发现的问题、风险级别、最小修复建议。主 Agent 必须检查实际 diff 与验证输出后才能采用结论。
+
+### 五道协作门
+
+| Gate | 进入条件 | HOLD 条件 |
+|---|---|---|
+| G0 派工 | 任务已冻结目标、Base SHA、范围/非范围、允许目录、权威文档、风险和验收 | Context Packet 不完整或写权限不清楚 |
+| G1 契约 | 共享契约、权限、持久化、公开事件或新依赖已有影响审查和 fixture 计划 | Agent 并行实现前各自发明字段或语义 |
+| G2 实现 | 有可复现命令、实际输出、diff/readback 或 UI 证据 | 只有代码修改或自述，没有验证证据 |
+| G3 独立审查 | 独立 Terra 高思考 Agent 已核对任务契约、架构边界、安全、文档/fixture/test 和范围 | 方向偏移未关闭；实现者自审代替独立审查 |
+| G4 主 Agent 集成 | 主 Agent 已处理冲突、复跑关键验证并区分本地、CI、远端和生产状态 | 关键验证未复跑或结论相互矛盾 |
+
+以下情况直接 HOLD：绕过 Port 调用具体实现；把模型文本或 Skill 当作权限；只改实现不更新受影响的 contract/fixture/test；重新引入 UX/Canvas 产品依赖；在 Public Event 中泄露私有 reasoning 或敏感字段；把 M0 非目标包装为顺手支持。
+
+## 5. 分支与 PR
 
 ```text
 main
@@ -111,13 +147,13 @@ chore/<topic>
 
 PR 模板必须包含：问题、范围/非范围、契约影响、自动验证、人工验证、风险、回滚、文档更新。
 
-## 5. Contract-first
+## 6. Contract-first
 
 共享契约先通过小 PR 冻结类型、示例事件和 fixtures，再并行实现。契约未合并前，调用方只使用 Draft PR 或约定 fixture，不得各自复制和改名。
 
 同一时间只允许一个修改同一共享契约的 PR 进入 Ready。契约合并后，受影响分支立即同步 `main`。
 
-## 6. GitHub 保护
+## 7. GitHub 保护
 
 `main` 建议启用：
 
@@ -130,7 +166,7 @@ PR 模板必须包含：问题、范围/非范围、契约影响、自动验证�
 
 GitHub 用户名齐全后添加 CODEOWNERS。共享契约由架构 Owner，Web 由张子恒，Store/Server integration 由秦峻溥。
 
-## 7. Issue 状态
+## 8. Issue 状态
 
 只使用 Architecture/Contract、Feature Slice、Defect 三类 Issue。
 
@@ -142,7 +178,7 @@ Ready：Owner、Context Packet、输入契约/fixture、验收命令和目录范
 
 Done：PR 已合并、required checks 通过、真实路径验证完成、必要 UI 人工验收有记录、稳定事实变化已更新权威文档。
 
-## 8. 集成顺序
+## 9. 集成顺序
 
 1. 共享 contracts 与 fixtures。
 2. 秦峻溥的 Store Port 和 Server skeleton。

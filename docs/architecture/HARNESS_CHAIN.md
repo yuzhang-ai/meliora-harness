@@ -29,7 +29,8 @@ submit turn
 
 - **Session**：一个工作区中的长期对话容器。
 - **Turn**：一次用户输入及其触发的完整处理。
-- **Run**：Turn 的一次可恢复执行实例。
+- **Run**：Turn 的稳定执行聚合，指向当前或最近的 Run Attempt。
+- **Run Attempt**：Run 的一次实际执行。恢复不会让终态回退，而是创建编号递增的新 Attempt。
 - **Model Step**：一次 Provider 请求和响应。
 - **Tool Invocation**：一次规范化工具调用。
 - **Receipt**：工具执行及验证的不可混淆证据。
@@ -52,7 +53,8 @@ created
 
 规则：
 
-- 终态不可回退，恢复操作创建新的 attempt。
+- 状态属于 Run Attempt；Run 只保存 active/latest attempt 指针。
+- Attempt 终态不可回退，恢复操作创建新的 attempt。
 - 状态变化先持久化，再向前端投影。
 - 同一个 Run 同时只有一个有效 lease owner。
 - `awaiting_approval` 不占用 Provider 请求。

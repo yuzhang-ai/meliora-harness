@@ -88,6 +88,7 @@ event_id
 schema_version
 session_id
 run_id
+sequence
 timestamp
 kind
 payload
@@ -107,6 +108,8 @@ visibility=public
 | Public UI | 用户理解 | 摘要、状态、diff、验证和可操作按钮 |
 
 三者禁止共用一个未经处理的 payload。
+
+公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`，不能直接暴露内部 Artifact ID 字符串。
 
 ## 7. Outcome Contract
 

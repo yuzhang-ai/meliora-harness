@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": [
+    "packages/**/*.ts",
+    "fixtures/contracts/**/*.ts",
+    "tests/contracts/**/*.ts"
+  ],
+  "exclude": ["vendor", "apps", "node_modules"]
+}

@@ -106,6 +106,7 @@ WP-A read-only runtime + WP-C store
 - 公共 Run Event、Tool、Workspace Host、Store 和 Outcome contracts 已合并。
 - CI 运行 typecheck、unit、contract 和 fixture replay。
 - 三位成员都能从 Context Packet 独立启动各自工作。
+- 每个进入集成的共享契约或跨模块工作包都有主 Agent 集成记录，以及独立 Agent 的偏航审查结论。
 - 没有先删除 UX/Canvas，也没有把完整页面编辑器迁入产品目录。
 
 ## 7. 明确不做
@@ -125,11 +126,11 @@ WP-A read-only runtime + WP-C store
 | BoardUI 参考核验 | 你 + Codex | Completed | 页面结构与可见状态已核对 |
 | 干净 E3 来源基线 | 你 + Codex | Completed locally | orphan main + source commit provenance |
 | E3 独立闭包与回归 | 你 + Codex | Verified locally | typecheck + 5 组 characterization tests |
-| Contract-first PR | 你 + Codex | Ready | 下一工作包 |
+| Contract-first PR | 你 + Codex | Ready for PR | 正式 packages 契约已建立；DeepSeek/Kimi Codec、Action Gate、Memory Store contract tests 与独立 G3 复审通过 |
 | Web Shell | 张子恒 | Backlog | 依赖 fixtures |
 | Store/Server skeleton | 秦峻溥 | Backlog | 依赖 Store contract |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-下一工作包进入 WP-A contracts：在正式 packages 目录定义 canonical model event、Run state、WorkspaceHostPort、Tool Definition、SessionStorePort 和 Outcome Contract，并提供给 Web 与 Store 两条线使用的 fixtures。推送前先在不依赖旧 node_modules 的干净安装环境中复跑 CI 命令。
+Contract-first slice 已在 `feat/runtime-contracts` 本地分支达到 Ready for PR。获得提交/推送授权后，先在干净安装环境复跑 CI 并建立小 PR；随后并行启动只读 Workspace Host skeleton、Provider 错误 fixtures，以及 Web/Store 两条消费契约的工作包。
