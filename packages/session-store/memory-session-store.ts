@@ -166,6 +166,22 @@ export class MemorySessionStore implements SessionStorePort {
         latestAttemptNumber: run?.latestAttemptNumber ?? -1,
       };
     }
+    const latestAttempt = this.attemptForRun(input.runId, run.activeAttemptId);
+    if (
+      !latestAttempt ||
+      latestAttempt.attemptNumber !== run.latestAttemptNumber ||
+      this.attempts.has(attemptKey(input.runId, input.attemptId)) ||
+      input.sessionId !== run.sessionId ||
+      input.turnId !== run.turnId ||
+      input.catalogHash !== latestAttempt.catalogHash ||
+      input.intentRevision !== latestAttempt.intentRevision
+    ) {
+      return {
+        kind: "conflict",
+        code: "run_attempt_conflict",
+        latestAttemptNumber: run.latestAttemptNumber,
+      };
+    }
     const activeLease = this.activeLeaseForRun(input.runId);
     if (activeLease) {
       return {
@@ -382,6 +398,10 @@ export class MemorySessionStore implements SessionStorePort {
 
   async acquireLease(input: LeaseRequest): Promise<LeaseResult> {
     if (!this.attemptForRun(input.runId, input.attemptId)) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const run = this.runs.get(input.runId);
+    if (!run || run.activeAttemptId !== input.attemptId) {
       return { kind: "conflict", code: "run_attempt_conflict" };
     }
     const activeLease = this.activeLeaseForRun(input.runId);

@@ -1,82 +1,61 @@
 import assert from "node:assert/strict";
+import { deepseekStreamDuplicateToolCallIdFixture } from "../../fixtures/contracts/v1/deepseek-stream-duplicate-tool-call-id";
 import { deepseekStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/deepseek-stream-text-single-tool";
+import { kimiStreamMissingToolCallIdFixture } from "../../fixtures/contracts/v1/kimi-stream-missing-tool-call-id";
 import { kimiStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/kimi-stream-text-single-tool";
+import type { ProviderCodecContext, ProviderId } from "../../packages/providers";
 import { decodeDeepSeekChatCompletionChunks, decodeKimiChatCompletionChunks } from "../../packages/providers";
 
-const fixtureContexts = {
-  deepseek: {
-    modelStepId: "model-step-deepseek-001",
-    occurredAt: (index: number) => `2026-09-10T00:00:00.${String(index * 10).padStart(3, "0")}Z`,
-    createInvocationId: ({ providerToolCallId }: { providerToolCallId?: string }) =>
-      providerToolCallId === "ds-call-read-file-001"
-        ? "invocation-deepseek-read-file-001"
-        : "unexpected-deepseek-invocation",
-  },
-  kimi: {
-    modelStepId: "model-step-kimi-001",
-    occurredAt: (index: number) => `2026-09-10T00:01:00.${String(index * 10).padStart(3, "0")}Z`,
-    createInvocationId: ({ providerToolCallId }: { providerToolCallId?: string }) =>
-      providerToolCallId === "kimi-call-git-status-001"
-        ? "invocation-kimi-git-status-001"
-        : "unexpected-kimi-invocation",
-  },
-} as const;
+function fixtureContext(provider: ProviderId, modelStepId: string, timestampPrefix: string): ProviderCodecContext {
+  return {
+    modelStepId,
+    occurredAt: (index) => `${timestampPrefix}.${String(index * 10).padStart(3, "0")}Z`,
+    createInvocationId: ({ choiceIndex, toolCallIndex }) => `invocation-${provider}-${choiceIndex}-${toolCallIndex}`,
+  };
+}
 
-assert.deepEqual(
-  decodeDeepSeekChatCompletionChunks(deepseekStreamTextSingleToolFixture.rawChunks, fixtureContexts.deepseek),
-  deepseekStreamTextSingleToolFixture.expectedEvents,
-);
-assert.deepEqual(
-  decodeKimiChatCompletionChunks(kimiStreamTextSingleToolFixture.rawChunks, fixtureContexts.kimi),
-  kimiStreamTextSingleToolFixture.expectedEvents,
-);
-
-const multiToolEvents = decodeDeepSeekChatCompletionChunks(
-  [
-    {
-      id: "multi-tool-response",
-      choices: [
-        {
-          index: 0,
-          delta: {
-            tool_calls: [
-              { index: 0, id: "call-a", function: { name: "read_file", arguments: "{\"path\":\"a" } },
-              { index: 1, id: "call-b", function: { name: "git_status", arguments: "{\"scope\":\"work" } },
-            ],
-          },
-        },
-      ],
-    },
-    {
-      id: "multi-tool-response",
-      choices: [
-        {
-          index: 0,
-          delta: {
-            tool_calls: [
-              { index: 1, function: { arguments: "space\"}" } },
-              { index: 0, function: { arguments: "\"}" } },
-            ],
-          },
-          finish_reason: "tool_calls",
-        },
-      ],
-      usage: { prompt_tokens: 3, completion_tokens: 2 },
-    },
-  ],
+const decodedFixtures = [
   {
-    modelStepId: "model-step-multi-tool-001",
-    occurredAt: (index) => `2026-09-10T00:02:00.${String(index).padStart(3, "0")}Z`,
-    createInvocationId: ({ providerToolCallId }) => `invocation-${providerToolCallId}`,
+    fixture: deepseekStreamTextSingleToolFixture,
+    actual: decodeDeepSeekChatCompletionChunks(
+      deepseekStreamTextSingleToolFixture.rawChunks,
+      fixtureContext("deepseek", "model-step-deepseek-001", "2026-09-10T00:00:00"),
+    ),
   },
-);
-const completedCalls = multiToolEvents.filter((event) => event.kind === "tool_call_completed");
-assert.deepEqual(
-  completedCalls.map(({ invocationId, rawArguments }) => ({ invocationId, rawArguments })),
-  [
-    { invocationId: "invocation-call-a", rawArguments: "{\"path\":\"a\"}" },
-    { invocationId: "invocation-call-b", rawArguments: "{\"scope\":\"workspace\"}" },
-  ],
-);
+  {
+    fixture: kimiStreamTextSingleToolFixture,
+    actual: decodeKimiChatCompletionChunks(
+      kimiStreamTextSingleToolFixture.rawChunks,
+      fixtureContext("kimi", "model-step-kimi-001", "2026-09-10T00:01:00"),
+    ),
+  },
+  {
+    fixture: deepseekStreamDuplicateToolCallIdFixture,
+    actual: decodeDeepSeekChatCompletionChunks(
+      deepseekStreamDuplicateToolCallIdFixture.rawChunks,
+      fixtureContext("deepseek", "model-step-deepseek-duplicate-id-001", "2026-09-10T00:02:00"),
+    ),
+  },
+  {
+    fixture: kimiStreamMissingToolCallIdFixture,
+    actual: decodeKimiChatCompletionChunks(
+      kimiStreamMissingToolCallIdFixture.rawChunks,
+      fixtureContext("kimi", "model-step-kimi-missing-id-001", "2026-09-10T00:03:00"),
+    ),
+  },
+] as const;
 
-console.log(JSON.stringify({ gate: "meliora-m0-provider-codec-contract", status: "PASS", fixtures: 2 }));
+for (const { fixture, actual } of decodedFixtures) {
+  assert.deepEqual(actual, fixture.expectedEvents, fixture.id);
+}
+
+const duplicateIdStarts = decodedFixtures[2].actual.filter((event) => event.kind === "tool_call_started");
+assert.equal(duplicateIdStarts.length, 2);
+assert.equal(new Set(duplicateIdStarts.map((event) => event.invocationId)).size, 2);
+assert.equal(duplicateIdStarts[0]?.providerToolCallId, duplicateIdStarts[1]?.providerToolCallId);
+
+const missingIdStart = decodedFixtures[3].actual.find((event) => event.kind === "tool_call_started");
+assert.equal(missingIdStart?.providerToolCallId, undefined);
+assert.equal(missingIdStart?.invocationId, "invocation-kimi-0-2");
+
+console.log(JSON.stringify({ gate: "meliora-m0-provider-codec-contract", status: "PASS", fixtures: 4 }));

@@ -79,7 +79,7 @@ export const kimiStreamTextSingleToolFixture = {
       streamIndex: 1,
       occurredAt: "2026-09-10T00:01:00.010Z",
       kind: "tool_call_started",
-      invocationId: "invocation-kimi-git-status-001",
+      invocationId: "invocation-kimi-0-0",
       toolName: "git_status",
       providerToolCallId: "kimi-call-git-status-001",
     },
@@ -89,7 +89,7 @@ export const kimiStreamTextSingleToolFixture = {
       streamIndex: 2,
       occurredAt: "2026-09-10T00:01:00.020Z",
       kind: "tool_arguments_delta",
-      invocationId: "invocation-kimi-git-status-001",
+      invocationId: "invocation-kimi-0-0",
       delta: "{\"scope\":\"work",
     },
     {
@@ -98,7 +98,7 @@ export const kimiStreamTextSingleToolFixture = {
       streamIndex: 3,
       occurredAt: "2026-09-10T00:01:00.030Z",
       kind: "tool_arguments_delta",
-      invocationId: "invocation-kimi-git-status-001",
+      invocationId: "invocation-kimi-0-0",
       delta: "space\"}",
     },
     {
@@ -107,7 +107,7 @@ export const kimiStreamTextSingleToolFixture = {
       streamIndex: 4,
       occurredAt: "2026-09-10T00:01:00.040Z",
       kind: "tool_call_completed",
-      invocationId: "invocation-kimi-git-status-001",
+      invocationId: "invocation-kimi-0-0",
       rawArguments: "{\"scope\":\"workspace\"}",
     },
     {

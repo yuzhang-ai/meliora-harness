@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { deepseekStreamDuplicateToolCallIdFixture } from "../../fixtures/contracts/v1/deepseek-stream-duplicate-tool-call-id";
 import { deepseekStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/deepseek-stream-text-single-tool";
+import { kimiStreamMissingToolCallIdFixture } from "../../fixtures/contracts/v1/kimi-stream-missing-tool-call-id";
 import { kimiStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/kimi-stream-text-single-tool";
 import { publicRunEventReplays } from "../../fixtures/contracts/v1/public-run-event-replays";
 import { actionGateDecisionFixtures } from "../../fixtures/contracts/v1/action-gate-decisions";
@@ -52,7 +54,12 @@ function replayProviderFixture(fixture: ReplayableProviderFixture): void {
   }
 }
 
-for (const fixture of [deepseekStreamTextSingleToolFixture, kimiStreamTextSingleToolFixture]) {
+for (const fixture of [
+  deepseekStreamTextSingleToolFixture,
+  kimiStreamTextSingleToolFixture,
+  deepseekStreamDuplicateToolCallIdFixture,
+  kimiStreamMissingToolCallIdFixture,
+]) {
   replayProviderFixture(fixture);
 }
 
@@ -142,7 +149,7 @@ assert.equal(
 console.log(JSON.stringify({
   gate: "meliora-m0-contract-fixture-validation",
   status: "PASS",
-  providerFixtures: 2,
+  providerFixtures: 4,
   publicReplays: Object.keys(publicRunEventReplays).length,
   actionGateFixtures: Object.keys(actionGateDecisionFixtures).length,
 }));

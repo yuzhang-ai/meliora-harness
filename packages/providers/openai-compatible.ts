@@ -79,16 +79,11 @@ export function decodeOpenAiCompatibleChatCompletionChunks(
     } as CanonicalModelEvent);
   };
 
-  const startToolCallIfReady = (state: OpenAiToolCallState, allowMissingProviderToolCallId = false): void => {
-    if (
-      state.invocationId !== undefined ||
-      state.toolName === undefined ||
-      (state.providerToolCallId === undefined && !allowMissingProviderToolCallId)
-    ) {
-      return;
-    }
+  const startToolCallIfReady = (state: OpenAiToolCallState): void => {
+    if (state.invocationId !== undefined || state.toolName === undefined) return;
     state.invocationId = context.createInvocationId({
       provider,
+      choiceIndex: state.choiceIndex,
       toolCallIndex: state.toolCallIndex,
       toolName: state.toolName,
       providerToolCallId: state.providerToolCallId,
@@ -104,7 +99,7 @@ export function decodeOpenAiCompatibleChatCompletionChunks(
   const completeChoiceToolCalls = (choiceIndex: number): void => {
     for (const state of toolCalls.values()) {
       if (state.choiceIndex !== choiceIndex || state.completed) continue;
-      startToolCallIfReady(state, true);
+      startToolCallIfReady(state);
       emitPendingArgumentDeltas(state);
       if (state.invocationId === undefined) continue;
       state.completed = true;

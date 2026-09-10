@@ -154,6 +154,19 @@ assert.deepEqual(await store.createRunAttempt({
   sessionId: "session-1", turnId: "turn-1", runId: "run-1", attemptId: "attempt-2", expectedLatestAttemptNumber: 0,
   catalogHash: "catalog-hash", intentRevision: 1, createdAt: timestamp(), ownerId: "worker-2", ttlMs: 1_000, requestedAt: timestamp(),
 }), { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: 1 });
+for (const forgedAttempt of [
+  { attemptId: "attempt-1" },
+  { sessionId: "session-forged" },
+  { turnId: "turn-forged" },
+  { catalogHash: "catalog-forged" },
+  { intentRevision: 2 },
+]) {
+  assert.deepEqual(await store.createRunAttempt({
+    sessionId: "session-1", turnId: "turn-1", runId: "run-1", attemptId: "attempt-2", expectedLatestAttemptNumber: 1,
+    catalogHash: "catalog-hash", intentRevision: 1, createdAt: timestamp(), ownerId: "worker-2", ttlMs: 1_000, requestedAt: timestamp(),
+    ...forgedAttempt,
+  }), { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: 1 });
+}
 const nextAttempt = await store.createRunAttempt({
   sessionId: "session-1", turnId: "turn-1", runId: "run-1", attemptId: "attempt-2", expectedLatestAttemptNumber: 1,
   catalogHash: "catalog-hash", intentRevision: 1, createdAt: timestamp(), ownerId: "worker-2", ttlMs: 1_000, requestedAt: timestamp(),
@@ -169,7 +182,7 @@ assert.deepEqual(await store.acquireLease({
   ownerId: "worker-1",
   ttlMs: 1_000,
   requestedAt: timestamp(),
-}), { kind: "held", expiresAt: nextAttempt.lease.expiresAt });
+}), { kind: "conflict", code: "run_attempt_conflict" });
 const unknownAttemptId = "attempt-not-found";
 const unknownAttemptInvocation: NormalizedToolInvocation = {
   ...invocation,
@@ -214,6 +227,14 @@ assert.deepEqual(await store.appendEvents({
 assert.deepEqual(await store.commitReceipt({
   runId: "run-1", attemptId: "attempt-1", leaseToken: initialLease.leaseToken, reservationId: reserved.reservationId, receipt,
 }), { kind: "conflict", code: "lease_expired" });
+now += 1_000;
+assert.deepEqual(await store.acquireLease({
+  runId: "run-1",
+  attemptId: "attempt-1",
+  ownerId: "worker-1",
+  ttlMs: 1_000,
+  requestedAt: timestamp(),
+}), { kind: "conflict", code: "run_attempt_conflict" });
 
 console.log(JSON.stringify({
   gate: "session-store-contract",
@@ -223,8 +244,9 @@ console.log(JSON.stringify({
   reservationReplayRecoversInvocationAndReceipt: true,
   recoveryReads: true,
   activeLeaseBlocksRecoveryAndExpiredLeaseTransfersAtomically: true,
-  activeLeaseBlocksOldAttemptReacquisition: true,
+  supersededAttemptCannotReacquireLease: true,
   fabricatedAttemptCannotAcquireLeaseOrWrite: true,
+  attemptRecoveryRejectsDuplicateAndForgedAuthorization: true,
   attemptReconcilesPriorReservationReadOnly: true,
   receiptMatchesReservedInvocation: true,
 }));

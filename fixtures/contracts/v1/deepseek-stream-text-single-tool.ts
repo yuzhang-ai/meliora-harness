@@ -79,7 +79,7 @@ export const deepseekStreamTextSingleToolFixture = {
       streamIndex: 1,
       occurredAt: "2026-09-10T00:00:00.010Z",
       kind: "tool_call_started",
-      invocationId: "invocation-deepseek-read-file-001",
+      invocationId: "invocation-deepseek-0-0",
       toolName: "read_file",
       providerToolCallId: "ds-call-read-file-001",
     },
@@ -89,7 +89,7 @@ export const deepseekStreamTextSingleToolFixture = {
       streamIndex: 2,
       occurredAt: "2026-09-10T00:00:00.020Z",
       kind: "tool_arguments_delta",
-      invocationId: "invocation-deepseek-read-file-001",
+      invocationId: "invocation-deepseek-0-0",
       delta: "{\"path\":\"packages/agent",
     },
     {
@@ -98,7 +98,7 @@ export const deepseekStreamTextSingleToolFixture = {
       streamIndex: 3,
       occurredAt: "2026-09-10T00:00:00.030Z",
       kind: "tool_arguments_delta",
-      invocationId: "invocation-deepseek-read-file-001",
+      invocationId: "invocation-deepseek-0-0",
       delta: "-runtime/run-state.ts\"}",
     },
     {
@@ -107,7 +107,7 @@ export const deepseekStreamTextSingleToolFixture = {
       streamIndex: 4,
       occurredAt: "2026-09-10T00:00:00.040Z",
       kind: "tool_call_completed",
-      invocationId: "invocation-deepseek-read-file-001",
+      invocationId: "invocation-deepseek-0-0",
       rawArguments: "{\"path\":\"packages/agent-runtime/run-state.ts\"}",
     },
     {

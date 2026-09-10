@@ -4,6 +4,7 @@ export type ProviderId = "deepseek" | "kimi";
 
 export type InvocationIdInput = Readonly<{
   provider: ProviderId;
+  choiceIndex: number;
   toolCallIndex: number;
   toolName: string;
   providerToolCallId?: string;
@@ -11,6 +12,8 @@ export type InvocationIdInput = Readonly<{
 
 /**
  * Runtime-owned values are injected so a Codec never owns durable IDs or time.
+ * `choiceIndex` and `toolCallIndex` are the provider-independent identity seed;
+ * a provider tool-call ID is optional protocol metadata, never an internal key.
  */
 export type ProviderCodecContext = Readonly<{
   modelStepId: string;
