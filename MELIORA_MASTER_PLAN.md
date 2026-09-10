@@ -175,7 +175,7 @@ MVP 必须具备：
 - 最终完成声明由 Receipt、readback 和 verification 支撑。
 - 前端只接收 public projection，不泄露 API Key、Authorization 和私有 reasoning。
 
-第一阶段明确不做：完整 IDE、UX 页面编辑器、Canvas 产品、多人实时协作、云端计费、Subagent、完整 MCP 市场、自动发布和无审批写入。生产共享数据库和桌面安装包暂不冻结。
+第一阶段明确不做：完整 IDE、UX 页面编辑器、Canvas 产品、多人实时协作、云端计费、面向最终用户的 Runtime Subagent / 自动委派产品能力、完整 MCP 市场、自动发布和无审批写入。生产共享数据库和桌面安装包暂不冻结。开发期间由 Codex 使用子 Agent 做并行实现与独立审查，属于团队施工方式，不代表该产品能力进入 M0/M1 范围。
 
 ## 7. 决策与变更
 

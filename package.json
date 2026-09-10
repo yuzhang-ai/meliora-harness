@@ -7,7 +7,8 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "typecheck": "npm run typecheck:e3",
+    "typecheck": "npm run typecheck:packages && npm run typecheck:e3",
+    "typecheck:packages": "tsc -p tsconfig.packages.json",
     "typecheck:e3": "tsc -p vendor/e3-runtime/tsconfig.json",
     "test:e3:a1": "cd vendor/e3-runtime/apps/demo && tsx scripts/check-landing-page-harness-v1-e3-s0-a1.ts",
     "test:e3:a2": "cd vendor/e3-runtime/apps/demo && tsx scripts/check-landing-page-harness-v1-e3-s0-a2.ts",
@@ -15,7 +16,8 @@
     "test:e3:profile": "cd vendor/e3-runtime/apps/demo && tsx scripts/check-landing-page-harness-v1-e3-s1-profile.ts",
     "test:e3:durable": "cd vendor/e3-runtime/apps/demo && tsx scripts/check-landing-page-harness-v1-e3-s1-durable.ts",
     "test:e3": "npm run test:e3:a1 && npm run test:e3:a2 && npm run test:e3:a3 && npm run test:e3:profile && npm run test:e3:durable",
-    "check": "npm run typecheck && npm run test:e3"
+    "test:contracts": "tsx tests/contracts/replay-contract-fixtures.ts && tsx tests/contracts/action-gate-contract.ts && tsx tests/contracts/provider-codec-contract.ts && tsx tests/contracts/session-store-contract.ts",
+    "check": "npm run typecheck && npm run test:contracts && npm run test:e3"
   },
   "dependencies": {
     "better-sqlite3": "12.11.1",

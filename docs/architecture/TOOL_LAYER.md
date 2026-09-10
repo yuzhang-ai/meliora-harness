@@ -78,7 +78,7 @@ current_grants
 prior_receipts
 ```
 
-Gate 输出只能是 `allow`、`ask` 或 `block`，并包含 reason code。审批请求必须展示工具、规范化参数、影响范围、风险、可撤销性和超时。审批绑定参数哈希，参数变化后旧批准失效。
+Gate 输出只能是 `allow`、`ask` 或 `block`，并包含 reason code。不可覆盖的 deny policy（首期至少 L3）先于历史 Grant 判定。审批请求必须展示工具、规范化参数、影响范围、风险、可撤销性和超时；Grant 同时绑定 principal、workspace、run、attempt、tool/version、catalog、policy version 和参数哈希，任一变化后旧批准失效。
 
 禁止：
 
@@ -121,7 +121,10 @@ E3 Harness -> E3S1UxHostPort       (回归接缝，暂留)
 
 ```ts
 interface ToolReceipt {
+  receiptId: string;
   invocationId: string;
+  runId: string;
+  attemptId: string;
   toolName: string;
   toolVersion: string;
   argumentsHash: string;
@@ -138,6 +141,8 @@ interface ToolReceipt {
 ```
 
 Receipt 是事实证据，不是模型摘要。大输出写 Artifact，Receipt 只存寻址信息和安全摘要。写入类工具还需保存 before/after hash、readback 或 Git diff。
+
+`outcome_unknown` 是 Tool Invocation 的非终结执行状态，不是成功 Receipt。Runtime 必须先通过 Host readback/reconcile 确认结果；只有确认后的 `succeeded / failed / cancelled` 才能生成 Receipt。
 
 ## 7. 幂等与失败
 

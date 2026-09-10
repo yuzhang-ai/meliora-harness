@@ -45,6 +45,9 @@ SchemaMigration
 ```ts
 interface SessionStorePort {
   createSession(input: CreateSession): Promise<Session>;
+  createTurn(input: CreateTurn): Promise<Turn>;
+  createRun(input: CreateRun): Promise<Run>;
+  createRunAttempt(input: CreateRunAttempt): Promise<RunAttempt>;
   appendEvents(input: AppendEvents): Promise<AppendResult>;
   readEvents(input: ReadEvents): Promise<EventPage>;
   writeSnapshot(input: WriteSnapshot): Promise<void>;
@@ -58,7 +61,7 @@ interface SessionStorePort {
 }
 ```
 
-Port contract 需定义事务边界、冲突错误、分页、顺序、时钟和一致性，不把 SQLite 特性暴露给调用方。
+创建 Run 时原子创建 Attempt #1；恢复通过 `createRunAttempt` 创建递增 Attempt，不修改旧 Attempt 的终态。恢复必须同时以 `expected_latest_attempt_number` CAS 检查 Attempt 版本和旧 lease 的过期状态：同一 Run 任一未过期 lease 都返回 `lease_held`，不得写入新 Attempt 或第二 lease；仅在旧 lease 已过期时，才能原子创建新 Attempt 与新 lease。所有状态写入、事件追加、Snapshot、Invocation reservation 与 Receipt commit 都绑定 `run_id + attempt_id + lease_token`。`appendEvents` 还必须携带 `expected_sequence`，由 Store 原子分配连续 sequence。Port contract 需定义事务边界、冲突错误、分页、顺序、时钟和一致性，不把 SQLite 特性暴露给调用方。
 
 ## 4. Event Log
 
@@ -84,7 +87,7 @@ Public SSE 只读取 `visibility=public` 的投影事件。Private 事件可用�
 - Snapshot 记录应用到哪个 event sequence。
 - 恢复先读最近 Snapshot，再重放后续事件。
 - Snapshot 写失败不影响已提交事件。
-- 恢复后检查 lease、未决 invocation、approval 和 terminal state。
+- 恢复后检查 lease、未决 invocation、approval 和 terminal state。新 Attempt 可仅按 `run_id + idempotency_key` 读取旧 Attempt 的 reservation、invocation 和 Receipt，用于 reconcile；该读取不转移 lease，也不允许新 Attempt 提交或重放旧副作用。
 - `outcome_unknown` 的工具先 readback，不重新执行。
 - 任何 schema 升级都有向前 migration 和旧 fixture replay。
 
@@ -109,7 +112,7 @@ Last-Event-ID: <event_id>
 
 要求：
 
-- 事件 ID 单调且可断点续传。
+- SSE `id` 使用每个 Run 单调递增的 `sequence`；`event_id` 是稳定实体 ID，不承担排序语义。
 - 心跳不进入业务事件日志。
 - 客户端重复收到事件时按 ID 去重。
 - 终态事件后连接可关闭。
