@@ -15,7 +15,11 @@ const storedEvent = (sequence: number, kind: string, visibility: "public" | "pri
   sequence,
   kind,
   visibility,
-  payload: kind === "run_completed" ? { outcomeId: "outcome-1", summary: "done" } : { delta: "hello" },
+  payload: kind === "run_completed"
+    ? { outcomeId: "outcome-1", summary: "done" }
+    : kind === "run_blocked"
+      ? { code: "approval_required", message: "waiting for approval", userActions: ["approve"] }
+      : { delta: "hello" },
   createdAt: `2026-09-11T00:00:0${sequence}.000Z`,
 });
 
@@ -67,6 +71,33 @@ test("SSE resumes from numeric Last-Event-ID and filters private events", async 
     assert.equal(data.schemaVersion, "meliora.public-run-event.v1");
     assert.equal(data.sessionId, "session-1");
     assert.equal(data.visibility, "public");
+  } finally { await app.close(); }
+});
+
+test("run_blocked is terminal and closes SSE without heartbeats", async () => {
+  const app = await startServer(fakeStore([storedEvent(1, "run_blocked")]));
+  try {
+    const response = await fetch(`${app.url}/api/runs/run-1/events`);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /id: 1\nevent: run_blocked/u);
+    assert.doesNotMatch(body, /heartbeat/u);
+  } finally { await app.close(); }
+});
+
+test("unknown public events are quarantined so a later terminal event remains reachable", async () => {
+  const fixture = [
+    storedEvent(1, "assistant_text_delta"),
+    storedEvent(2, "invented_public_kind"),
+    storedEvent(3, "run_completed"),
+  ];
+  const app = await startServer(fakeStore(fixture));
+  try {
+    const response = await fetch(`${app.url}/api/runs/run-1/events`, { headers: { "Last-Event-ID": "1" } });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /id: 3\nevent: run_completed/u);
+    assert.doesNotMatch(body, /invented_public_kind|event-2/u);
   } finally { await app.close(); }
 });
 

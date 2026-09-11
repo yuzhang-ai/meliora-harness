@@ -19,6 +19,13 @@ test("sensitive values never reach database, WAL or SHM", async (t) => {
   const path = createTempDatabase(t); const secret = "sk-meliora-secret-123456789";
   const store = new SqliteSessionStore(path); const lease = await seed(store);
   await assert.rejects(store.appendEvents({ runId: "run-1", attemptId: "attempt-1", expectedSequence: 0, leaseToken: lease.leaseToken, events: [{ ...event("secret"), payload: { apiKey: secret } }] }), SensitiveDataError);
+  await assert.rejects(store.appendEvents({
+    runId: "run-1",
+    attemptId: "attempt-1",
+    expectedSequence: 0,
+    leaseToken: lease.leaseToken,
+    events: [{ ...event("header-secret"), payload: { headers: { "x-api-key": "opaque-provider-credential" } } }],
+  }), SensitiveDataError);
   const safeContent = new TextEncoder().encode("safe artifact");
   await assert.rejects(store.putArtifact({
     artifactId: "secret-artifact",
@@ -29,6 +36,29 @@ test("sensitive values never reach database, WAL or SHM", async (t) => {
     metadata: { accessToken: secret },
     createdAt: new Date().toISOString(),
   }), SensitiveDataError);
+  await assert.rejects(store.putArtifact({
+    artifactId: "environment-secret-artifact",
+    contentHash: hashBytes(safeContent),
+    mediaType: "application/octet-stream",
+    content: safeContent,
+    visibility: "private",
+    metadata: { OPENAI_API_KEY: "opaque-provider-credential" },
+    createdAt: new Date().toISOString(),
+  }), SensitiveDataError);
+  const utf16Secret = Buffer.from(`{"x-api-key":"opaque-provider-credential","token":"${secret}"}`, "utf16le");
+  await assert.rejects(store.putArtifact({
+    artifactId: "utf16-secret-artifact",
+    contentHash: hashBytes(utf16Secret),
+    mediaType: "application/octet-stream",
+    content: utf16Secret,
+    visibility: "private",
+    createdAt: new Date().toISOString(),
+  }), SensitiveDataError);
   store.close();
-  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) if (existsSync(candidate)) assert.equal(readFileSync(candidate).toString("latin1").includes(secret), false);
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    const bytes = readFileSync(candidate);
+    assert.equal(bytes.includes(secret), false);
+    assert.equal(bytes.includes(utf16Secret), false);
+  }
 });

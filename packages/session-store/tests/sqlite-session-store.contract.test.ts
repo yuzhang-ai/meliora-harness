@@ -165,6 +165,44 @@ test("lease expiry gates writes and transfers recovery attempt atomically", asyn
   store.close();
 });
 
+test("lease expiry is based on the store clock, never caller timestamps", async (t) => {
+  let now = Date.parse(timestamp());
+  const store = new SqliteSessionStore(createTempDatabase(t), {
+    clock: () => new Date(now),
+    nonce: (() => { let n = 0; return () => `trusted-clock-${++n}`; })(),
+  });
+  await store.createSession({ sessionId: "session-1", workspaceId: "workspace-1", createdAt: timestamp() });
+  await store.createTurn({ sessionId: "session-1", turnId: "turn-1", intentRevision: 1, createdAt: timestamp() });
+  await store.createRun({ sessionId: "session-1", turnId: "turn-1", runId: "run-1", initialAttemptId: "attempt-1", catalogHash: "catalog-hash", intentRevision: 1, createdAt: timestamp() });
+
+  const future = "2099-01-01T00:00:00.000Z";
+  const first = await store.acquireLease({ runId: "run-1", attemptId: "attempt-1", ownerId: "worker-1", ttlMs: 1_000, requestedAt: future });
+  assert.equal(first.kind, "acquired");
+  if (first.kind !== "acquired") throw new Error("expected lease acquisition");
+  assert.equal(first.expiresAt, new Date(now + 1_000).toISOString());
+
+  now += 500;
+  assert.equal(await store.renewLease({ runId: "run-1", attemptId: "attempt-1", leaseToken: first.leaseToken, ttlMs: 1_000, renewedAt: future }), true);
+  now += 1_000;
+  const recovered = await store.createRunAttempt({
+    sessionId: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    attemptId: "attempt-2",
+    expectedLatestAttemptNumber: 1,
+    catalogHash: "catalog-hash",
+    intentRevision: 1,
+    createdAt: future,
+    ownerId: "worker-2",
+    ttlMs: 1_000,
+    requestedAt: future,
+  });
+  assert.equal(recovered.kind, "created");
+  if (recovered.kind !== "created") throw new Error("expected recovery attempt");
+  assert.equal(recovered.lease.expiresAt, new Date(now + 1_000).toISOString());
+  store.close();
+});
+
 test("same-sequence snapshot accepts exact replay and rejects drift", async (t) => {
   const store = new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(timestamp()) }); const lease = await seed(store);
   const input = { snapshot: { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: "snapshot-1", runId: "run-1", attemptId: "attempt-1", throughSequence: 0, state: { value: 1 }, createdAt: timestamp() }, expectedSequence: 0, leaseToken: lease.leaseToken };

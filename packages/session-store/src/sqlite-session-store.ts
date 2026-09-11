@@ -15,7 +15,7 @@ import type {
 } from "../contracts.js";
 import { IdempotencyConflictError, SequenceConflictError, StoreIntegrityError } from "./errors.js";
 import { canonicalJson, hashBytes } from "./integrity.js";
-import { assertPersistableJson, assertPersistableText } from "./sensitive-data.js";
+import { assertPersistableBytes, assertPersistableJson } from "./sensitive-data.js";
 
 const MIGRATION_NAME = "0001_initial.sql";
 const MIGRATION_VERSION = 1;
@@ -130,16 +130,17 @@ export class SqliteSessionStore implements SessionStorePort {
   async createRunAttempt(input: CreateRunAttemptInput): Promise<CreateRunAttemptResult> {
     requireTimestamp(input.createdAt, "createdAt"); requireTimestamp(input.requestedAt, "requestedAt"); this.requireTtl(input.ttlMs);
     return this.db.transaction((): CreateRunAttemptResult => {
+      const now = this.clock();
       const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
       if (!run || run.latest_attempt_number !== input.expectedLatestAttemptNumber) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run?.latest_attempt_number ?? -1 };
       const latest = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, run.active_attempt_id) as Row | undefined;
       const forged = run.session_id !== input.sessionId || run.turn_id !== input.turnId || latest?.catalog_hash !== input.catalogHash || latest?.intent_revision !== input.intentRevision || !!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId);
       if (forged) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run.latest_attempt_number };
-      const active = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND expires_at>?").get(input.runId, this.clock().toISOString()) as Row | undefined;
+      const active = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND expires_at>?").get(input.runId, now.toISOString()) as Row | undefined;
       if (active) return { kind: "conflict", code: "lease_held", latestAttemptNumber: run.latest_attempt_number, expiresAt: active.expires_at };
       const attemptNumber = run.latest_attempt_number + 1;
       const leaseToken = this.nonce();
-      const expiresAt = new Date(Date.parse(input.requestedAt) + input.ttlMs).toISOString();
+      const expiresAt = new Date(now.getTime() + input.ttlMs).toISOString();
       this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(input.attemptId, input.runId, input.sessionId, input.turnId, attemptNumber, "created", latest!.last_event_sequence, input.catalogHash, input.intentRevision, "null", input.createdAt, input.createdAt);
       this.db.prepare("UPDATE runs SET active_attempt_id=?,latest_attempt_number=?,updated_at=? WHERE run_id=?").run(input.attemptId, attemptNumber, input.createdAt, input.runId);
       this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?)").run(input.runId, input.attemptId, input.ownerId, hashBytes(leaseToken), expiresAt);
@@ -268,7 +269,7 @@ export class SqliteSessionStore implements SessionStorePort {
   }
 
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
-    assertPersistableText(new TextDecoder().decode(input.content), "artifact.content");
+    assertPersistableBytes(input.content, "artifact.content");
     if (input.metadata !== undefined) assertPersistableJson(input.metadata, "artifact.metadata");
     const actualHash = hashBytes(input.content);
     if (actualHash !== input.contentHash) throw new IdempotencyConflictError("artifact_content_hash_conflict");
@@ -295,11 +296,12 @@ export class SqliteSessionStore implements SessionStorePort {
   async acquireLease(input: LeaseRequest): Promise<LeaseResult> {
     this.requireTtl(input.ttlMs); requireTimestamp(input.requestedAt, "requestedAt");
     return this.db.transaction((): LeaseResult => {
+      const now = this.clock();
       const run = this.db.prepare("SELECT active_attempt_id FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
       if (!run || run.active_attempt_id !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
       const prior = this.db.prepare("SELECT * FROM run_leases WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
-      if (prior && Date.parse(prior.expires_at) > this.clock().getTime()) return { kind: "held", expiresAt: prior.expires_at };
-      const leaseToken = this.nonce(); const expiresAt = new Date(Date.parse(input.requestedAt) + input.ttlMs).toISOString();
+      if (prior && Date.parse(prior.expires_at) > now.getTime()) return { kind: "held", expiresAt: prior.expires_at };
+      const leaseToken = this.nonce(); const expiresAt = new Date(now.getTime() + input.ttlMs).toISOString();
       this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?) ON CONFLICT(run_id,attempt_id) DO UPDATE SET owner_id=excluded.owner_id,lease_token_hash=excluded.lease_token_hash,expires_at=excluded.expires_at").run(input.runId, input.attemptId, input.ownerId, hashBytes(leaseToken), expiresAt);
       return { kind: "acquired", leaseToken, expiresAt };
     })();
@@ -307,11 +309,14 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async renewLease(input: LeaseRenewal): Promise<boolean> {
     this.requireTtl(input.ttlMs); requireTimestamp(input.renewedAt, "renewedAt");
-    const tokenHash = hashBytes(input.leaseToken);
-    const current = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").get(input.runId, input.attemptId, tokenHash) as Row | undefined;
-    if (!current || Date.parse(current.expires_at) <= this.clock().getTime()) return false;
-    const expiresAt = new Date(Date.parse(input.renewedAt) + input.ttlMs).toISOString();
-    return this.db.prepare("UPDATE run_leases SET expires_at=? WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").run(expiresAt, input.runId, input.attemptId, tokenHash).changes === 1;
+    return this.db.transaction((): boolean => {
+      const now = this.clock();
+      const tokenHash = hashBytes(input.leaseToken);
+      const current = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").get(input.runId, input.attemptId, tokenHash) as Row | undefined;
+      if (!current || Date.parse(current.expires_at) <= now.getTime()) return false;
+      const expiresAt = new Date(now.getTime() + input.ttlMs).toISOString();
+      return this.db.prepare("UPDATE run_leases SET expires_at=? WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").run(expiresAt, input.runId, input.attemptId, tokenHash).changes === 1;
+    })();
   }
 
   /** Server composition helper; intentionally not part of the frozen port. */

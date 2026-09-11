@@ -20,7 +20,8 @@ const PUBLIC_EVENT_KINDS = new Set<PublicRunEvent["kind"]>([
 ]);
 
 const isTerminalPublicEvent = (event: PublicRunEvent): boolean =>
-  event.kind === "run_completed" || event.kind === "run_failed" || event.kind === "run_cancelled";
+  event.kind === "run_blocked" || event.kind === "run_completed"
+  || event.kind === "run_failed" || event.kind === "run_cancelled";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -216,7 +217,17 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
     for (const storedEvent of events) {
       cursor = storedEvent.sequence;
       if (storedEvent.visibility !== "public") continue;
-      const event = projectPublicEvent(storedEvent, sessionId);
+      let event: PublicRunEvent;
+      try {
+        event = projectPublicEvent(storedEvent, sessionId);
+      } catch (error) {
+        if (error instanceof TypeError) {
+          // Quarantine an invalid persisted public event without pinning the
+          // stream cursor. A later valid event must remain reachable.
+          continue;
+        }
+        throw error;
+      }
       if (!(await writeWithBackpressure(response, encodeSseEvent(event)))) { stop(false); return; }
       if (isTerminalEvent(event)) { stop(true); return; }
     }
