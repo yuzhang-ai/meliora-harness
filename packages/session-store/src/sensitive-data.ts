@@ -5,7 +5,7 @@ const SENSITIVE_VALUE =
   /(?:\bbearer\s+[a-z0-9._~+\/-]+=*|\b(?:sk|api)[-_][a-z0-9_-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/iu;
 
 const SENSITIVE_TEXT_FIELD =
-  /(?:^|["'\s{,;])(?:[a-z0-9_-]*api[-_]?key|authorization|proxy[-_]?authorization|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|private[-_]?reasoning|raw[-_]?environment)["']?\s*[:=]/iu;
+  /(?:^|["'\s{,;])(?:[a-z0-9_-]*api[-_]?key|authorization|proxy[-_]?authorization|cookie|set[ _-]?cookie|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|private[-_]?reasoning|raw[-_]?environment)["']?\s*[:=]/iu;
 
 const normalizeKey = (key: string): string => key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/gu, "");
 

@@ -54,11 +54,26 @@ test("sensitive values never reach database, WAL or SHM", async (t) => {
     visibility: "private",
     createdAt: new Date().toISOString(),
   }), SensitiveDataError);
+  const cookieArtifacts = [
+    { artifactId: "utf8-cookie-artifact", mediaType: "text/plain", content: Buffer.from("Cookie: sessionid=opaque-cookie-secret", "utf8") },
+    { artifactId: "utf8-set-cookie-artifact", mediaType: "text/plain", content: Buffer.from("Set-Cookie: sessionid=opaque-set-cookie-secret; HttpOnly", "utf8") },
+    { artifactId: "utf16-cookie-artifact", mediaType: "application/octet-stream", content: Buffer.from("cOoKiE = sessionid=opaque-cookie-variant", "utf16le") },
+    { artifactId: "utf16-set-cookie-artifact", mediaType: "application/octet-stream", content: Buffer.from("SET_COOKIE : sessionid=opaque-set-cookie-variant", "utf16le") },
+  ];
+  for (const artifact of cookieArtifacts) {
+    await assert.rejects(store.putArtifact({
+      ...artifact,
+      contentHash: hashBytes(artifact.content),
+      visibility: "private",
+      createdAt: new Date().toISOString(),
+    }), SensitiveDataError);
+  }
   store.close();
   for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
     if (!existsSync(candidate)) continue;
     const bytes = readFileSync(candidate);
     assert.equal(bytes.includes(secret), false);
     assert.equal(bytes.includes(utf16Secret), false);
+    for (const artifact of cookieArtifacts) assert.equal(bytes.includes(artifact.content), false);
   }
 });
