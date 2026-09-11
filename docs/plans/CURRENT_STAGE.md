@@ -3,7 +3,7 @@
 > 状态：Active
 > 里程碑：M0 - 基线与契约冻结
 > 版本：v0.1
-> 最后更新：2026-09-10
+> 最后更新：2026-09-11
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md) 及全部专项规范
@@ -127,11 +127,11 @@ WP-A read-only runtime + WP-C store
 | 干净 E3 来源基线 | 你 + Codex | Completed locally | orphan main + source commit provenance |
 | E3 独立闭包与回归 | 你 + Codex | Verified locally | typecheck + 5 组 characterization tests |
 | Contract-first PR | 你 + Codex | Merged | PR #3 已合并至 main `3f2e24f0`；CI、全量 check 与独立审查通过 |
-| Read-only Runtime | 你 + Codex | Ready for PR | Issue #4；五个只读工具与真实 Host/Store/Run loop 集成门禁通过，独立安全复审 PASS |
+| Read-only Runtime | 你 + Codex | Merged | PR #5 已合并至 main `e3b8a1a1`；真实 Host/Store/Run loop、CI 与独立安全复审通过 |
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
 | Store/Server skeleton | 秦峻溥 | Ready | Issue #2；基于合并后的 SessionStorePort 开工 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice 已通过 PR #3 合并到 `main`。`feat/runtime-read-only-loop` 已完成 Issue #4 的五个只读工具、Workspace Host、Provider 错误 fixtures、最小 Run loop 与真实无密钥集成门禁，下一步建立小 PR 并等待 CI；张子恒、秦峻溥分别从 Issue #1、#2 的冻结契约并行开工。
+Contract-first slice 与只读 Runtime 已分别通过 PR #3、#5 合并到 `main`。下一步由张子恒、秦峻溥从 Issue #1、#2 的最新主分支并行开发 Web Shell 与 Store/SSE；后端主线进入真实 Provider transport、server composition 和恢复路径设计，但继续保持无密钥 fixture 为默认门禁。
