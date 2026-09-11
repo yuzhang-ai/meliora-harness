@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "allowImportingTsExtensions": false
+  },
+  "include": ["contracts.ts", "index.ts", "memory-session-store.ts", "src/**/*.ts", "tests/**/*.ts"]
+}

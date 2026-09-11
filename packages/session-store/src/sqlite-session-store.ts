@@ -1,0 +1,347 @@
+import { randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import Database from "better-sqlite3";
+import type { JsonValue } from "../../model-protocol/contracts.js";
+import type { NormalizedToolInvocation, ToolReceipt } from "../../tool-runtime/contracts.js";
+import type {
+  AppendEventsInput, AppendEventsResult, Artifact, ArtifactRef, CommitReceiptInput, CommitReceiptResult,
+  CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
+  EventPage, InvocationReconciliationRecord, InvocationReservationInput, LeaseRenewal, LeaseRequest,
+  LeaseResult, PersistedRunAttempt, PersistedRunRecord, PutArtifactInput, ReadEventsInput,
+  ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReservationInput,
+  ReservationResult, RunSnapshot, SessionRecord, SessionStorePort, StoredEvent,
+  StoredInvocationReservation, TurnRecord, WriteSnapshotInput,
+} from "../contracts.js";
+import { IdempotencyConflictError, SequenceConflictError, StoreIntegrityError } from "./errors.js";
+import { canonicalJson, hashBytes } from "./integrity.js";
+import { assertPersistableJson, assertPersistableText } from "./sensitive-data.js";
+
+const MIGRATION_NAME = "0001_initial.sql";
+const MIGRATION_VERSION = 1;
+const MIGRATION_SQL = readFileSync(new URL(`../migrations/${MIGRATION_NAME}`, import.meta.url), "utf8");
+const MIGRATION_HASH = hashBytes(MIGRATION_SQL);
+type Options = Readonly<{ clock?: () => Date; nonce?: () => string }>;
+type LeaseConflict = "lease_not_held" | "lease_expired";
+type Row = Record<string, any>;
+
+const requireId = (value: string, name: string): void => {
+  if (!value || value.length > 200 || /[\u0000-\u001f]/u.test(value)) throw new TypeError(`${name} must be a non-empty bounded identifier.`);
+};
+const requireTimestamp = (value: string, name: string): void => {
+  if (!Number.isFinite(Date.parse(value))) throw new TypeError(`${name} must be an ISO timestamp.`);
+};
+const json = (value: unknown): string => canonicalJson(JSON.parse(JSON.stringify(value)) as JsonValue);
+const sameJson = (left: unknown, right: unknown): boolean => json(left) === json(right);
+const prepareDatabasePath = (databasePath: string): string => {
+  if (databasePath === ":memory:") return databasePath;
+  const resolved = resolve(databasePath);
+  const parent = dirname(resolved);
+  mkdirSync(parent, { recursive: true });
+  if (lstatSync(parent).isSymbolicLink()) throw new Error("sqlite_parent_symlink_rejected");
+  const realParent = realpathSync(parent);
+  if (dirname(resolve(realParent, "database.sqlite")) !== realParent) throw new Error("sqlite_parent_resolution_failed");
+  try {
+    const target = lstatSync(resolved);
+    if (target.isSymbolicLink() || !target.isFile()) throw new Error("sqlite_target_not_regular_file");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return resolved;
+};
+
+export class SqliteSessionStore implements SessionStorePort {
+  private readonly db: Database.Database;
+  private readonly clock: () => Date;
+  private readonly nonce: () => string;
+
+  constructor(databasePath: string, options: Options = {}) {
+    this.clock = options.clock ?? (() => new Date());
+    this.nonce = options.nonce ?? randomUUID;
+    this.db = new Database(prepareDatabasePath(databasePath));
+    this.db.pragma("foreign_keys = ON");
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("synchronous = FULL");
+    this.db.pragma("busy_timeout = 5000");
+    this.applyMigrations();
+  }
+
+  private applyMigrations(): void {
+    this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)");
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version > MIGRATION_VERSION) throw new StoreIntegrityError("database_schema_is_newer");
+    const row = this.db.prepare("SELECT name,checksum FROM schema_migrations WHERE version=?").get(MIGRATION_VERSION) as Row | undefined;
+    if (row) {
+      if (row.name !== MIGRATION_NAME || row.checksum !== MIGRATION_HASH || version !== MIGRATION_VERSION) throw new StoreIntegrityError("migration_history_drift");
+      return;
+    }
+    if (version !== 0) throw new StoreIntegrityError("migration_history_missing");
+    this.db.transaction(() => {
+      this.db.exec(MIGRATION_SQL);
+      this.db.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)").run(MIGRATION_VERSION, MIGRATION_NAME, MIGRATION_HASH, this.clock().toISOString());
+      this.db.pragma(`user_version = ${MIGRATION_VERSION}`);
+    })();
+  }
+
+  async createSession(input: CreateSessionInput): Promise<SessionRecord> {
+    requireId(input.sessionId, "sessionId"); requireId(input.workspaceId, "workspaceId"); requireTimestamp(input.createdAt, "createdAt");
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(input.sessionId) as Row | undefined;
+      if (prior) {
+        if (prior.workspace_id !== input.workspaceId || prior.created_at !== input.createdAt) throw new IdempotencyConflictError("session_identity_conflict");
+        return this.toSession(prior);
+      }
+      this.db.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run(input.sessionId, input.workspaceId, input.createdAt, input.createdAt);
+      return { schemaVersion: "meliora.session.v1" as const, ...input, updatedAt: input.createdAt };
+    })();
+  }
+
+  async createTurn(input: CreateTurnInput): Promise<TurnRecord> {
+    requireId(input.turnId, "turnId"); requireTimestamp(input.createdAt, "createdAt");
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT * FROM turns WHERE turn_id=?").get(input.turnId) as Row | undefined;
+      if (prior) {
+        if (prior.session_id !== input.sessionId || prior.intent_revision !== input.intentRevision || prior.created_at !== input.createdAt) throw new IdempotencyConflictError("turn_identity_conflict");
+        return this.toTurn(prior);
+      }
+      if (!this.db.prepare("SELECT 1 FROM sessions WHERE session_id=?").get(input.sessionId)) throw new Error("session_not_found");
+      this.db.prepare("INSERT INTO turns VALUES (?,?,?,?,?)").run(input.turnId, input.sessionId, input.intentRevision, input.createdAt, input.createdAt);
+      return { schemaVersion: "meliora.turn.v1" as const, ...input, updatedAt: input.createdAt };
+    })();
+  }
+
+  async createRun(input: CreateRunInput): Promise<PersistedRunRecord> {
+    requireId(input.runId, "runId"); requireId(input.initialAttemptId, "initialAttemptId"); requireTimestamp(input.createdAt, "createdAt");
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (prior) {
+        const attempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_number=1").get(input.runId) as Row | undefined;
+        if (prior.session_id !== input.sessionId || prior.turn_id !== input.turnId || prior.active_attempt_id !== input.initialAttemptId || attempt?.catalog_hash !== input.catalogHash || attempt?.intent_revision !== input.intentRevision) throw new IdempotencyConflictError("run_identity_conflict");
+        return this.toRun(prior);
+      }
+      const turn = this.db.prepare("SELECT session_id,intent_revision FROM turns WHERE turn_id=?").get(input.turnId) as Row | undefined;
+      if (!turn || turn.session_id !== input.sessionId || turn.intent_revision !== input.intentRevision) throw new Error("turn_not_found");
+      this.db.prepare("INSERT INTO runs VALUES (?,?,?,?,?,?,?)").run(input.runId, input.turnId, input.sessionId, input.initialAttemptId, 1, input.createdAt, input.createdAt);
+      this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(input.initialAttemptId, input.runId, input.sessionId, input.turnId, 1, "created", 0, input.catalogHash, input.intentRevision, "null", input.createdAt, input.createdAt);
+      return { schemaVersion: "meliora.persisted-run.v1" as const, sessionId: input.sessionId, turnId: input.turnId, runId: input.runId, activeAttemptId: input.initialAttemptId, latestAttemptNumber: 1, createdAt: input.createdAt, updatedAt: input.createdAt };
+    })();
+  }
+
+  async createRunAttempt(input: CreateRunAttemptInput): Promise<CreateRunAttemptResult> {
+    requireTimestamp(input.createdAt, "createdAt"); requireTimestamp(input.requestedAt, "requestedAt"); this.requireTtl(input.ttlMs);
+    return this.db.transaction((): CreateRunAttemptResult => {
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!run || run.latest_attempt_number !== input.expectedLatestAttemptNumber) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run?.latest_attempt_number ?? -1 };
+      const latest = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, run.active_attempt_id) as Row | undefined;
+      const forged = run.session_id !== input.sessionId || run.turn_id !== input.turnId || latest?.catalog_hash !== input.catalogHash || latest?.intent_revision !== input.intentRevision || !!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId);
+      if (forged) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run.latest_attempt_number };
+      const active = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND expires_at>?").get(input.runId, this.clock().toISOString()) as Row | undefined;
+      if (active) return { kind: "conflict", code: "lease_held", latestAttemptNumber: run.latest_attempt_number, expiresAt: active.expires_at };
+      const attemptNumber = run.latest_attempt_number + 1;
+      const leaseToken = this.nonce();
+      const expiresAt = new Date(Date.parse(input.requestedAt) + input.ttlMs).toISOString();
+      this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(input.attemptId, input.runId, input.sessionId, input.turnId, attemptNumber, "created", latest!.last_event_sequence, input.catalogHash, input.intentRevision, "null", input.createdAt, input.createdAt);
+      this.db.prepare("UPDATE runs SET active_attempt_id=?,latest_attempt_number=?,updated_at=? WHERE run_id=?").run(input.attemptId, attemptNumber, input.createdAt, input.runId);
+      this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?)").run(input.runId, input.attemptId, input.ownerId, hashBytes(leaseToken), expiresAt);
+      const row = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row;
+      return { kind: "created", attempt: this.toAttempt(row), lease: { leaseToken, expiresAt } };
+    })();
+  }
+
+  async appendEvents(input: AppendEventsInput): Promise<AppendEventsResult> {
+    for (const event of input.events) {
+      requireId(event.eventId, "eventId");
+      requireTimestamp(event.createdAt, "event.createdAt");
+      assertPersistableJson(event.payload, "event.payload");
+    }
+    return this.db.transaction((): AppendEventsResult => {
+      const attempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
+      if (!attempt) return { kind: "conflict", code: "run_attempt_conflict" };
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      if (attempt.last_event_sequence !== input.expectedSequence) return { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt.last_event_sequence };
+      const events: StoredEvent[] = input.events.map((event, index) => ({ ...event, runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + index + 1 }));
+      for (const event of events) {
+        const payload = canonicalJson(event.payload);
+        this.db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(event.eventId, event.runId, event.attemptId, event.sequence, event.schemaVersion, event.kind, event.visibility, payload, hashBytes(json(event)), event.createdAt, event.causationId ?? null, event.correlationId ?? null);
+      }
+      const lastSequence = input.expectedSequence + events.length;
+      this.db.prepare("UPDATE run_attempts SET last_event_sequence=?,updated_at=? WHERE run_id=? AND attempt_id=?").run(lastSequence, this.clock().toISOString(), input.runId, input.attemptId);
+      return { kind: "appended", events, lastSequence };
+    })();
+  }
+
+  async readEvents(input: ReadEventsInput): Promise<EventPage> {
+    const after = input.afterSequence ?? 0;
+    if (!Number.isInteger(after) || after < 0 || !Number.isInteger(input.limit) || input.limit < 1) throw new TypeError("invalid_event_page");
+    const rows = this.db.prepare("SELECT * FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(input.runId, after, input.limit + 1) as Row[];
+    const events = rows.slice(0, input.limit).map((row) => this.toEvent(row));
+    return { events, nextSequence: rows.length > input.limit ? events.at(-1)?.sequence ?? null : null };
+  }
+
+  async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
+    const snapshot = input.snapshot; assertPersistableJson(snapshot.state, "snapshot.state");
+    this.db.transaction(() => {
+      const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?").get(snapshot.runId, snapshot.attemptId) as Row | undefined;
+      if (!attempt || attempt.last_event_sequence !== input.expectedSequence || snapshot.throughSequence > input.expectedSequence) throw new SequenceConflictError(snapshot.runId, input.expectedSequence, attempt?.last_event_sequence ?? -1);
+      const lease = this.leaseConflict(snapshot.runId, snapshot.attemptId, input.leaseToken); if (lease) throw new IdempotencyConflictError(lease);
+      const state = canonicalJson(snapshot.state); const stateHash = hashBytes(state);
+      const prior = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(snapshot.runId) as Row | undefined;
+      if (prior?.through_sequence === snapshot.throughSequence) {
+        if (prior.snapshot_id !== snapshot.snapshotId || prior.attempt_id !== snapshot.attemptId || prior.state_json !== state) throw new IdempotencyConflictError("snapshot_content_conflict");
+        return;
+      }
+      if (prior && prior.through_sequence > snapshot.throughSequence) throw new SequenceConflictError(snapshot.runId, snapshot.throughSequence, prior.through_sequence);
+      this.db.prepare("INSERT INTO run_snapshots VALUES (?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET attempt_id=excluded.attempt_id,snapshot_id=excluded.snapshot_id,through_sequence=excluded.through_sequence,state_json=excluded.state_json,state_hash=excluded.state_hash,created_at=excluded.created_at").run(snapshot.runId, snapshot.attemptId, snapshot.snapshotId, snapshot.throughSequence, state, stateHash, snapshot.createdAt);
+    })();
+  }
+
+  async readSnapshot(runId: string): Promise<RunSnapshot | null> {
+    const row = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(runId) as Row | undefined;
+    if (!row) return null;
+    if (hashBytes(row.state_json) !== row.state_hash) throw new StoreIntegrityError("snapshot_hash_drift");
+    return { schemaVersion: "meliora.run-snapshot.v1", snapshotId: row.snapshot_id, runId: row.run_id, attemptId: row.attempt_id, throughSequence: row.through_sequence, state: JSON.parse(row.state_json) as JsonValue, createdAt: row.created_at };
+  }
+
+  async reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult> {
+    const invocation = input.invocation;
+    assertPersistableJson(JSON.parse(JSON.stringify(invocation)) as JsonValue, "invocation");
+    return this.db.transaction((): ReservationResult => {
+      if (!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(invocation.runId, invocation.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+      const prior = this.db.prepare("SELECT * FROM invocations WHERE run_id=? AND idempotency_key=?").get(invocation.runId, invocation.idempotencyKey) as Row | undefined;
+      if (prior) {
+        const existing = this.toInvocation(prior);
+        if (!this.sameInvocation(existing, invocation)) return { kind: "conflict", code: "idempotency_key_conflict" };
+        return { kind: "replay", reservationId: prior.reservation_id, invocation: existing, receipt: this.receiptForReservation(prior.reservation_id) };
+      }
+      const lease = this.leaseConflict(invocation.runId, invocation.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      if (this.db.prepare("SELECT 1 FROM invocations WHERE run_id=? AND attempt_id=? AND invocation_id=?").get(invocation.runId, invocation.attemptId, invocation.invocationId)) return { kind: "conflict", code: "invocation_reservation_conflict" };
+      const reservationId = this.nonce(); const body = json(invocation);
+      this.db.prepare("INSERT INTO invocations VALUES (?,?,?,?,?,?,?,?,?)").run(invocation.invocationId, invocation.runId, invocation.attemptId, reservationId, invocation.idempotencyKey, body, hashBytes(body), invocation.status, input.reservedAt);
+      return { kind: "owner", reservationId };
+    })();
+  }
+
+  async readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null> {
+    const row = this.db.prepare("SELECT * FROM invocations WHERE run_id=? AND attempt_id=? AND invocation_id=?").get(input.runId, input.attemptId, input.invocationId) as Row | undefined;
+    return row ? this.toInvocation(row) : null;
+  }
+
+  async readReservation(input: ReadReservationInput): Promise<StoredInvocationReservation | null> {
+    const row = this.db.prepare("SELECT * FROM invocations WHERE run_id=? AND attempt_id=? AND invocation_id=?").get(input.runId, input.attemptId, input.invocationId) as Row | undefined;
+    return row ? this.toReservation(row) : null;
+  }
+
+  async readInvocationByIdempotencyKey(input: ReadInvocationByIdempotencyKeyInput): Promise<InvocationReconciliationRecord | null> {
+    const row = this.db.prepare("SELECT * FROM invocations WHERE run_id=? AND idempotency_key=?").get(input.runId, input.idempotencyKey) as Row | undefined;
+    return row ? { reservation: this.toReservation(row), invocation: this.toInvocation(row), receipt: this.receiptForReservation(row.reservation_id) } : null;
+  }
+
+  async commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult> {
+    return this.db.transaction((): CommitReceiptResult => {
+      if (!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      const row = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+      if (!row || row.run_id !== input.runId || row.attempt_id !== input.attemptId || row.invocation_id !== input.receipt.invocationId) return { kind: "conflict", code: "invocation_reservation_conflict" };
+      const invocation = this.toInvocation(row);
+      if (!this.receiptMatches(input.receipt, invocation)) return { kind: "conflict", code: "receipt_conflict" };
+      const prior = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+      if (prior) return sameJson(JSON.parse(prior.receipt_json), input.receipt) ? { kind: "replay", receiptId: prior.receipt_id } : { kind: "conflict", code: "receipt_conflict" };
+      const reusedReceiptId = this.db
+        .prepare("SELECT reservation_id FROM receipts WHERE run_id=? AND attempt_id=? AND receipt_id=?")
+        .get(input.runId, input.attemptId, input.receipt.receiptId) as Row | undefined;
+      if (reusedReceiptId) return { kind: "conflict", code: "receipt_conflict" };
+      assertPersistableJson(JSON.parse(JSON.stringify(input.receipt)) as JsonValue, "receipt");
+      const body = json(input.receipt);
+      this.db.prepare("INSERT INTO receipts VALUES (?,?,?,?,?,?,?)").run(input.receipt.receiptId, input.runId, input.attemptId, input.reservationId, body, hashBytes(body), input.receipt.endedAt);
+      const updated = json({ ...invocation, status: input.receipt.status });
+      this.db.prepare("UPDATE invocations SET status=?,invocation_json=?,invocation_hash=? WHERE reservation_id=?").run(input.receipt.status, updated, hashBytes(updated), input.reservationId);
+      return { kind: "committed", receiptId: input.receipt.receiptId };
+    })();
+  }
+
+  async readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null> {
+    const row = this.db.prepare("SELECT * FROM receipts WHERE run_id=? AND attempt_id=? AND receipt_id=?").get(input.runId, input.attemptId, input.receiptId) as Row | undefined;
+    return row ? this.toReceipt(row) : null;
+  }
+
+  async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
+    assertPersistableText(new TextDecoder().decode(input.content), "artifact.content");
+    if (input.metadata !== undefined) assertPersistableJson(input.metadata, "artifact.metadata");
+    const actualHash = hashBytes(input.content);
+    if (actualHash !== input.contentHash) throw new IdempotencyConflictError("artifact_content_hash_conflict");
+    const metadata = input.metadata === undefined ? null : canonicalJson(input.metadata);
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(input.artifactId) as Row | undefined;
+      if (prior) {
+        if (prior.content_hash !== input.contentHash || prior.media_type !== input.mediaType || prior.byte_length !== input.content.byteLength || prior.visibility !== input.visibility || prior.metadata_json !== metadata || prior.created_at !== input.createdAt) throw new IdempotencyConflictError("artifact_conflict");
+        return this.toArtifactRef(prior);
+      }
+      this.db.prepare("INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)").run(input.artifactId, input.contentHash, input.mediaType, Buffer.from(input.content), input.content.byteLength, input.visibility, metadata, input.createdAt);
+      return { artifactId: input.artifactId, contentHash: input.contentHash, mediaType: input.mediaType, byteLength: input.content.byteLength, visibility: input.visibility };
+    })();
+  }
+
+  async getArtifact(id: string): Promise<Artifact | null> {
+    const row = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(id) as Row | undefined;
+    if (!row) return null;
+    if (row.content.byteLength !== row.byte_length || hashBytes(row.content) !== row.content_hash) throw new StoreIntegrityError("artifact_hash_drift");
+    const artifact = { ...this.toArtifactRef(row), createdAt: row.created_at, content: new Uint8Array(row.content) };
+    return row.metadata_json === null ? artifact : { ...artifact, metadata: JSON.parse(row.metadata_json) as JsonValue };
+  }
+
+  async acquireLease(input: LeaseRequest): Promise<LeaseResult> {
+    this.requireTtl(input.ttlMs); requireTimestamp(input.requestedAt, "requestedAt");
+    return this.db.transaction((): LeaseResult => {
+      const run = this.db.prepare("SELECT active_attempt_id FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!run || run.active_attempt_id !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+      const prior = this.db.prepare("SELECT * FROM run_leases WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
+      if (prior && Date.parse(prior.expires_at) > this.clock().getTime()) return { kind: "held", expiresAt: prior.expires_at };
+      const leaseToken = this.nonce(); const expiresAt = new Date(Date.parse(input.requestedAt) + input.ttlMs).toISOString();
+      this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?) ON CONFLICT(run_id,attempt_id) DO UPDATE SET owner_id=excluded.owner_id,lease_token_hash=excluded.lease_token_hash,expires_at=excluded.expires_at").run(input.runId, input.attemptId, input.ownerId, hashBytes(leaseToken), expiresAt);
+      return { kind: "acquired", leaseToken, expiresAt };
+    })();
+  }
+
+  async renewLease(input: LeaseRenewal): Promise<boolean> {
+    this.requireTtl(input.ttlMs); requireTimestamp(input.renewedAt, "renewedAt");
+    const tokenHash = hashBytes(input.leaseToken);
+    const current = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").get(input.runId, input.attemptId, tokenHash) as Row | undefined;
+    if (!current || Date.parse(current.expires_at) <= this.clock().getTime()) return false;
+    const expiresAt = new Date(Date.parse(input.renewedAt) + input.ttlMs).toISOString();
+    return this.db.prepare("UPDATE run_leases SET expires_at=? WHERE run_id=? AND attempt_id=? AND lease_token_hash=?").run(expiresAt, input.runId, input.attemptId, tokenHash).changes === 1;
+  }
+
+  /** Server composition helper; intentionally not part of the frozen port. */
+  async readRunSessionId(runId: string): Promise<string | null> {
+    const row = this.db.prepare("SELECT session_id FROM runs WHERE run_id=?").get(runId) as Row | undefined;
+    return row?.session_id ?? null;
+  }
+
+  close(): void { this.db.pragma("wal_checkpoint(TRUNCATE)"); this.db.close(); }
+
+  private leaseConflict(runId: string, attemptId: string, token: string): LeaseConflict | null {
+    const row = this.db.prepare("SELECT lease_token_hash,expires_at FROM run_leases WHERE run_id=? AND attempt_id=?").get(runId, attemptId) as Row | undefined;
+    if (!row || row.lease_token_hash !== hashBytes(token)) return "lease_not_held";
+    return Date.parse(row.expires_at) <= this.clock().getTime() ? "lease_expired" : null;
+  }
+  private requireTtl(ttlMs: number): void { if (!Number.isInteger(ttlMs) || ttlMs < 1) throw new TypeError("lease_ttl_invalid"); }
+  private toSession(row: Row): SessionRecord { return { schemaVersion: "meliora.session.v1", sessionId: row.session_id, workspaceId: row.workspace_id, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private toTurn(row: Row): TurnRecord { return { schemaVersion: "meliora.turn.v1", sessionId: row.session_id, turnId: row.turn_id, intentRevision: row.intent_revision, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private toRun(row: Row): PersistedRunRecord { return { schemaVersion: "meliora.persisted-run.v1", sessionId: row.session_id, turnId: row.turn_id, runId: row.run_id, activeAttemptId: row.active_attempt_id, latestAttemptNumber: row.latest_attempt_number, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private toAttempt(row: Row): PersistedRunAttempt { return { schemaVersion: "meliora.persisted-run-attempt.v1", sessionId: row.session_id, turnId: row.turn_id, runId: row.run_id, attemptId: row.attempt_id, attemptNumber: row.attempt_number, status: row.status, lastEventSequence: row.last_event_sequence, catalogHash: row.catalog_hash, intentRevision: row.intent_revision, runtimeState: JSON.parse(row.runtime_state_json) as JsonValue, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private toEvent(row: Row): StoredEvent {
+    const event: StoredEvent = { schemaVersion: row.schema_version, eventId: row.event_id, runId: row.run_id, attemptId: row.attempt_id, sequence: row.sequence, kind: row.kind, visibility: row.visibility, payload: JSON.parse(row.payload_json) as JsonValue, createdAt: row.created_at, ...(row.causation_id === null ? {} : { causationId: row.causation_id }), ...(row.correlation_id === null ? {} : { correlationId: row.correlation_id }) };
+    if (hashBytes(json(event)) !== row.event_hash) throw new StoreIntegrityError("event_hash_drift");
+    return event;
+  }
+  private toInvocation(row: Row): NormalizedToolInvocation { if (hashBytes(row.invocation_json) !== row.invocation_hash) throw new StoreIntegrityError("invocation_hash_drift"); return JSON.parse(row.invocation_json) as NormalizedToolInvocation; }
+  private toReservation(row: Row): StoredInvocationReservation { return { reservationId: row.reservation_id, runId: row.run_id, attemptId: row.attempt_id, invocationId: row.invocation_id, idempotencyKey: row.idempotency_key, status: row.status, reservedAt: row.reserved_at }; }
+  private toReceipt(row: Row): ToolReceipt { if (hashBytes(row.receipt_json) !== row.receipt_hash) throw new StoreIntegrityError("receipt_hash_drift"); return JSON.parse(row.receipt_json) as ToolReceipt; }
+  private receiptForReservation(id: string): ToolReceipt | null { const row = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(id) as Row | undefined; return row ? this.toReceipt(row) : null; }
+  private sameInvocation(a: NormalizedToolInvocation, b: NormalizedToolInvocation): boolean { return a.invocationId === b.invocationId && a.runId === b.runId && a.attemptId === b.attemptId && a.toolName === b.toolName && a.toolVersion === b.toolVersion && a.argumentsHash === b.argumentsHash && a.catalogHash === b.catalogHash && a.idempotencyKey === b.idempotencyKey && sameJson(a.arguments, b.arguments); }
+  private receiptMatches(receipt: ToolReceipt, invocation: NormalizedToolInvocation): boolean { return receipt.invocationId === invocation.invocationId && receipt.runId === invocation.runId && receipt.attemptId === invocation.attemptId && receipt.toolName === invocation.toolName && receipt.toolVersion === invocation.toolVersion && receipt.argumentsHash === invocation.argumentsHash && receipt.catalogHash === invocation.catalogHash; }
+  private toArtifactRef(row: Row): ArtifactRef { return { artifactId: row.artifact_id, contentHash: row.content_hash, mediaType: row.media_type, byteLength: row.byte_length, visibility: row.visibility }; }
+}
