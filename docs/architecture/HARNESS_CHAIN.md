@@ -96,6 +96,16 @@ Codec 不执行工具、不审批、不写业务状态、不决定任务是否�
 
 每个 Codec 必须有无密钥 fixture，覆盖文本成功、单工具、多工具、参数分片、非法 JSON、缺失/重复 ID、限流、断流和 usage 缺失。
 
+### 4.1 M0 HTTP/SSE Transport 边界
+
+- DeepSeek 与 Kimi 共用 OpenAI-compatible Chat Completions transport，但各自默认只向官方 origin 发送凭证。
+- 自定义 HTTPS 网关和本地 loopback 网关必须由服务端配置以 exact origin 显式加入 trusted list；浏览器输入、模型输出和请求参数不能决定 endpoint 或 trusted origin。
+- Transport 不读取 `process.env`、不记录 Authorization、URL、响应 body 或底层 Error 原文，也不在内部隐式重试。重试由拥有 durable Model Step 状态的 Runtime 决定。
+- SSE reader 必须处理 UTF-8 字节分片、CRLF、注释、多行 `data`、`[DONE]`、显式 `finish_reason`、超时和调用方取消，并限制单事件、响应与总流大小。
+- `[DONE]` 只有在已收到合法 `finish_reason` 后才能结束成功；缺少终止语义、非法 JSON 或越界响应统一投影为安全的 `provider_malformed_stream`。
+- Tool history 回填使用 Runtime `invocationId` 作为关联 ID；Provider Tool Call ID 仅作协议元数据，缺失或重复时不能成为内部或重放主键。
+- M0 transport 先返回一次 Model Step 的完整 `CanonicalModelEvent[]`。逐 delta durable append 与 Public SSE 实时投影属于后续 Runtime 集成切片，不能在本阶段宣称已经完成。
+
 ## 5. Context Engine
 
 上下文分四层：
