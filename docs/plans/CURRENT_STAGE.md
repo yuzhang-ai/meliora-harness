@@ -2,7 +2,7 @@
 
 > 状态：Active
 > 里程碑：M0 - 基线与契约冻结
-> 版本：v0.1
+> 版本：v0.2
 > 最后更新：2026-09-11
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
@@ -18,13 +18,13 @@
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: local orphan main created from an E3 provenance checkout
+Target repo state: main@e56ed392；PR #8 已通过独立审查并 squash merge
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-CI: workflow created locally
-Team access: not verified
+CI: GitHub Actions run 34572069965 passed
+Team access: QinJunpu verified；张子恒 GitHub identity pending
 Blocked: none
 ```
 
@@ -129,9 +129,11 @@ WP-A read-only runtime + WP-C store
 | Contract-first PR | 你 + Codex | Merged | PR #3 已合并至 main `3f2e24f0`；CI、全量 check 与独立审查通过 |
 | Read-only Runtime | 你 + Codex | Merged | PR #5 已合并至 main `e3b8a1a1`；真实 Host/Store/Run loop、CI 与独立安全复审通过 |
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
-| Store/Server skeleton | 秦峻溥 | Ready | Issue #2；基于合并后的 SessionStorePort 开工 |
+| Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
+| Provider HTTP/SSE transport | 你 + Codex | Ready | Issue #7；从 main `e56ed392` 开始，继续以无密钥 fixture 为默认门禁 |
+| Store/SSE follow-up hardening | 秦峻溥 | Backlog | retained-event exhaustion 的 snapshot + resume-point、Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice 与只读 Runtime 已分别通过 PR #3、#5 合并到 `main`。下一步由张子恒、秦峻溥从 Issue #1、#2 的最新主分支并行开发 Web Shell 与 Store/SSE；后端主线进入真实 Provider transport、server composition 和恢复路径设计，但继续保持无密钥 fixture 为默认门禁。
+Contract-first slice、只读 Runtime、Store/Server skeleton 已分别通过 PR #3、#5、#8 合并到 `main`。张子恒继续在 Issue #1 内基于固定 `PublicRunEvent` fixtures 开发 Web Shell；后端主线从 main `e56ed392` 推进 Issue #7 的 Kimi/DeepSeek credential-free HTTP/SSE transport。秦峻溥冻结已合并分支，待独立 follow-up Issue 再处理 snapshot + resume-point 与 Windows ACL，不向 PR #8 继续追加范围。Issue #1 与 #7 分别验收后，再建立 Runtime + SQLite + Server SSE + Web 的真实集成施工单。
