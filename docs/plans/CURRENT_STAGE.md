@@ -130,10 +130,10 @@ WP-A read-only runtime + WP-C store
 | Read-only Runtime | 你 + Codex | Merged | PR #5 已合并至 main `e3b8a1a1`；真实 Host/Store/Run loop、CI 与独立安全复审通过 |
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
-| Provider HTTP/SSE transport | 你 + Codex | Ready | Issue #7；从 main `e56ed392` 开始，继续以无密钥 fixture 为默认门禁 |
+| Provider HTTP/SSE transport | 你 + Codex | In Review | Issue #7；基于 main `627fac05` 完成实现与无密钥 fixture 验收，独立安全复审通过，等待 Draft PR 与 CI |
 | Store/SSE follow-up hardening | 秦峻溥 | Backlog | retained-event exhaustion 的 snapshot + resume-point、Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton 已分别通过 PR #3、#5、#8 合并到 `main`。张子恒继续在 Issue #1 内基于固定 `PublicRunEvent` fixtures 开发 Web Shell；后端主线从 main `e56ed392` 推进 Issue #7 的 Kimi/DeepSeek credential-free HTTP/SSE transport。秦峻溥冻结已合并分支，待独立 follow-up Issue 再处理 snapshot + resume-point 与 Windows ACL，不向 PR #8 继续追加范围。Issue #1 与 #7 分别验收后，再建立 Runtime + SQLite + Server SSE + Web 的真实集成施工单。
+Contract-first slice、只读 Runtime、Store/Server skeleton 已分别通过 PR #3、#5、#8 合并到 `main`。张子恒继续在 Issue #1 内基于固定 `PublicRunEvent` fixtures 开发 Web Shell；后端主线已基于 main `627fac05` 完成 Issue #7 的 Kimi/DeepSeek HTTP/SSE transport，并通过无密钥 fixture 与独立安全复审，当前等待 Draft PR CI。秦峻溥冻结已合并分支，待独立 follow-up Issue 再处理 snapshot + resume-point 与 Windows ACL，不向 PR #8 继续追加范围。Issue #1 与 #7 分别验收后，再建立 Runtime + SQLite + Server SSE + Web 的真实集成施工单。
