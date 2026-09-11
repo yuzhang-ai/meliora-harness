@@ -5,6 +5,8 @@ import type {
   ArtifactRef,
   CommitReceiptInput,
   CommitReceiptResult,
+  FinishModelStepInput,
+  FinishModelStepResult,
   CreateRunAttemptInput,
   CreateRunAttemptResult,
   CreateRunInput,
@@ -18,22 +20,47 @@ import type {
   PersistedRunAttempt,
   PersistedRunRecord,
   PutArtifactInput,
+  ReadLatestModelStepInput,
+  ReadModelStepInput,
+  ReadPrivateUserInputInput,
   ReadEventsInput,
   ReadInvocationInput,
   ReadInvocationByIdempotencyKeyInput,
   ReadReceiptInput,
   ReadReservationInput,
   ReservationResult,
+  ReserveRunCommandInput,
+  ReserveRunCommandResult,
+  RunCommandScope,
   RunSnapshot,
   SessionRecord,
   SessionStorePort,
   StoredEvent,
   StoredInvocationReservation,
+  StoredModelStepCheckpoint,
+  StoredPrivateUserInput,
+  StoredRunCommand,
+  StartModelStepInput,
+  StartModelStepResult,
+  TransitionRunCommandInput,
+  TransitionRunCommandResult,
   TurnRecord,
   WriteSnapshotInput,
   InvocationReconciliationRecord,
 } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
+import {
+  assertValidCommandTimestamp,
+  assertValidGeneratedId,
+  assertValidIdempotencyKey,
+  assertValidLocalPrincipalId,
+  assertValidModelStepFingerprint,
+  assertValidReserveRunCommandInput,
+  assertValidSafeCode,
+  assertValidWorkspaceId,
+  canTransitionRunCommand,
+  privateUserInputContentHash,
+} from "./run-command-contract";
 
 type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
 
@@ -48,6 +75,9 @@ const invocationKey = (runId: string, attemptId: string, invocationId: string) =
   `${runId}\u0000${attemptId}\u0000${invocationId}`;
 const receiptKey = (runId: string, attemptId: string, receiptId: string) =>
   `${runId}\u0000${attemptId}\u0000${receiptId}`;
+const commandScopeKey = (scope: RunCommandScope) =>
+  `${scope.localPrincipalId}\u0000${scope.workspaceId}\u0000${scope.idempotencyKey}`;
+const modelStepKey = (runId: string, modelStepId: string) => `${runId}\u0000${modelStepId}`;
 const sameDocument = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 const sameInvocationRequest = (
   left: NormalizedToolInvocation,
@@ -68,6 +98,10 @@ const sameInvocationRequest = (
  * models the durable Store invariants without committing Meliora to SQLite.
  */
 export class MemorySessionStore implements SessionStorePort {
+  private readonly commands = new Map<string, StoredRunCommand>();
+  private readonly commandScopeByRunId = new Map<string, string>();
+  private readonly privateUserInputs = new Map<string, StoredPrivateUserInput>();
+  private readonly modelSteps = new Map<string, StoredModelStepCheckpoint>();
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly turns = new Map<string, TurnRecord>();
   private readonly runs = new Map<string, PersistedRunRecord>();
@@ -92,6 +126,264 @@ export class MemorySessionStore implements SessionStorePort {
     this.clock = options.clock ?? (() => new Date());
     this.nextLeaseToken = options.nextLeaseToken ?? (() => `lease-${++this.leaseSequence}`);
     this.nextReservationId = options.nextReservationId ?? (() => `reservation-${++this.reservationSequence}`);
+  }
+
+  async reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult> {
+    assertValidReserveRunCommandInput(input);
+    const scopeKey = commandScopeKey(input);
+    const existing = this.commands.get(scopeKey);
+    if (existing) {
+      return existing.canonicalRequestHash === input.canonicalRequestHash
+        ? { kind: "replay", command: existing }
+        : { kind: "conflict", code: "idempotency_key_conflict" };
+    }
+
+    // A new scope owns new stable IDs. Check every collision before mutating a Map.
+    if (
+      this.sessions.has(input.sessionId)
+      || this.turns.has(input.turnId)
+      || this.runs.has(input.runId)
+      || [...this.attempts.values()].some((attempt) => attempt.attemptId === input.attemptId)
+      || this.privateUserInputs.has(input.turnId)
+      || this.commandScopeByRunId.has(input.runId)
+    ) {
+      return { kind: "conflict", code: "command_identity_conflict" };
+    }
+
+    const command: StoredRunCommand = {
+      schemaVersion: "meliora.run-command.v1",
+      localPrincipalId: input.localPrincipalId,
+      workspaceId: input.workspaceId,
+      idempotencyKey: input.idempotencyKey,
+      canonicalRequestHash: input.canonicalRequestHash,
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      runId: input.runId,
+      attemptId: input.attemptId,
+      status: "reserved",
+      createdAt: input.reservedAt,
+      updatedAt: input.reservedAt,
+    };
+    const privateUserInput: StoredPrivateUserInput = {
+      schemaVersion: "meliora.private-user-input.v1",
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      role: "user",
+      visibility: "private",
+      content: input.userMessage,
+      contentHash: privateUserInputContentHash(input.userMessage),
+      createdAt: input.reservedAt,
+    };
+    const session: SessionRecord = {
+      schemaVersion: "meliora.session.v1",
+      sessionId: input.sessionId,
+      workspaceId: input.workspaceId,
+      createdAt: input.reservedAt,
+      updatedAt: input.reservedAt,
+    };
+    const turn: TurnRecord = {
+      schemaVersion: "meliora.turn.v1",
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      intentRevision: input.intentRevision,
+      createdAt: input.reservedAt,
+      updatedAt: input.reservedAt,
+    };
+    const run: PersistedRunRecord = {
+      schemaVersion: "meliora.persisted-run.v1",
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      runId: input.runId,
+      activeAttemptId: input.attemptId,
+      latestAttemptNumber: 1,
+      createdAt: input.reservedAt,
+      updatedAt: input.reservedAt,
+    };
+    const attempt: PersistedRunAttempt = {
+      schemaVersion: "meliora.persisted-run-attempt.v1",
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      runId: input.runId,
+      attemptId: input.attemptId,
+      attemptNumber: 1,
+      status: "created",
+      lastEventSequence: 0,
+      catalogHash: input.catalogHash,
+      intentRevision: input.intentRevision,
+      runtimeState: null,
+      createdAt: input.reservedAt,
+      updatedAt: input.reservedAt,
+    };
+
+    this.sessions.set(session.sessionId, session);
+    this.turns.set(turn.turnId, turn);
+    this.runs.set(run.runId, run);
+    this.attempts.set(attemptKey(run.runId, attempt.attemptId), attempt);
+    this.events.set(run.runId, []);
+    this.privateUserInputs.set(turn.turnId, privateUserInput);
+    this.commands.set(scopeKey, command);
+    this.commandScopeByRunId.set(run.runId, scopeKey);
+    return { kind: "owner", command };
+  }
+
+  async readRunCommand(input: RunCommandScope): Promise<StoredRunCommand | null> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    return this.commands.get(commandScopeKey(input)) ?? null;
+  }
+
+  async transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidCommandTimestamp(input.updatedAt);
+    if (input.nextStatus === "terminal" && !input.terminalStatus) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (input.nextStatus !== "terminal" && (input.terminalStatus !== undefined || input.terminalCode !== undefined)) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (input.terminalCode !== undefined) assertValidSafeCode(input.terminalCode);
+    const key = commandScopeKey(input);
+    const existing = this.commands.get(key);
+    if (!existing) return { kind: "not_found", code: "run_command_not_found" };
+
+    const isExactReplay = existing.status === input.nextStatus
+      && existing.terminalStatus === input.terminalStatus
+      && existing.terminalCode === input.terminalCode;
+    if (isExactReplay) return { kind: "replay", command: existing };
+    if (
+      existing.status !== input.expectedStatus
+      || !canTransitionRunCommand(existing.status, input.nextStatus)
+      || Date.parse(input.updatedAt) < Date.parse(existing.updatedAt)
+    ) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+
+    const {
+      terminalStatus: _terminalStatus,
+      terminalCode: _terminalCode,
+      ...commandBase
+    } = existing;
+    const updated: StoredRunCommand = input.nextStatus === "terminal"
+      ? {
+          ...commandBase,
+          status: "terminal",
+          terminalStatus: input.terminalStatus,
+          ...(input.terminalCode === undefined ? {} : { terminalCode: input.terminalCode }),
+          updatedAt: input.updatedAt,
+        }
+      : { ...commandBase, status: input.nextStatus, updatedAt: input.updatedAt };
+    this.commands.set(key, updated);
+    return { kind: "updated", command: updated };
+  }
+
+  async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
+    const record = this.privateUserInputs.get(input.turnId);
+    return record?.sessionId === input.sessionId ? record : null;
+  }
+
+  async startModelStep(input: StartModelStepInput): Promise<StartModelStepResult> {
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidGeneratedId(input.modelStepId);
+    assertValidModelStepFingerprint(input.requestFingerprint);
+    assertValidCommandTimestamp(input.startedAt);
+    if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const key = modelStepKey(input.runId, input.modelStepId);
+    const existing = this.modelSteps.get(key);
+    if (existing) {
+      return existing.attemptId === input.attemptId && existing.requestFingerprint === input.requestFingerprint
+        ? { kind: "replay", checkpoint: existing }
+        : { kind: "conflict", code: "model_step_conflict" };
+    }
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    const commandScope = this.commandScopeByRunId.get(input.runId);
+    const command = commandScope === undefined ? undefined : this.commands.get(commandScope);
+    if (!command || (command.status !== "accepted" && command.status !== "dispatched")) {
+      return { kind: "conflict", code: "model_step_conflict" };
+    }
+    if (Date.parse(input.startedAt) < Date.parse(command.updatedAt)) {
+      return { kind: "conflict", code: "model_step_conflict" };
+    }
+    const hasPendingStep = [...this.modelSteps.values()].some((checkpoint) => checkpoint.runId === input.runId
+        && checkpoint.status === "started",
+    );
+    if (hasPendingStep) return { kind: "conflict", code: "model_step_in_progress" };
+    const checkpoint: StoredModelStepCheckpoint = {
+      schemaVersion: "meliora.model-step-checkpoint.v1",
+      runId: input.runId,
+      attemptId: input.attemptId,
+      modelStepId: input.modelStepId,
+      requestFingerprint: input.requestFingerprint,
+      status: "started",
+      startedAt: input.startedAt,
+    };
+    if (command.status === "accepted") {
+      this.commands.set(commandScope!, { ...command, status: "dispatched", updatedAt: input.startedAt });
+    }
+    this.modelSteps.set(key, checkpoint);
+    return { kind: "started", checkpoint };
+  }
+
+  async finishModelStep(input: FinishModelStepInput): Promise<FinishModelStepResult> {
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidGeneratedId(input.modelStepId);
+    assertValidModelStepFingerprint(input.requestFingerprint);
+    assertValidCommandTimestamp(input.outcome.finishedAt);
+    if (input.outcome.status === "failed") assertValidSafeCode(input.outcome.failureCode);
+    if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    const key = modelStepKey(input.runId, input.modelStepId);
+    const existing = this.modelSteps.get(key);
+    if (!existing || existing.attemptId !== input.attemptId || existing.requestFingerprint !== input.requestFingerprint) {
+      return { kind: "conflict", code: "model_step_conflict" };
+    }
+    const {
+      status: _status,
+      finishedAt: _finishedAt,
+      failureCode: _failureCode,
+      ...checkpointBase
+    } = existing;
+    const desired: StoredModelStepCheckpoint = input.outcome.status === "terminal"
+      ? { ...checkpointBase, status: "terminal", finishedAt: input.outcome.finishedAt }
+      : {
+          ...checkpointBase,
+          status: "failed",
+          finishedAt: input.outcome.finishedAt,
+          failureCode: input.outcome.failureCode,
+        };
+    if (existing.status !== "started") {
+      return sameDocument(existing, desired)
+        ? { kind: "replay", checkpoint: existing }
+        : { kind: "conflict", code: "model_step_conflict" };
+    }
+    if (Date.parse(input.outcome.finishedAt) < Date.parse(existing.startedAt)) {
+      return { kind: "conflict", code: "model_step_conflict" };
+    }
+    this.modelSteps.set(key, desired);
+    return { kind: "committed", checkpoint: desired };
+  }
+
+  async readModelStep(input: ReadModelStepInput): Promise<StoredModelStepCheckpoint | null> {
+    return this.modelSteps.get(modelStepKey(input.runId, input.modelStepId)) ?? null;
+  }
+
+  async readLatestModelStep(input: ReadLatestModelStepInput): Promise<StoredModelStepCheckpoint | null> {
+    let latest: StoredModelStepCheckpoint | null = null;
+    for (const checkpoint of this.modelSteps.values()) {
+      if (checkpoint.runId !== input.runId || (input.attemptId !== undefined && checkpoint.attemptId !== input.attemptId)) continue;
+      if (!latest || Date.parse(checkpoint.startedAt) >= Date.parse(latest.startedAt)) latest = checkpoint;
+    }
+    return latest;
   }
 
   async createSession(input: CreateSessionInput): Promise<SessionRecord> {

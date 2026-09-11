@@ -10,8 +10,11 @@ import { createTempDatabase, event, seed } from "./helpers.js";
 test("migration is forward-only, checksummed and idempotent", (t) => {
   const path = createTempDatabase(t); new SqliteSessionStore(path).close(); new SqliteSessionStore(path).close();
   const db = new Database(path, { readonly: true });
-  assert.equal(db.pragma("user_version", { simple: true }), 1);
-  assert.deepEqual(db.prepare("SELECT version,name FROM schema_migrations").all(), [{ version: 1, name: "0001_initial.sql" }]);
+  assert.equal(db.pragma("user_version", { simple: true }), 2);
+  assert.deepEqual(db.prepare("SELECT version,name FROM schema_migrations ORDER BY version").all(), [
+    { version: 1, name: "0001_initial.sql" },
+    { version: 2, name: "0002_durable_commands.sql" },
+  ]);
   assert.equal(db.pragma("integrity_check", { simple: true }), "ok"); assert.deepEqual(db.pragma("foreign_key_check"), []); db.close();
 });
 
