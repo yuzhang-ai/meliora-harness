@@ -2,12 +2,27 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import { PUBLIC_RUN_EVENT_SCHEMA_VERSION, type PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
 import type { JsonObject } from "../../../packages/model-protocol/contracts.js";
+import { RunCommandContractError } from "../../../packages/session-store/run-command-contract.js";
 import type { SessionStorePort, StoredEvent } from "../../../packages/session-store/contracts.js";
+import {
+  parseTurnCommandRequest,
+  TURN_COMMAND_ERROR_SCHEMA_VERSION,
+  type TurnCommandErrorCode,
+  type TurnCommandErrorResponse,
+  type TurnCommandRequest,
+  type TurnCommandResponse,
+} from "../api-contracts/turn-command.js";
+
+export type TurnCommandSubmission =
+  | Readonly<{ status: 200 | 202; body: TurnCommandResponse }>
+  | Readonly<{ status: 400 | 404 | 409 | 503 | 500; body: TurnCommandErrorResponse }>;
 
 export interface MelioraServerOptions {
   store: SessionStorePort;
   /** Store deliberately has no Run lookup; composition provides this projection dependency. */
   resolveSessionId: (runId: string) => Promise<string | null> | string | null;
+  submitTurnCommand?: (request: TurnCommandRequest) => Promise<TurnCommandSubmission>;
+  maxJsonBodyBytes?: number;
   pollIntervalMs?: number;
   heartbeatMs?: number;
   isTerminalEvent?: (event: PublicRunEvent) => boolean;
@@ -107,6 +122,7 @@ export const encodeSseEvent = (event: PublicRunEvent): string => {
 };
 
 const json = (value: unknown): string => JSON.stringify(value);
+const DEFAULT_MAX_JSON_BODY_BYTES = 70 * 1024;
 
 export const writeWithBackpressure = async (response: ServerResponse, chunk: string): Promise<boolean> => {
   if (response.destroyed || response.writableEnded) return false;
@@ -136,6 +152,108 @@ const writeJsonError = (response: ServerResponse, status: number, body: { error:
   response.end(json(body));
 };
 
+const turnCommandErrorResponse = (code: TurnCommandErrorCode, retryable: boolean): TurnCommandErrorResponse => ({
+  schemaVersion: TURN_COMMAND_ERROR_SCHEMA_VERSION,
+  error: { code, retryable },
+});
+
+const writeTurnCommandSubmission = (response: ServerResponse, submission: TurnCommandSubmission): void => {
+  if (response.destroyed || response.writableEnded) return;
+  response.writeHead(submission.status, { "content-type": "application/json; charset=utf-8" });
+  response.end(json(submission.body));
+};
+
+const turnCommandContractStatus = (
+  code: TurnCommandErrorCode,
+): 400 | 404 | 409 | 503 | 500 => {
+  switch (code) {
+    case "invalid_request":
+    case "invalid_idempotency_key":
+    case "user_message_empty":
+    case "user_message_too_large":
+    case "sensitive_input_rejected":
+      return 400;
+    case "invalid_workspace":
+      return 404;
+    case "idempotency_key_conflict":
+    case "command_identity_conflict":
+    case "command_status_conflict":
+      return 409;
+    case "service_unavailable":
+      return 503;
+    default:
+      return 500;
+  }
+};
+
+const readJsonBody = async (
+  request: IncomingMessage,
+  maxBytes: number,
+): Promise<Readonly<{ ok: true; value: unknown }> | Readonly<{ ok: false; code: TurnCommandErrorCode }>> => {
+  const contentType = Array.isArray(request.headers["content-type"])
+    ? request.headers["content-type"][0]
+    : request.headers["content-type"];
+  if (contentType !== undefined && !/^application\/json(?:\s*;|$)/iu.test(contentType)) {
+    return { ok: false, code: "invalid_request" };
+  }
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+    totalBytes += buffer.byteLength;
+    if (totalBytes > maxBytes) return { ok: false, code: "invalid_request" };
+    chunks.push(buffer);
+  }
+  try {
+    return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) };
+  } catch {
+    return { ok: false, code: "invalid_request" };
+  }
+};
+
+const handleTurnCommandRequest = async (
+  options: MelioraServerOptions,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> => {
+  if (!options.submitTurnCommand) {
+    writeTurnCommandSubmission(response, {
+      status: 503,
+      body: turnCommandErrorResponse("service_unavailable", true),
+    });
+    return;
+  }
+  const parsedBody = await readJsonBody(request, options.maxJsonBodyBytes ?? DEFAULT_MAX_JSON_BODY_BYTES);
+  if (!parsedBody.ok) {
+    writeTurnCommandSubmission(response, {
+      status: turnCommandContractStatus(parsedBody.code),
+      body: turnCommandErrorResponse(parsedBody.code, false),
+    });
+    return;
+  }
+  let command: TurnCommandRequest;
+  try {
+    command = parseTurnCommandRequest(parsedBody.value);
+  } catch (error) {
+    const code = error instanceof RunCommandContractError
+      ? error.code as TurnCommandErrorCode
+      : "invalid_request";
+    writeTurnCommandSubmission(response, {
+      status: turnCommandContractStatus(code),
+      body: turnCommandErrorResponse(code, false),
+    });
+    return;
+  }
+  try {
+    writeTurnCommandSubmission(response, await options.submitTurnCommand(command));
+  } catch {
+    writeTurnCommandSubmission(response, {
+      status: 500,
+      body: turnCommandErrorResponse("internal_error", true),
+    });
+  }
+};
+
 const parseLastSequence = (header: string | undefined): number | null => {
   if (header === undefined) return 0;
   if (!/^(0|[1-9]\d*)$/u.test(header)) return null;
@@ -159,6 +277,10 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
   if (request.method === "GET" && url.pathname === "/api/health") {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     response.end(json({ ok: true }));
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/turns") {
+    await handleTurnCommandRequest(options, request, response);
     return;
   }
   const runEvents = /^\/api\/runs\/([^/]+)\/events$/u.exec(url.pathname);

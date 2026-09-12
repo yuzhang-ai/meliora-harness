@@ -2,8 +2,8 @@
 
 > 状态：Active
 > 里程碑：M0 - 基线与契约冻结
-> 版本：v0.2
-> 最后更新：2026-09-11
+> 版本：v0.3
+> 最后更新：2026-09-12
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md) 及全部专项规范
@@ -131,11 +131,11 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，当前进入 WP-1 Server composition |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已本地实现并等待独立审查/CI |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command 与 Model Step checkpoint 已通过 PR #3、#5、#8、#10、#14 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；后端进入 WP-1 Server composition，装配受控 workspace、local principal、Provider/Tool adapters 与 `POST /api/turns`，不提前扩展 snapshot/recovery 或 Web 范围。秦峻溥冻结 PR #14，等待 WP-3 的 snapshot/resume adapter 独立任务。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command 与 Model Step checkpoint 已通过 PR #3、#5、#8、#10、#14 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；后端 WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已在隔离 worktree 本地实现，下一动作是独立审查、全量 check、PR/CI，再进入 WP-3 recovery、snapshot 与 resume-point。秦峻溥冻结 PR #14，等待 WP-3 的 snapshot/resume adapter 独立任务。

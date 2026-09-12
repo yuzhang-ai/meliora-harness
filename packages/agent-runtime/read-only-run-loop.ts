@@ -68,11 +68,42 @@ export type ReadOnlyRunIds = Readonly<{
   nextOutcomeId(): string;
 }>;
 
+export type ReadOnlyModelStepCheckpointGate = Readonly<{
+  start(input: Readonly<{
+    runId: string;
+    attemptId: string;
+    leaseToken: string;
+    modelStepId: string;
+    messages: readonly CanonicalInputMessage[];
+    catalog: ToolCatalogSnapshot;
+    startedAt: string;
+  }>): Promise<
+    | Readonly<{ kind: "started"; requestFingerprint: string }>
+    | Readonly<{ kind: "replay"; requestFingerprint: string; status: "terminal" | "failed" }>
+    | Readonly<{ kind: "conflict"; code: string }>
+  >;
+  finish(input: Readonly<{
+    runId: string;
+    attemptId: string;
+    leaseToken: string;
+    modelStepId: string;
+    requestFingerprint: string;
+    outcome:
+      | Readonly<{ status: "terminal"; finishedAt: string }>
+      | Readonly<{ status: "failed"; failureCode: string; finishedAt: string }>;
+  }>): Promise<
+    | Readonly<{ kind: "committed" | "replay" }>
+    | Readonly<{ kind: "conflict"; code: string }>
+  >;
+}>;
+
 export type ReadOnlyRunLoopDependencies = Readonly<{
   store: SessionStorePort;
   model: ReadOnlyRunModelPort;
   tools: ReadOnlyToolPort;
   ids: ReadOnlyRunIds;
+  /** Mandatory durable gate: Provider I/O is forbidden until start returns a new checkpoint. */
+  modelStepCheckpoint: ReadOnlyModelStepCheckpointGate;
   now(): string;
   hashArguments(argumentsValue: JsonObject): string;
   validateArguments?(definition: ToolDefinition, argumentsValue: JsonObject): string | null;
@@ -82,6 +113,12 @@ export type ReadOnlyRunLoopDependencies = Readonly<{
     invocation: NormalizedToolInvocation;
     execution: ReadOnlyToolExecution;
   }>): ReadOnlyToolProjection | Promise<ReadOnlyToolProjection>;
+  /**
+   * Server-owned public projection for assistant text before any private tool
+   * observation has entered the current model-call context. Once a private tool
+   * observation is present, the loop publishes only a fixed redaction notice.
+   */
+  projectAssistantText(input: Readonly<{ content: string }>): string | Promise<string>;
   isPublicArtifact(artifactId: string): Promise<boolean>;
   ownerId: string;
   leaseTtlMs: number;
@@ -100,6 +137,9 @@ export type ReadOnlyRunLoopInput = Readonly<{
   userMessage: string;
   signal?: AbortSignal;
   maxModelSteps?: number;
+  precreated?: Readonly<{
+    leaseToken: string;
+  }>;
 }>;
 
 export type ReadOnlyRunLoopResult = Readonly<{
@@ -128,8 +168,15 @@ const jsonObject = (raw: string): JsonObject | null => {
 const asPublicArtifacts = (ids: readonly string[]): PublicArtifactRef[] =>
   ids.map((artifactId) => ({ artifactId, visibility: "public" }));
 
+const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
+const MODEL_STEP_OUTCOME_UNKNOWN_SUMMARY = "模型步骤结果未知，已停止自动重发 Provider 请求。";
+const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
+const DETERMINISTIC_PROVIDER_FAILURE_CODES = new Set(["provider_authentication_failed", "provider_rate_limited"]);
+const PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION = "模型已基于私有工具结果生成回复，内容已隐藏。";
 const defaultSummary = (definition: ToolDefinition): string => `正在执行只读工具 ${definition.name}。`;
 const isLeaseLostError = (error: unknown): boolean => error instanceof Error && error.message === "run_lease_lost";
+const isAmbiguousProviderFailure = (event: Extract<CanonicalModelEvent, { kind: "model_step_failed" }>): boolean =>
+  !DETERMINISTIC_PROVIDER_FAILURE_CODES.has(event.code);
 
 /**
  * Durable minimum Run loop for M0. It intentionally accepts only L0 tools;
@@ -153,6 +200,7 @@ export class ReadOnlyRunLoop {
     const receipts: ToolReceipt[] = [];
     const verificationIds: string[] = [];
     const publicEvidenceIds: string[] = [];
+    let hasPrivateToolResultObservation = false;
     const messages: CanonicalInputMessage[] = [{ role: "user", content: input.userMessage }];
     const catalogByName = new Map(input.catalog.definitions.map((definition) => [definition.name, definition]));
 
@@ -310,27 +358,50 @@ export class ReadOnlyRunLoop {
       }
       return { outcome, publicEvents };
     };
+    const terminalModelStepOutcomeUnknown = (): Promise<ReadOnlyRunLoopResult> =>
+      terminal(
+        "blocked",
+        MODEL_STEP_OUTCOME_UNKNOWN_SUMMARY,
+        MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        false,
+        MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+      );
 
-    await this.dependencies.store.createSession({ sessionId: input.sessionId, workspaceId: input.workspaceId, createdAt: this.dependencies.now() });
-    await this.dependencies.store.createTurn({ sessionId: input.sessionId, turnId: input.turnId, intentRevision: input.intentRevision, createdAt: this.dependencies.now() });
-    await this.dependencies.store.createRun({
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-      runId: input.runId,
-      initialAttemptId: input.attemptId,
-      catalogHash: input.catalog.catalogHash,
-      intentRevision: input.intentRevision,
-      createdAt: this.dependencies.now(),
-    });
-    const lease = await this.dependencies.store.acquireLease({
-      runId: input.runId,
-      attemptId: input.attemptId,
-      ownerId: this.dependencies.ownerId,
-      ttlMs: this.dependencies.leaseTtlMs,
-      requestedAt: this.dependencies.now(),
-    });
-    if (lease.kind !== "acquired") throw new Error(`run_lease_${lease.kind}`);
-    leaseToken = lease.leaseToken;
+    const startedCheckpointRemains = async (
+      modelStepId: string,
+      requestFingerprint?: string,
+    ): Promise<boolean> => {
+      const checkpoint = await this.dependencies.store.readModelStep({ runId: input.runId, modelStepId });
+      return checkpoint?.status === "started"
+        && checkpoint.attemptId === input.attemptId
+        && (requestFingerprint === undefined || checkpoint.requestFingerprint === requestFingerprint);
+    };
+
+    if (input.precreated) {
+      if (input.precreated.leaseToken.length === 0) throw new Error("run_lease_missing");
+      leaseToken = input.precreated.leaseToken;
+    } else {
+      await this.dependencies.store.createSession({ sessionId: input.sessionId, workspaceId: input.workspaceId, createdAt: this.dependencies.now() });
+      await this.dependencies.store.createTurn({ sessionId: input.sessionId, turnId: input.turnId, intentRevision: input.intentRevision, createdAt: this.dependencies.now() });
+      await this.dependencies.store.createRun({
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        runId: input.runId,
+        initialAttemptId: input.attemptId,
+        catalogHash: input.catalog.catalogHash,
+        intentRevision: input.intentRevision,
+        createdAt: this.dependencies.now(),
+      });
+      const lease = await this.dependencies.store.acquireLease({
+        runId: input.runId,
+        attemptId: input.attemptId,
+        ownerId: this.dependencies.ownerId,
+        ttlMs: this.dependencies.leaseTtlMs,
+        requestedAt: this.dependencies.now(),
+      });
+      if (lease.kind !== "acquired") throw new Error(`run_lease_${lease.kind}`);
+      leaseToken = lease.leaseToken;
+    }
     await changeStatus("preparing");
 
     if (signal.aborted) return terminal("cancelled", "任务已在执行前取消。", "cancelled_before_start");
@@ -340,21 +411,87 @@ export class ReadOnlyRunLoop {
       if (signal.aborted) return terminal("cancelled", "用户取消了当前任务。", "user_requested");
       await changeStatus("model_streaming");
       const modelStepId = this.dependencies.ids.nextModelStepId();
+      let requestFingerprint: string | undefined;
       let modelEvents: readonly CanonicalModelEvent[];
       try {
+        const checkpoint = await this.dependencies.modelStepCheckpoint.start({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          modelStepId,
+          messages,
+          catalog: input.catalog,
+          startedAt: this.dependencies.now(),
+        });
+        if (checkpoint.kind === "conflict") {
+          return terminal(
+            checkpoint.code === "model_step_in_progress" ? "blocked" : "failed",
+            "模型步骤 checkpoint 无法安全开始。",
+            checkpoint.code,
+            checkpoint.code !== "model_step_in_progress",
+            checkpoint.code === "model_step_in_progress" ? ["等待当前模型步骤结果确认后再恢复。"] : [],
+          );
+        }
+        if (checkpoint.kind === "replay") {
+          return terminal(
+            checkpoint.status === "terminal" ? "blocked" : "failed",
+            "模型步骤已存在，当前执行不会重复请求 Provider。",
+            checkpoint.status === "terminal" ? "model_step_replay_without_recovery" : "model_step_failed_checkpoint",
+            false,
+            checkpoint.status === "terminal" ? ["从持久化事件或快照恢复该 Run。"] : [],
+          );
+        }
+        requestFingerprint = checkpoint.requestFingerprint;
         modelEvents = await withLeaseHeartbeat(() => this.dependencies.model.next({ modelStepId, messages, signal }));
       } catch (error) {
         if (isLeaseLostError(error)) throw error;
+        if (await startedCheckpointRemains(modelStepId, requestFingerprint)) {
+          return terminalModelStepOutcomeUnknown();
+        }
         return terminal("failed", "模型调用失败。", "provider_request_failed", true);
+      }
+      if (requestFingerprint) {
+        const failedEvent = modelEvents.find((event): event is Extract<CanonicalModelEvent, { kind: "model_step_failed" }> =>
+          event.kind === "model_step_failed",
+        );
+        if (failedEvent && isAmbiguousProviderFailure(failedEvent)) {
+          return terminalModelStepOutcomeUnknown();
+        }
+        let finished: Awaited<ReturnType<ReadOnlyModelStepCheckpointGate["finish"]>>;
+        try {
+          finished = await this.dependencies.modelStepCheckpoint.finish({
+            runId: input.runId,
+            attemptId: input.attemptId,
+            leaseToken,
+            modelStepId,
+            requestFingerprint,
+            outcome: failedEvent
+              ? { status: "failed", failureCode: failedEvent.code, finishedAt: this.dependencies.now() }
+              : { status: "terminal", finishedAt: this.dependencies.now() },
+          });
+        } catch (error) {
+          if (isLeaseLostError(error)) throw error;
+          if (await startedCheckpointRemains(modelStepId, requestFingerprint)) {
+            return terminalModelStepOutcomeUnknown();
+          }
+          throw error;
+        }
+        if (finished?.kind === "conflict") {
+          if (await startedCheckpointRemains(modelStepId, requestFingerprint)) {
+            return terminalModelStepOutcomeUnknown();
+          }
+          return terminal("failed", "模型步骤 checkpoint 无法安全结束。", finished.code, true);
+        }
       }
       const completedCalls: CompletedToolCall[] = [];
       let assistantContent = "";
+      const assistantDeltas: string[] = [];
       let finishReason: Extract<CanonicalModelEvent, { kind: "model_step_completed" }>["finishReason"] | undefined;
       for (const event of modelEvents) {
         await persistModelEvent(event);
         if (event.kind === "assistant_text_delta") {
           assistantContent += event.delta;
-          await publish("assistant_text_delta", { delta: event.delta });
+          assistantDeltas.push(event.delta);
         } else if (event.kind === "tool_call_completed") {
           const started = modelEvents.find((candidate): candidate is Extract<CanonicalModelEvent, { kind: "tool_call_started" }> =>
             candidate.kind === "tool_call_started" && candidate.invocationId === event.invocationId,
@@ -369,6 +506,26 @@ export class ReadOnlyRunLoop {
           return terminal("failed", event.safeMessage ?? "模型流中断。", event.code, event.retryable);
         } else if (event.kind === "model_step_completed") {
           finishReason = event.finishReason;
+        }
+      }
+      if (assistantDeltas.length > 0) {
+        let publicAssistantContent: string;
+        if (hasPrivateToolResultObservation) {
+          publicAssistantContent = PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION;
+        } else {
+          try {
+            publicAssistantContent = await withLeaseHeartbeat(() => Promise.resolve(
+              this.dependencies.projectAssistantText({ content: assistantContent }),
+            ));
+          } catch (error) {
+            if (isLeaseLostError(error)) throw error;
+            publicAssistantContent = "模型输出包含无法安全公开的内容，已隐藏。";
+          }
+        }
+        if (publicAssistantContent === assistantContent) {
+          for (const delta of assistantDeltas) await publish("assistant_text_delta", { delta });
+        } else if (publicAssistantContent.length > 0) {
+          await publish("assistant_text_delta", { delta: publicAssistantContent });
         }
       }
       if (assistantContent.length > 0 || completedCalls.length > 0) {
@@ -536,6 +693,9 @@ export class ReadOnlyRunLoop {
           summary: projection.publicSummary,
           artifactRefs: asPublicArtifacts(publicArtifactIds),
         });
+        if ((execution.outputArtifactId !== undefined || projection.modelContent !== projection.publicSummary) && projection.modelContent.length > 0) {
+          hasPrivateToolResultObservation = true;
+        }
         if (execution.status === "failed") return terminal("failed", projection.publicSummary, "tool_execution_failed", true);
         if (!execution.verification || execution.verification.status !== "passed") {
           return terminal("blocked", "只读工具完成，但验证尚未通过。", "verification_missing", false, ["请执行或补充验证。"]);
