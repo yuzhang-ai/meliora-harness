@@ -45,6 +45,9 @@ const INTENT_REVISION = 1;
 const LEASE_TTL_MS = 60_000;
 const MAX_MODEL_STEPS = 4;
 const CATALOG_VERSION = "m0-read-only-workspace-tools-v1";
+const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
+const MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE = "模型步骤结果未知，已停止自动重发 Provider 请求。";
+const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
 
 export type TurnCommandIds = ReadOnlyRunIds & Readonly<{
   nextSessionId(): string;
@@ -209,6 +212,17 @@ const safeModelToolContent = (
     }
   }).join("\n").trim();
   return projected.length === 0 ? fallback : projected;
+};
+
+const UNSAFE_ASSISTANT_TEXT_REDACTION = "模型输出包含无法安全公开的内容，已隐藏。";
+
+export const projectServerOwnedAssistantText = (input: Readonly<{ content: string }>): string => {
+  try {
+    assertPersistableText(input.content, "assistant-public-text");
+    return input.content;
+  } catch {
+    return UNSAFE_ASSISTANT_TEXT_REDACTION;
+  }
 };
 
 const createServerOwnedToolProjector = (
@@ -398,6 +412,32 @@ const appendWorkerBlockedEvent = async (
   });
 };
 
+const settleStartedModelStepAsUnknown = async (
+  store: SessionStorePort,
+  command: StoredRunCommand,
+  leaseToken: string,
+  ids: TurnCommandIds,
+  now: () => string,
+): Promise<boolean> => {
+  const latestCommand = await store.readRunCommand(commandScope(command));
+  if (!latestCommand || latestCommand.status === "terminal") return false;
+  const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
+  if (latestStep?.status !== "started") return false;
+  await appendWorkerBlockedEvent(
+    store,
+    latestCommand,
+    leaseToken,
+    MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+    MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+    MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+    ids,
+    now,
+  ).catch(() => undefined);
+  await settleCommand(store, latestCommand, leaseToken, "blocked", MODEL_STEP_OUTCOME_UNKNOWN_CODE, now)
+    .catch(() => undefined);
+  return true;
+};
+
 const runWorker = async (
   options: Required<Omit<TurnCommandSubmitterOptions, "defer" | "ids">> & Readonly<{
     ids: TurnCommandIds;
@@ -425,13 +465,13 @@ const runWorker = async (
         options.store,
         command,
         leaseToken,
-        "model_step_outcome_unknown",
-        "模型步骤结果未知，已停止自动重发 Provider 请求。",
-        ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"],
+        MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+        MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
         options.ids,
         options.now,
       );
-      await settleCommand(options.store, command, leaseToken, "blocked", "model_step_outcome_unknown", options.now);
+      await settleCommand(options.store, command, leaseToken, "blocked", MODEL_STEP_OUTCOME_UNKNOWN_CODE, options.now);
       return;
     }
     if (current.status === "reserved") {
@@ -477,6 +517,7 @@ const runWorker = async (
         normalizeReadOnlyWorkspaceToolArguments(definition.name, value).ok ? null : "只读工具参数无效。",
       describeTool: (definition) => `准备执行只读工具 ${definition.name}。`,
       projectToolResult,
+      projectAssistantText: projectServerOwnedAssistantText,
       isPublicArtifact: async (artifactId) => (await options.store.getArtifact(artifactId))?.visibility === "public",
       ownerId: options.ownerId,
       leaseTtlMs: options.leaseTtlMs,
@@ -501,6 +542,10 @@ const runWorker = async (
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
+      if (await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now)
+        .catch(() => false)) {
+        return;
+      }
       await appendWorkerFailureEvent(options.store, command, leaseToken, "worker_failed", "后台执行失败。", options.ids, options.now)
         .catch(() => undefined);
       await settleCommand(options.store, command, leaseToken, "failed", "worker_failed", options.now)

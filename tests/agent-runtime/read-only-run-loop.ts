@@ -78,6 +78,7 @@ function createLoop(
   const store = new MemorySessionStore({ clock: () => new Date(now()) });
   let modelCalls = 0;
   let checkpointStarts = 0;
+  let assistantProjectionCalls = 0;
   const loop = new ReadOnlyRunLoop({
     store,
     modelStepCheckpoint: checkpointGate(() => { checkpointStarts += 1; }),
@@ -128,13 +129,17 @@ function createLoop(
       publicArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],
       publicVerificationArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],
     }),
+    projectAssistantText: ({ content }) => {
+      assistantProjectionCalls += 1;
+      return content;
+    },
     isPublicArtifact: async (artifactId) => artifactId === "artifact-read-file-summary",
     ownerId: "fixture-worker",
     leaseTtlMs: options.leaseTtlMs ?? 60_000,
     policyVersion: "fixture-policy-v1",
     principalId: "fixture-user",
   });
-  return { loop, store, modelCalls: () => modelCalls };
+  return { loop, store, modelCalls: () => modelCalls, assistantProjectionCalls: () => assistantProjectionCalls };
 }
 
 sequence = 0;
@@ -156,6 +161,7 @@ const successResult = await success.loop.run({
 });
 assert.equal(successResult.outcome.status, "completed");
 assert.equal(success.modelCalls(), 2);
+assert.equal(success.assistantProjectionCalls(), 1, "post-tool assistant text must not rely on the public projector to avoid leaking private observations");
 assert.equal(successResult.outcome.receiptRefs.length, 1);
 assert.equal((await success.store.readReceipt({
   runId: "run-success",
@@ -168,6 +174,12 @@ assert.deepEqual(successResult.publicEvents.map((event) => event.kind), [
   "run_status_changed", "run_status_changed", "run_completed",
 ]);
 assert.equal(successResult.publicEvents.some((event) => JSON.stringify(event).includes("reasoning")), false);
+const successAssistantText = successResult.publicEvents
+  .filter((event): event is Extract<(typeof successResult.publicEvents)[number], { kind: "assistant_text_delta" }> => event.kind === "assistant_text_delta")
+  .map((event) => event.payload.delta)
+  .join("");
+assert.match(successAssistantText, /我先读取入口文件。/u, "pre-tool safe assistant text should still be public");
+assert.match(successAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u, "post-tool assistant text should be fixed redaction");
 assert.equal(JSON.stringify(successResult).includes("API_KEY=secret"), false, "executor text must cross a server-owned projector");
 assert.equal(JSON.stringify(successResult).includes("private-artifact-id"), false, "private artifacts must not become public refs");
 assert.equal((await success.store.readEvents({ runId: "run-success", limit: 100 })).events.some((event) => event.visibility === "private"), true);

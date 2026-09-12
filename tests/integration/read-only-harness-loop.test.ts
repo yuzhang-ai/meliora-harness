@@ -166,6 +166,7 @@ try {
     now: () => fixedNow,
     hashArguments: (argumentsValue) => contentHash(new TextEncoder().encode(JSON.stringify(argumentsValue))),
     projectToolResult: (input) => projector.project(input),
+    projectAssistantText: ({ content }) => content,
     isPublicArtifact: async (artifactId) => (await store.getArtifact(artifactId))?.visibility === "public",
     ownerId: "integration-worker",
     leaseTtlMs: 60_000,

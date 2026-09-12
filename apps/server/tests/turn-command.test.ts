@@ -9,7 +9,13 @@ import { deepseekStreamTextSingleToolFixture } from "../../../fixtures/contracts
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
 import type { ReadOnlyRunModelPort } from "../../../packages/agent-runtime/read-only-run-loop.js";
 import { MemorySessionStore } from "../../../packages/session-store/memory-session-store.js";
-import type { SessionStorePort, StartModelStepInput, StartModelStepResult } from "../../../packages/session-store/contracts.js";
+import type {
+  FinishModelStepInput,
+  FinishModelStepResult,
+  SessionStorePort,
+  StartModelStepInput,
+  StartModelStepResult,
+} from "../../../packages/session-store/contracts.js";
 import { SqliteSessionStore } from "../../../packages/session-store/index.js";
 import {
   TURN_COMMAND_REQUEST_SCHEMA_VERSION,
@@ -282,6 +288,18 @@ class BlockingCheckpointStore extends MemorySessionStore {
   }
 }
 
+class ThrowingFinishModelStepStore extends MemorySessionStore {
+  override async finishModelStep(_input: FinishModelStepInput): Promise<FinishModelStepResult> {
+    throw new Error("injected_finish_model_step_failure");
+  }
+}
+
+class ConflictingFinishModelStepStore extends MemorySessionStore {
+  override async finishModelStep(_input: FinishModelStepInput): Promise<FinishModelStepResult> {
+    return { kind: "conflict", code: "model_step_conflict" };
+  }
+}
+
 test("Model Step checkpoint conflict fails closed without calling the Provider", async () => {
   const store = new BlockingCheckpointStore({ clock: () => new Date(fixedNow) });
   const ids = deterministicIds();
@@ -317,6 +335,78 @@ test("Model Step checkpoint conflict fails closed without calling the Provider",
     }))?.status, "terminal");
   } finally {
     await app.close();
+  }
+});
+
+test("finishModelStep failures preserve the started checkpoint and block provider retry", async (t) => {
+  for (const scenario of [
+    { name: "throw", store: () => new ThrowingFinishModelStepStore({ clock: () => new Date(fixedNow) }) },
+    { name: "conflict", store: () => new ConflictingFinishModelStepStore({ clock: () => new Date(fixedNow) }) },
+  ] as const) {
+    await t.test(scenario.name, async () => {
+      const store = scenario.store();
+      const ids = deterministicIds();
+      const deferred: Array<() => Promise<void>> = [];
+      let modelCalls = 0;
+      const request = {
+        schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+        workspaceId,
+        idempotencyKey: `finish-model-step-${scenario.name}`,
+        message: "检查 finish checkpoint 故障",
+      } as const;
+      const submitTurnCommand = createTurnCommandSubmitter({
+        store,
+        workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+        model: {
+          next: async ({ modelStepId }) => {
+            modelCalls += 1;
+            return [{
+              schemaVersion: "meliora.model-event.v1",
+              modelStepId,
+              streamIndex: 0,
+              occurredAt: fixedNow,
+              kind: "model_step_completed",
+              finishReason: "stop",
+            }];
+          },
+        },
+        ids,
+        now: () => fixedNow,
+        defer: (run) => { deferred.push(run); },
+      });
+
+      const created = await submitTurnCommand(request);
+      assert.equal(created.status, 202);
+      assert.equal(created.body.disposition, "created");
+      assert.equal(deferred.length, 1);
+      await Promise.resolve(deferred.shift()!());
+
+      assert.equal(modelCalls, 1);
+      const checkpoint = await store.readLatestModelStep({ runId: created.body.runId });
+      assert.equal(checkpoint?.status, "started");
+      const command = await store.readRunCommand({
+        localPrincipalId: "local-user",
+        workspaceId,
+        idempotencyKey: request.idempotencyKey,
+      });
+      assert.equal(command?.status, "terminal");
+      assert.equal(command?.status === "terminal" ? command.terminalStatus : null, "blocked");
+      assert.equal(command?.status === "terminal" ? command.terminalCode : null, "model_step_outcome_unknown");
+      const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 20 });
+      assert.ok(events.events.some((event) => event.kind === "run_blocked"));
+      assert.equal(events.events.some((event) => event.kind === "run_failed"), false);
+      assert.equal(JSON.stringify(events.events).includes("\"retryable\":true"), false);
+      assert.equal(JSON.stringify(events.events).includes("worker_failed"), false);
+
+      const replay = await submitTurnCommand(request);
+      assert.equal(replay.status, 200);
+      assert.equal(replay.body.disposition, "replay");
+      assert.equal(replay.body.commandStatus, "terminal");
+      assert.equal(replay.body.terminalStatus, "blocked");
+      assert.equal(replay.body.terminalCode, "model_step_outcome_unknown");
+      assert.equal(deferred.length, 0);
+      assert.equal(modelCalls, 1);
+    });
   }
 });
 
