@@ -68,11 +68,42 @@ export type ReadOnlyRunIds = Readonly<{
   nextOutcomeId(): string;
 }>;
 
+export type ReadOnlyModelStepCheckpointGate = Readonly<{
+  start(input: Readonly<{
+    runId: string;
+    attemptId: string;
+    leaseToken: string;
+    modelStepId: string;
+    messages: readonly CanonicalInputMessage[];
+    catalog: ToolCatalogSnapshot;
+    startedAt: string;
+  }>): Promise<
+    | Readonly<{ kind: "started"; requestFingerprint: string }>
+    | Readonly<{ kind: "replay"; requestFingerprint: string; status: "terminal" | "failed" }>
+    | Readonly<{ kind: "conflict"; code: string }>
+  >;
+  finish(input: Readonly<{
+    runId: string;
+    attemptId: string;
+    leaseToken: string;
+    modelStepId: string;
+    requestFingerprint: string;
+    outcome:
+      | Readonly<{ status: "terminal"; finishedAt: string }>
+      | Readonly<{ status: "failed"; failureCode: string; finishedAt: string }>;
+  }>): Promise<
+    | Readonly<{ kind: "committed" | "replay" }>
+    | Readonly<{ kind: "conflict"; code: string }>
+  >;
+}>;
+
 export type ReadOnlyRunLoopDependencies = Readonly<{
   store: SessionStorePort;
   model: ReadOnlyRunModelPort;
   tools: ReadOnlyToolPort;
   ids: ReadOnlyRunIds;
+  /** Mandatory durable gate: Provider I/O is forbidden until start returns a new checkpoint. */
+  modelStepCheckpoint: ReadOnlyModelStepCheckpointGate;
   now(): string;
   hashArguments(argumentsValue: JsonObject): string;
   validateArguments?(definition: ToolDefinition, argumentsValue: JsonObject): string | null;
@@ -100,6 +131,9 @@ export type ReadOnlyRunLoopInput = Readonly<{
   userMessage: string;
   signal?: AbortSignal;
   maxModelSteps?: number;
+  precreated?: Readonly<{
+    leaseToken: string;
+  }>;
 }>;
 
 export type ReadOnlyRunLoopResult = Readonly<{
@@ -311,26 +345,31 @@ export class ReadOnlyRunLoop {
       return { outcome, publicEvents };
     };
 
-    await this.dependencies.store.createSession({ sessionId: input.sessionId, workspaceId: input.workspaceId, createdAt: this.dependencies.now() });
-    await this.dependencies.store.createTurn({ sessionId: input.sessionId, turnId: input.turnId, intentRevision: input.intentRevision, createdAt: this.dependencies.now() });
-    await this.dependencies.store.createRun({
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-      runId: input.runId,
-      initialAttemptId: input.attemptId,
-      catalogHash: input.catalog.catalogHash,
-      intentRevision: input.intentRevision,
-      createdAt: this.dependencies.now(),
-    });
-    const lease = await this.dependencies.store.acquireLease({
-      runId: input.runId,
-      attemptId: input.attemptId,
-      ownerId: this.dependencies.ownerId,
-      ttlMs: this.dependencies.leaseTtlMs,
-      requestedAt: this.dependencies.now(),
-    });
-    if (lease.kind !== "acquired") throw new Error(`run_lease_${lease.kind}`);
-    leaseToken = lease.leaseToken;
+    if (input.precreated) {
+      if (input.precreated.leaseToken.length === 0) throw new Error("run_lease_missing");
+      leaseToken = input.precreated.leaseToken;
+    } else {
+      await this.dependencies.store.createSession({ sessionId: input.sessionId, workspaceId: input.workspaceId, createdAt: this.dependencies.now() });
+      await this.dependencies.store.createTurn({ sessionId: input.sessionId, turnId: input.turnId, intentRevision: input.intentRevision, createdAt: this.dependencies.now() });
+      await this.dependencies.store.createRun({
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        runId: input.runId,
+        initialAttemptId: input.attemptId,
+        catalogHash: input.catalog.catalogHash,
+        intentRevision: input.intentRevision,
+        createdAt: this.dependencies.now(),
+      });
+      const lease = await this.dependencies.store.acquireLease({
+        runId: input.runId,
+        attemptId: input.attemptId,
+        ownerId: this.dependencies.ownerId,
+        ttlMs: this.dependencies.leaseTtlMs,
+        requestedAt: this.dependencies.now(),
+      });
+      if (lease.kind !== "acquired") throw new Error(`run_lease_${lease.kind}`);
+      leaseToken = lease.leaseToken;
+    }
     await changeStatus("preparing");
 
     if (signal.aborted) return terminal("cancelled", "任务已在执行前取消。", "cancelled_before_start");
@@ -340,12 +379,70 @@ export class ReadOnlyRunLoop {
       if (signal.aborted) return terminal("cancelled", "用户取消了当前任务。", "user_requested");
       await changeStatus("model_streaming");
       const modelStepId = this.dependencies.ids.nextModelStepId();
+      let requestFingerprint: string | undefined;
       let modelEvents: readonly CanonicalModelEvent[];
       try {
+        const checkpoint = await this.dependencies.modelStepCheckpoint.start({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          modelStepId,
+          messages,
+          catalog: input.catalog,
+          startedAt: this.dependencies.now(),
+        });
+        if (checkpoint.kind === "conflict") {
+          return terminal(
+            checkpoint.code === "model_step_in_progress" ? "blocked" : "failed",
+            "模型步骤 checkpoint 无法安全开始。",
+            checkpoint.code,
+            checkpoint.code !== "model_step_in_progress",
+            checkpoint.code === "model_step_in_progress" ? ["等待当前模型步骤结果确认后再恢复。"] : [],
+          );
+        }
+        if (checkpoint.kind === "replay") {
+          return terminal(
+            checkpoint.status === "terminal" ? "blocked" : "failed",
+            "模型步骤已存在，当前执行不会重复请求 Provider。",
+            checkpoint.status === "terminal" ? "model_step_replay_without_recovery" : "model_step_failed_checkpoint",
+            false,
+            checkpoint.status === "terminal" ? ["从持久化事件或快照恢复该 Run。"] : [],
+          );
+        }
+        requestFingerprint = checkpoint.requestFingerprint;
         modelEvents = await withLeaseHeartbeat(() => this.dependencies.model.next({ modelStepId, messages, signal }));
       } catch (error) {
+        if (requestFingerprint) {
+          const finishedAt = this.dependencies.now();
+          await this.dependencies.modelStepCheckpoint.finish({
+            runId: input.runId,
+            attemptId: input.attemptId,
+            leaseToken,
+            modelStepId,
+            requestFingerprint,
+            outcome: { status: "failed", failureCode: "provider_request_failed", finishedAt },
+          });
+        }
         if (isLeaseLostError(error)) throw error;
         return terminal("failed", "模型调用失败。", "provider_request_failed", true);
+      }
+      if (requestFingerprint) {
+        const failedEvent = modelEvents.find((event): event is Extract<CanonicalModelEvent, { kind: "model_step_failed" }> =>
+          event.kind === "model_step_failed",
+        );
+        const finished = await this.dependencies.modelStepCheckpoint.finish({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          modelStepId,
+          requestFingerprint,
+          outcome: failedEvent
+            ? { status: "failed", failureCode: failedEvent.code, finishedAt: this.dependencies.now() }
+            : { status: "terminal", finishedAt: this.dependencies.now() },
+        });
+        if (finished?.kind === "conflict") {
+          return terminal("failed", "模型步骤 checkpoint 无法安全结束。", finished.code, true);
+        }
       }
       const completedCalls: CompletedToolCall[] = [];
       let assistantContent = "";

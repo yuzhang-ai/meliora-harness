@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { deepseekStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/deepseek-stream-text-single-tool";
-import { ReadOnlyRunLoop, type ReadOnlyRunIds } from "../../packages/agent-runtime/read-only-run-loop";
+import {
+  ReadOnlyRunLoop,
+  type ReadOnlyModelStepCheckpointGate,
+  type ReadOnlyRunIds,
+} from "../../packages/agent-runtime/read-only-run-loop";
 import type { CanonicalModelEvent } from "../../packages/model-protocol/contracts";
 import { MemorySessionStore } from "../../packages/session-store/memory-session-store";
 import {
@@ -111,11 +115,25 @@ try {
     definitions: tools.definitions,
   };
   let modelCalls = 0;
+  let checkpointStarts = 0;
+  const modelStepCheckpoint: ReadOnlyModelStepCheckpointGate = {
+    start: async (input) => {
+      checkpointStarts += 1;
+      const requestFingerprint = contentHash(new TextEncoder().encode(JSON.stringify({
+        messages: input.messages,
+        catalogHash: input.catalog.catalogHash,
+      })));
+      return { kind: "started", requestFingerprint };
+    },
+    finish: async () => ({ kind: "committed" }),
+  };
   const loop = new ReadOnlyRunLoop({
     store,
+    modelStepCheckpoint,
     model: {
       next: async ({ modelStepId, messages }) => {
         modelCalls += 1;
+        assert.equal(checkpointStarts, modelCalls, "Provider calls must follow durable Model Step checkpoints");
         if (modelCalls === 1) {
           assert.deepEqual(messages, [{ role: "user", content: "读取真实工作区入口文件" }]);
           return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
