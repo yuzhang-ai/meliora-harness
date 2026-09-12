@@ -23,7 +23,8 @@
     "test:m0:runtime": "tsx tests/workspace-host/node-workspace-host.test.ts && tsx tests/tool-runtime/read-only-workspace-tools.test.ts && tsx tests/agent-runtime/read-only-run-loop.ts && tsx tests/integration/read-only-harness-loop.test.ts",
     "test:store": "tsx --test packages/session-store/tests/migration-and-security.test.ts packages/session-store/tests/migration-v2.test.ts packages/session-store/tests/sqlite-session-store.contract.test.ts packages/session-store/tests/run-command-contract.test.ts",
     "test:server": "tsx --test apps/server/tests/sse.test.ts",
-    "check": "npm run typecheck && npm run test:contracts && npm run test:providers && npm run test:m0:runtime && npm run test:store && npm run test:server && npm run test:e3"
+    "check:web": "npm --prefix apps/web ci && npm --prefix apps/web test && npm --prefix apps/web run build",
+    "check": "npm run typecheck && npm run test:contracts && npm run test:providers && npm run test:m0:runtime && npm run test:store && npm run test:server && npm run test:e3 && npm run check:web"
   },
   "dependencies": {
     "better-sqlite3": "12.11.1",
