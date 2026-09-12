@@ -7,20 +7,42 @@ import type { NormalizedToolInvocation, ToolReceipt } from "../../tool-runtime/c
 import type {
   AppendEventsInput, AppendEventsResult, Artifact, ArtifactRef, CommitReceiptInput, CommitReceiptResult,
   CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
-  EventPage, InvocationReconciliationRecord, InvocationReservationInput, LeaseRenewal, LeaseRequest,
-  LeaseResult, PersistedRunAttempt, PersistedRunRecord, PutArtifactInput, ReadEventsInput,
+  EventPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
+  InvocationReservationInput, LeaseRenewal, LeaseRequest, LeaseResult, PersistedRunAttempt,
+  PersistedRunRecord, PutArtifactInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
   ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReservationInput,
-  ReservationResult, RunSnapshot, SessionRecord, SessionStorePort, StoredEvent,
-  StoredInvocationReservation, TurnRecord, WriteSnapshotInput,
+  ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
+  RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
+  StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
+  StoredPrivateUserInput, StoredRunCommand, TransitionRunCommandInput, TransitionRunCommandResult,
+  TurnRecord, WriteSnapshotInput,
 } from "../contracts.js";
+import {
+  assertValidCommandTimestamp,
+  assertValidGeneratedId,
+  assertValidIdempotencyKey,
+  assertValidLocalPrincipalId,
+  assertValidModelStepFingerprint,
+  assertValidReserveRunCommandInput,
+  assertValidSafeCode,
+  assertValidWorkspaceId,
+  canTransitionRunCommand,
+  privateUserInputContentHash,
+} from "../run-command-contract.js";
 import { IdempotencyConflictError, SequenceConflictError, StoreIntegrityError } from "./errors.js";
 import { canonicalJson, hashBytes } from "./integrity.js";
 import { assertPersistableBytes, assertPersistableJson } from "./sensitive-data.js";
 
-const MIGRATION_NAME = "0001_initial.sql";
-const MIGRATION_VERSION = 1;
-const MIGRATION_SQL = readFileSync(new URL(`../migrations/${MIGRATION_NAME}`, import.meta.url), "utf8");
-const MIGRATION_HASH = hashBytes(MIGRATION_SQL);
+type Migration = Readonly<{ version: number; name: string; sql: string; checksum: string }>;
+const loadMigration = (version: number, name: string): Migration => {
+  const sql = readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8");
+  return { version, name, sql, checksum: hashBytes(sql) };
+};
+const MIGRATIONS = [
+  loadMigration(1, "0001_initial.sql"),
+  loadMigration(2, "0002_durable_commands.sql"),
+] as const;
+const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
 type Options = Readonly<{ clock?: () => Date; nonce?: () => string }>;
 type LeaseConflict = "lease_not_held" | "lease_expired";
 type Row = Record<string, any>;
@@ -33,6 +55,11 @@ const requireTimestamp = (value: string, name: string): void => {
 };
 const json = (value: unknown): string => canonicalJson(JSON.parse(JSON.stringify(value)) as JsonValue);
 const sameJson = (left: unknown, right: unknown): boolean => json(left) === json(right);
+const isUniqueConstraint = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT_PRIMARYKEY";
+};
 const prepareDatabasePath = (databasePath: string): string => {
   if (databasePath === ":memory:") return databasePath;
   const resolved = resolve(databasePath);
@@ -63,24 +90,307 @@ export class SqliteSessionStore implements SessionStorePort {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = FULL");
     this.db.pragma("busy_timeout = 5000");
-    this.applyMigrations();
+    try {
+      this.applyMigrations();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   private applyMigrations(): void {
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)");
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version > MIGRATION_VERSION) throw new StoreIntegrityError("database_schema_is_newer");
-    const row = this.db.prepare("SELECT name,checksum FROM schema_migrations WHERE version=?").get(MIGRATION_VERSION) as Row | undefined;
-    if (row) {
-      if (row.name !== MIGRATION_NAME || row.checksum !== MIGRATION_HASH || version !== MIGRATION_VERSION) throw new StoreIntegrityError("migration_history_drift");
-      return;
+    this.verifyMigrationHistory();
+    for (const migration of MIGRATIONS) {
+      this.db.transaction(() => {
+        const version = this.verifyMigrationHistory();
+        if (version >= migration.version) return;
+        if (version !== migration.version - 1) throw new StoreIntegrityError("migration_history_missing");
+        this.db.exec(migration.sql);
+        this.db.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)")
+          .run(migration.version, migration.name, migration.checksum, this.clock().toISOString());
+        this.db.pragma(`user_version = ${migration.version}`);
+      }).immediate();
     }
-    if (version !== 0) throw new StoreIntegrityError("migration_history_missing");
-    this.db.transaction(() => {
-      this.db.exec(MIGRATION_SQL);
-      this.db.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)").run(MIGRATION_VERSION, MIGRATION_NAME, MIGRATION_HASH, this.clock().toISOString());
-      this.db.pragma(`user_version = ${MIGRATION_VERSION}`);
-    })();
+    this.verifyMigrationHistory();
+  }
+
+  private verifyMigrationHistory(): number {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (!Number.isInteger(version) || version < 0) throw new StoreIntegrityError("migration_history_drift");
+    if (version > LATEST_MIGRATION_VERSION) throw new StoreIntegrityError("database_schema_is_newer");
+    const rows = this.db.prepare("SELECT version,name,checksum FROM schema_migrations ORDER BY version").all() as Row[];
+    if (rows.length !== version) throw new StoreIntegrityError("migration_history_missing");
+    for (let index = 0; index < version; index += 1) {
+      const expected = MIGRATIONS[index];
+      const actual = rows[index];
+      if (!expected || actual?.version !== expected.version || actual.name !== expected.name || actual.checksum !== expected.checksum) {
+        throw new StoreIntegrityError("migration_history_drift");
+      }
+    }
+    return version;
+  }
+
+  async reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult> {
+    assertValidReserveRunCommandInput(input);
+    const inputHash = privateUserInputContentHash(input.userMessage);
+    try {
+      return this.db.transaction((): ReserveRunCommandResult => {
+        const prior = this.db.prepare(
+          "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+        ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+        if (prior) {
+          if (prior.canonical_request_hash !== input.canonicalRequestHash) {
+            return { kind: "conflict", code: "idempotency_key_conflict" };
+          }
+          return { kind: "replay", command: this.toRunCommand(prior) };
+        }
+
+        const identityCollision = this.db.prepare(`
+          SELECT 1 FROM sessions WHERE session_id=?
+          UNION ALL SELECT 1 FROM turns WHERE turn_id=?
+          UNION ALL SELECT 1 FROM runs WHERE run_id=?
+          UNION ALL SELECT 1 FROM run_attempts WHERE attempt_id=?
+          UNION ALL SELECT 1 FROM run_commands WHERE turn_id=? OR run_id=?
+          LIMIT 1
+        `).get(input.sessionId, input.turnId, input.runId, input.attemptId, input.turnId, input.runId);
+        if (identityCollision) return { kind: "conflict", code: "command_identity_conflict" };
+
+        this.db.prepare("INSERT INTO sessions VALUES (?,?,?,?)")
+          .run(input.sessionId, input.workspaceId, input.reservedAt, input.reservedAt);
+        this.db.prepare("INSERT INTO turns VALUES (?,?,?,?,?)")
+          .run(input.turnId, input.sessionId, input.intentRevision, input.reservedAt, input.reservedAt);
+        this.db.prepare("INSERT INTO runs VALUES (?,?,?,?,?,?,?)")
+          .run(input.runId, input.turnId, input.sessionId, input.attemptId, 1, input.reservedAt, input.reservedAt);
+        this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+          .run(input.attemptId, input.runId, input.sessionId, input.turnId, 1, "created", 0, input.catalogHash, input.intentRevision, "null", input.reservedAt, input.reservedAt);
+        this.db.prepare(`
+          INSERT INTO run_commands (
+            local_principal_id,workspace_id,idempotency_key,canonical_request_hash,
+            session_id,turn_id,run_id,attempt_id,status,terminal_status,terminal_code,
+            created_at,updated_at,accepted_at,dispatched_at,terminal_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          input.localPrincipalId, input.workspaceId, input.idempotencyKey, input.canonicalRequestHash,
+          input.sessionId, input.turnId, input.runId, input.attemptId, "reserved", null, null,
+          input.reservedAt, input.reservedAt, null, null, null,
+        );
+        this.db.prepare(`
+          INSERT INTO run_command_inputs (
+            run_id,session_id,turn_id,schema_version,role,visibility,content,content_hash,created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?)
+        `).run(
+          input.runId, input.sessionId, input.turnId, "meliora.private-user-input.v1", "user", "private",
+          input.userMessage, inputHash, input.reservedAt,
+        );
+        const created = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(input.runId) as Row;
+        return { kind: "owner", command: this.toRunCommand(created) };
+      }).immediate();
+    } catch (error) {
+      if (isUniqueConstraint(error)) return { kind: "conflict", code: "command_identity_conflict" };
+      throw error;
+    }
+  }
+
+  async readRunCommand(input: RunCommandScope): Promise<StoredRunCommand | null> {
+    this.validateRunCommandScope(input);
+    const row = this.db.prepare(
+      "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+    ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+    return row ? this.toRunCommand(row) : null;
+  }
+
+  async transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult> {
+    this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidCommandTimestamp(input.updatedAt);
+    if ((input as { nextStatus: RunCommandStatus }).nextStatus === "dispatched") {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (input.nextStatus === "terminal") {
+      if (!input.terminalStatus) return { kind: "conflict", code: "command_status_conflict" };
+      if (input.terminalCode !== undefined) assertValidSafeCode(input.terminalCode);
+    } else if (input.terminalStatus !== undefined || input.terminalCode !== undefined) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    return this.db.transaction((): TransitionRunCommandResult => {
+      const row = this.db.prepare(
+        "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+      ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+      if (!row) return { kind: "not_found", code: "run_command_not_found" };
+      if (row.run_id !== input.runId || !this.isActiveAttempt(input.runId, input.attemptId)) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      if (row.status === input.nextStatus) {
+        const terminalMatches = input.nextStatus !== "terminal"
+          || (row.terminal_status === input.terminalStatus && row.terminal_code === (input.terminalCode ?? null));
+        return terminalMatches
+          ? { kind: "replay", command: this.toRunCommand(row) }
+          : { kind: "conflict", code: "command_status_conflict" };
+      }
+      if (row.status !== input.expectedStatus || !canTransitionRunCommand(row.status, input.nextStatus)) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+      if (Date.parse(input.updatedAt) < Date.parse(row.updated_at)) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+
+      const acceptedAt = input.nextStatus === "accepted" ? input.updatedAt : row.accepted_at;
+      const terminalAt = input.nextStatus === "terminal" ? input.updatedAt : null;
+      this.db.prepare(`
+        UPDATE run_commands
+        SET status=?,terminal_status=?,terminal_code=?,updated_at=?,accepted_at=?,dispatched_at=?,terminal_at=?
+        WHERE run_id=? AND status=?
+      `).run(
+        input.nextStatus,
+        input.nextStatus === "terminal" ? input.terminalStatus : null,
+        input.nextStatus === "terminal" ? input.terminalCode ?? null : null,
+        input.updatedAt, acceptedAt, row.dispatched_at, terminalAt, row.run_id, input.expectedStatus,
+      );
+      const updated = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(row.run_id) as Row;
+      return { kind: "updated", command: this.toRunCommand(updated) };
+    }).immediate();
+  }
+
+  async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
+    assertValidGeneratedId(input.sessionId);
+    assertValidGeneratedId(input.turnId);
+    const row = this.db.prepare(
+      "SELECT * FROM run_command_inputs WHERE session_id=? AND turn_id=?",
+    ).get(input.sessionId, input.turnId) as Row | undefined;
+    if (!row) return null;
+    if (hashBytes(row.content) !== row.content_hash) throw new StoreIntegrityError("private_user_input_hash_drift");
+    return {
+      schemaVersion: "meliora.private-user-input.v1",
+      sessionId: row.session_id,
+      turnId: row.turn_id,
+      role: "user",
+      visibility: "private",
+      content: row.content,
+      contentHash: row.content_hash,
+      createdAt: row.created_at,
+    };
+  }
+
+  async startModelStep(input: StartModelStepInput): Promise<StartModelStepResult> {
+    this.validateModelStepIdentity(input);
+    assertValidCommandTimestamp(input.startedAt);
+    try {
+      return this.db.transaction((): StartModelStepResult => {
+        if (!this.isActiveAttempt(input.runId, input.attemptId)) {
+          return { kind: "conflict", code: "run_attempt_conflict" };
+        }
+        const prior = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+          .get(input.runId, input.modelStepId) as Row | undefined;
+        if (prior) {
+          if (prior.attempt_id !== input.attemptId || prior.request_fingerprint !== input.requestFingerprint) {
+            return { kind: "conflict", code: "model_step_conflict" };
+          }
+          return prior.status === "started"
+            ? { kind: "conflict", code: "model_step_in_progress" }
+            : { kind: "replay", checkpoint: this.toModelStep(prior) };
+        }
+        const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+        if (lease) return { kind: "conflict", code: lease };
+        if (this.db.prepare("SELECT 1 FROM model_steps WHERE model_step_id=?").get(input.modelStepId)) {
+          return { kind: "conflict", code: "model_step_conflict" };
+        }
+        if (this.db.prepare("SELECT 1 FROM model_steps WHERE run_id=? AND status='started'")
+          .get(input.runId)) {
+          return { kind: "conflict", code: "model_step_in_progress" };
+        }
+        const command = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?")
+          .get(input.runId) as Row | undefined;
+        if (!command || (command.status !== "accepted" && command.status !== "dispatched")) {
+          return { kind: "conflict", code: "model_step_conflict" };
+        }
+        if (Date.parse(input.startedAt) < Date.parse(command.updated_at)) {
+          return { kind: "conflict", code: "model_step_conflict" };
+        }
+        if (command.status === "accepted") {
+          this.db.prepare(`
+            UPDATE run_commands SET status='dispatched',updated_at=?,dispatched_at=?
+            WHERE run_id=? AND status='accepted'
+          `).run(input.startedAt, input.startedAt, input.runId);
+        }
+        this.db.prepare(`
+          INSERT INTO model_steps (
+            model_step_id,run_id,attempt_id,request_fingerprint,status,failure_code,started_at,finished_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?)
+        `).run(
+          input.modelStepId, input.runId, input.attemptId, input.requestFingerprint, "started", null,
+          input.startedAt, null, input.startedAt,
+        );
+        const row = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+          .get(input.runId, input.modelStepId) as Row;
+        return { kind: "started", checkpoint: this.toModelStep(row) };
+      }).immediate();
+    } catch (error) {
+      if (isUniqueConstraint(error)) return { kind: "conflict", code: "model_step_conflict" };
+      throw error;
+    }
+  }
+
+  async finishModelStep(input: FinishModelStepInput): Promise<FinishModelStepResult> {
+    this.validateModelStepIdentity(input);
+    assertValidCommandTimestamp(input.outcome.finishedAt);
+    if (input.outcome.status === "failed") assertValidSafeCode(input.outcome.failureCode);
+    return this.db.transaction((): FinishModelStepResult => {
+      if (!this.isActiveAttempt(input.runId, input.attemptId)) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      const row = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+        .get(input.runId, input.modelStepId) as Row | undefined;
+      if (!row || row.attempt_id !== input.attemptId || row.request_fingerprint !== input.requestFingerprint) {
+        return { kind: "conflict", code: "model_step_conflict" };
+      }
+      if (row.status !== "started") {
+        const failureCode = input.outcome.status === "failed" ? input.outcome.failureCode : null;
+        return row.status === input.outcome.status
+          && row.finished_at === input.outcome.finishedAt
+          && row.failure_code === failureCode
+          ? { kind: "replay", checkpoint: this.toModelStep(row) }
+          : { kind: "conflict", code: "model_step_conflict" };
+      }
+      const failureCode = input.outcome.status === "failed" ? input.outcome.failureCode : null;
+      if (Date.parse(input.outcome.finishedAt) < Date.parse(row.started_at)) {
+        return { kind: "conflict", code: "model_step_conflict" };
+      }
+      this.db.prepare(`
+        UPDATE model_steps SET status=?,failure_code=?,finished_at=?,updated_at=?
+        WHERE run_id=? AND model_step_id=? AND status='started'
+      `).run(
+        input.outcome.status, failureCode, input.outcome.finishedAt, input.outcome.finishedAt,
+        input.runId, input.modelStepId,
+      );
+      const updated = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+        .get(input.runId, input.modelStepId) as Row;
+      return { kind: "committed", checkpoint: this.toModelStep(updated) };
+    }).immediate();
+  }
+
+  async readModelStep(input: ReadModelStepInput): Promise<StoredModelStepCheckpoint | null> {
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.modelStepId);
+    const row = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+      .get(input.runId, input.modelStepId) as Row | undefined;
+    return row ? this.toModelStep(row) : null;
+  }
+
+  async readLatestModelStep(input: ReadLatestModelStepInput): Promise<StoredModelStepCheckpoint | null> {
+    assertValidGeneratedId(input.runId);
+    if (input.attemptId !== undefined) assertValidGeneratedId(input.attemptId);
+    const row = input.attemptId === undefined
+      ? this.db.prepare("SELECT * FROM model_steps WHERE run_id=? ORDER BY started_at DESC,model_step_id DESC LIMIT 1")
+        .get(input.runId) as Row | undefined
+      : this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND attempt_id=? ORDER BY started_at DESC,model_step_id DESC LIMIT 1")
+        .get(input.runId, input.attemptId) as Row | undefined;
+    return row ? this.toModelStep(row) : null;
   }
 
   async createSession(input: CreateSessionInput): Promise<SessionRecord> {
@@ -331,6 +641,71 @@ export class SqliteSessionStore implements SessionStorePort {
     const row = this.db.prepare("SELECT lease_token_hash,expires_at FROM run_leases WHERE run_id=? AND attempt_id=?").get(runId, attemptId) as Row | undefined;
     if (!row || row.lease_token_hash !== hashBytes(token)) return "lease_not_held";
     return Date.parse(row.expires_at) <= this.clock().getTime() ? "lease_expired" : null;
+  }
+  private validateRunCommandScope(input: RunCommandScope): void {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+  }
+  private validateModelStepIdentity(input: Readonly<{
+    runId: string;
+    attemptId: string;
+    modelStepId: string;
+    requestFingerprint: string;
+  }>): void {
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidGeneratedId(input.modelStepId);
+    assertValidModelStepFingerprint(input.requestFingerprint);
+  }
+  private isActiveAttempt(runId: string, attemptId: string): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 FROM runs WHERE run_id=? AND active_attempt_id=?",
+    ).get(runId, attemptId);
+    return row !== undefined;
+  }
+  private toRunCommand(row: Row): StoredRunCommand {
+    const base = {
+      schemaVersion: "meliora.run-command.v1" as const,
+      localPrincipalId: row.local_principal_id,
+      workspaceId: row.workspace_id,
+      idempotencyKey: row.idempotency_key,
+      canonicalRequestHash: row.canonical_request_hash,
+      sessionId: row.session_id,
+      turnId: row.turn_id,
+      runId: row.run_id,
+      attemptId: row.attempt_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+    return row.status === "terminal"
+      ? {
+          ...base,
+          status: "terminal",
+          terminalStatus: row.terminal_status,
+          ...(row.terminal_code === null ? {} : { terminalCode: row.terminal_code }),
+        }
+      : { ...base, status: row.status };
+  }
+  private toModelStep(row: Row): StoredModelStepCheckpoint {
+    const base = {
+      schemaVersion: "meliora.model-step-checkpoint.v1" as const,
+      runId: row.run_id,
+      attemptId: row.attempt_id,
+      modelStepId: row.model_step_id,
+      requestFingerprint: row.request_fingerprint,
+      startedAt: row.started_at,
+    };
+    if (row.status === "started") return { ...base, status: "started" };
+    if (row.status === "terminal") {
+      return { ...base, status: "terminal", finishedAt: row.finished_at };
+    }
+    return {
+      ...base,
+      status: "failed",
+      finishedAt: row.finished_at,
+      failureCode: row.failure_code,
+    };
   }
   private requireTtl(ttlMs: number): void { if (!Number.isInteger(ttlMs) || ttlMs < 1) throw new TypeError("lease_ttl_invalid"); }
   private toSession(row: Row): SessionRecord { return { schemaVersion: "meliora.session.v1", sessionId: row.session_id, workspaceId: row.workspace_id, createdAt: row.created_at, updatedAt: row.updated_at }; }

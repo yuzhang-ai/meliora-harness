@@ -132,9 +132,10 @@ WP-A read-only runtime + WP-C store
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
 | M0 真实纵向集成 | 你 + Codex | Ready | 施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；先做 durable command contract，不提前接 UI |
+| Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | In progress | Issue #13；冻结 Command/API/Model Step contract，新增 SQLite `0002`、Memory/SQLite adapter 与共同恢复测试，不包含 HTTP handler |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport 已分别通过 PR #3、#5、#8、#10 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；后端按 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md) 先冻结 durable command contract，再装配 Runtime + SQLite + Server SSE。秦峻溥暂缓新增 Store/SSE 功能，待 WP-0 contract draft 后审查 command reservation 与 migration；不向 PR #8 继续追加范围。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport 已分别通过 PR #3、#5、#8、#10 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；Issue #13 已启动 WP-0 durable command 与 Model Step checkpoint，秦峻溥负责 SQLite command reservation/migration，完成 contract、共同 adapter tests 与独立审查后再进入 Server composition；不向 PR #8 继续追加范围。

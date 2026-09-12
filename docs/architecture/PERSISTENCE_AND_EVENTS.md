@@ -25,8 +25,11 @@
 Workspace
 Session
 Turn
+RunCommand
+PrivateUserInput
 Run
 RunAttempt
+ModelStepCheckpoint
 Event
 Message
 ToolInvocation
@@ -44,6 +47,14 @@ SchemaMigration
 
 ```ts
 interface SessionStorePort {
+  reserveRunCommand(input: ReserveRunCommand): Promise<RunCommandReservation>;
+  readRunCommand(scope: RunCommandScope): Promise<StoredRunCommand | null>;
+  transitionRunCommand(input: TransitionRunCommand): Promise<RunCommandTransition>;
+  readPrivateUserInput(input: ReadPrivateUserInput): Promise<PrivateUserInput | null>;
+  startModelStep(input: StartModelStep): Promise<ModelStepStartResult>;
+  finishModelStep(input: FinishModelStep): Promise<ModelStepFinishResult>;
+  readModelStep(input: ReadModelStep): Promise<ModelStepCheckpoint | null>;
+  readLatestModelStep(input: ReadLatestModelStep): Promise<ModelStepCheckpoint | null>;
   createSession(input: CreateSession): Promise<Session>;
   createTurn(input: CreateTurn): Promise<Turn>;
   createRun(input: CreateRun): Promise<Run>;
@@ -60,6 +71,30 @@ interface SessionStorePort {
   renewLease(input: LeaseRenewal): Promise<boolean>;
 }
 ```
+
+### 3.1 Durable Run Command
+
+启动 Run 的幂等 scope 固定为 `local_principal_id + workspace_id + idempotency_key`。浏览器不得提交 principal、workspace path、Provider endpoint、API Key、trusted origin 或任何 Runtime 生成 ID；`local_principal_id` 由 loopback Server 注入，`workspace_id` 必须先由受控 registry 解析。
+
+canonical request 只包含版本化的 `workspace_id + user_message`，不包含 principal、idempotency key、时间戳或生成 ID。相同 scope 与相同 canonical request hash 返回已存 Command 及同一组 `session_id / turn_id / run_id / attempt_id`；调用方在重试时提供的新候选 ID 必须被忽略。相同 scope 与不同 hash 稳定返回 `idempotency_key_conflict`，且不得新增任何记录。workspace 不同即 scope 不同，不得串用 Run。
+
+Command 状态为 `reserved -> accepted -> dispatched -> terminal`。`terminal` 另带 `completed / blocked / failed / cancelled` 之一及可选安全 code。通用状态更新必须同时携带 Command scope、`run_id + active attempt_id + lease_token` 并使用 expected-status CAS；Store 在同一原子操作内验证 active Attempt 与未过期 lease，旧 worker 即使知道 Command scope 也不得推进状态。`accepted -> dispatched` 不属于通用状态更新，只能由 `startModelStep` 在写入新 checkpoint 的同一事务中完成。恢复协调器可以用当前 Attempt 与有效 lease 把未能继续接管的 `reserved / accepted / dispatched` Command 收口为 terminal blocked，不能留下无人接管的永久 `202`。
+
+新 Command 的 reservation、通过长度与敏感信息校验的 private user input、Session、Turn、Run 和 Attempt #1 必须由一个 Store 方法在同一事务内写入。private user input 是 Turn 级、`role=user`、`visibility=private` 的 model-visible 事实，创建后续 Attempt 时继续复用。敏感信息检查必须在把原文绑定给任何 SQL 语句之前完成；仅依赖事务 rollback 不能保证原文不会进入 WAL/SHM。
+
+### 3.2 Model Step Checkpoint
+
+每次 Provider 调用前，Runtime 必须先等待 `startModelStep` 返回全新的 `kind=started` 并成功持久化 `run_id / attempt_id / model_step_id / request_fingerprint / started_at / status=started`，然后才允许发出任何网络字节。首次 `startModelStep` 与 Command 的 `accepted -> dispatched` 必须在同一事务中完成，避免已经允许发出网络请求但 Command 仍显示可安全派发。相同且仍未结算的 Model Step 重试返回 `model_step_in_progress`，不得把 replay 误作再次发送许可；相同 ID 与不同 fingerprint 返回 `model_step_conflict`；同一 Run 同时只能存在一个未决 `started` step。Model Step 绑定实际执行它的 Run Attempt，而不是固定绑定 Command reservation 原子创建的 Attempt #1，因此无未决 step 时恢复后的 Attempt 可以继续 checkpoint；只要旧 Attempt 留有未决 `started` step，新 Attempt 就必须返回 `model_step_in_progress`，不得再次调用 Provider。
+
+Provider 响应完成处理后，`finishModelStep` 将同一 checkpoint 以 CAS 更新为 `terminal` 或 `failed`。重复提交完全相同的完成事实是 replay，任何 fingerprint、状态、时间或安全 failure code 漂移均为冲突。原始响应、headers、URL、credential 和底层错误文本不得写入 checkpoint。
+
+恢复读取到 `started` 且没有 `terminal / failed` 的 checkpoint，只能派生 terminal blocked code `model_step_outcome_unknown`。该状态说明 Provider 请求可能已经发出；在未来没有经过验证的 Provider 查询或幂等机制前，不得自动再次付费调用。Store 只保存并返回事实，不自行触发 Provider、不修改 Runtime/Public Event 语义。
+
+### 3.3 Turn Command HTTP Contract
+
+`POST /api/turns` 的浏览器 request 只允许 `schemaVersion / workspaceId / idempotencyKey / message`，未知字段必须拒绝。成功 response 只返回 `created | replay` disposition、稳定的 Session/Turn/Run/Attempt IDs、Command 状态及可选 terminal 状态，不返回用户原文或 canonical hash。新 Command 和非终态 replay 返回 `202`，终态 replay 返回 `200`。
+
+错误响应只使用冻结的安全 code 和 retryable 标志；不得携带用户原文、hash 材料、workspace path、数据库路径、Provider 原始响应或 SQLite 错误。浏览器输入错误、未知 workspace、幂等冲突与服务端故障必须映射到不同且稳定的 code。
 
 创建 Run 时原子创建 Attempt #1；恢复通过 `createRunAttempt` 创建递增 Attempt，不修改旧 Attempt 的终态。恢复必须同时以 `expected_latest_attempt_number` CAS 检查 Attempt 版本和旧 lease 的过期状态：同一 Run 任一未过期 lease 都返回 `lease_held`，不得写入新 Attempt 或第二 lease；仅在旧 lease 已过期时，才能原子创建新 Attempt 与新 lease。所有状态写入、事件追加、Snapshot、Invocation reservation 与 Receipt commit 都绑定 `run_id + attempt_id + lease_token`。`appendEvents` 还必须携带 `expected_sequence`，由 Store 原子分配连续 sequence。Port contract 需定义事务边界、冲突错误、分页、顺序、时钟和一致性，不把 SQLite 特性暴露给调用方。
 
