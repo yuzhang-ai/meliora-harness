@@ -158,7 +158,7 @@ export const assertValidReserveRunCommandInput = (input: ReserveRunCommandInput)
 
 const RUN_COMMAND_TRANSITIONS: Readonly<Record<RunCommandStatus, readonly RunCommandStatus[]>> = {
   reserved: ["accepted", "terminal"],
-  accepted: ["dispatched", "terminal"],
+  accepted: ["terminal"],
   dispatched: ["terminal"],
   terminal: [],
 };

@@ -78,13 +78,13 @@ interface SessionStorePort {
 
 canonical request 只包含版本化的 `workspace_id + user_message`，不包含 principal、idempotency key、时间戳或生成 ID。相同 scope 与相同 canonical request hash 返回已存 Command 及同一组 `session_id / turn_id / run_id / attempt_id`；调用方在重试时提供的新候选 ID 必须被忽略。相同 scope 与不同 hash 稳定返回 `idempotency_key_conflict`，且不得新增任何记录。workspace 不同即 scope 不同，不得串用 Run。
 
-Command 状态为 `reserved -> accepted -> dispatched -> terminal`。`terminal` 另带 `completed / blocked / failed / cancelled` 之一及可选安全 code。状态更新使用 expected-status CAS；恢复协调器可以把未能继续接管的 `reserved / accepted / dispatched` Command 直接收口为 terminal blocked，不能留下无人接管的永久 `202`。
+Command 状态为 `reserved -> accepted -> dispatched -> terminal`。`terminal` 另带 `completed / blocked / failed / cancelled` 之一及可选安全 code。通用状态更新必须同时携带 Command scope、`run_id + active attempt_id + lease_token` 并使用 expected-status CAS；Store 在同一原子操作内验证 active Attempt 与未过期 lease，旧 worker 即使知道 Command scope 也不得推进状态。`accepted -> dispatched` 不属于通用状态更新，只能由 `startModelStep` 在写入新 checkpoint 的同一事务中完成。恢复协调器可以用当前 Attempt 与有效 lease 把未能继续接管的 `reserved / accepted / dispatched` Command 收口为 terminal blocked，不能留下无人接管的永久 `202`。
 
 新 Command 的 reservation、通过长度与敏感信息校验的 private user input、Session、Turn、Run 和 Attempt #1 必须由一个 Store 方法在同一事务内写入。private user input 是 Turn 级、`role=user`、`visibility=private` 的 model-visible 事实，创建后续 Attempt 时继续复用。敏感信息检查必须在把原文绑定给任何 SQL 语句之前完成；仅依赖事务 rollback 不能保证原文不会进入 WAL/SHM。
 
 ### 3.2 Model Step Checkpoint
 
-每次 Provider 调用前，Runtime 必须先等待 `startModelStep` 成功持久化 `run_id / attempt_id / model_step_id / request_fingerprint / started_at / status=started`，然后才允许发出任何网络字节。首次 `startModelStep` 与 Command 的 `accepted -> dispatched` 必须在同一事务中完成，避免已经允许发出网络请求但 Command 仍显示可安全派发。相同 Model Step 与相同 fingerprint 可 replay；相同 ID 与不同 fingerprint 返回 `model_step_conflict`；同一 Run 同时只能存在一个未决 `started` step。Model Step 绑定实际执行它的 Run Attempt，而不是固定绑定 Command reservation 原子创建的 Attempt #1，因此无未决 step 时恢复后的 Attempt 可以继续 checkpoint；只要旧 Attempt 留有未决 `started` step，新 Attempt 就必须返回 `model_step_in_progress`，不得再次调用 Provider。
+每次 Provider 调用前，Runtime 必须先等待 `startModelStep` 返回全新的 `kind=started` 并成功持久化 `run_id / attempt_id / model_step_id / request_fingerprint / started_at / status=started`，然后才允许发出任何网络字节。首次 `startModelStep` 与 Command 的 `accepted -> dispatched` 必须在同一事务中完成，避免已经允许发出网络请求但 Command 仍显示可安全派发。相同且仍未结算的 Model Step 重试返回 `model_step_in_progress`，不得把 replay 误作再次发送许可；相同 ID 与不同 fingerprint 返回 `model_step_conflict`；同一 Run 同时只能存在一个未决 `started` step。Model Step 绑定实际执行它的 Run Attempt，而不是固定绑定 Command reservation 原子创建的 Attempt #1，因此无未决 step 时恢复后的 Attempt 可以继续 checkpoint；只要旧 Attempt 留有未决 `started` step，新 Attempt 就必须返回 `model_step_in_progress`，不得再次调用 Provider。
 
 Provider 响应完成处理后，`finishModelStep` 将同一 checkpoint 以 CAS 更新为 `terminal` 或 `failed`。重复提交完全相同的完成事实是 replay，任何 fingerprint、状态、时间或安全 failure code 漂移均为冲突。原始响应、headers、URL、credential 和底层错误文本不得写入 checkpoint。
 

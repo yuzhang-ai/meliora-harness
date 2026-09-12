@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import type {
   ReserveRunCommandInput,
   SessionStorePort,
+  TransitionRunCommandInput,
 } from "../contracts.js";
 import { MemorySessionStore } from "../memory-session-store.js";
 import {
@@ -188,10 +189,35 @@ for (const adapter of adapters) {
     try {
       const input = commandInput("lifecycle");
       assert.equal((await harness.store.reserveRunCommand(input)).kind, "owner");
+      const lease = await harness.store.acquireLease({
+        runId: input.runId,
+        attemptId: input.attemptId,
+        ownerId: "worker-1",
+        ttlMs: 60_000,
+        requestedAt: timestamp(),
+      });
+      assert.equal(lease.kind, "acquired");
+      if (lease.kind !== "acquired") throw new Error("expected lease");
+      const transitionAuthority = {
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseToken: lease.leaseToken,
+      } as const;
+      assert.deepEqual(await harness.store.transitionRunCommand({
+        localPrincipalId: input.localPrincipalId,
+        workspaceId: input.workspaceId,
+        idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
+        leaseToken: "stale-lease",
+        expectedStatus: "reserved",
+        nextStatus: "accepted",
+        updatedAt: timestamp(1_000),
+      }), { kind: "conflict", code: "lease_not_held" });
       const accepted = await harness.store.transitionRunCommand({
         localPrincipalId: input.localPrincipalId,
         workspaceId: input.workspaceId,
         idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
         expectedStatus: "reserved",
         nextStatus: "accepted",
         updatedAt: timestamp(1_000),
@@ -201,6 +227,7 @@ for (const adapter of adapters) {
         localPrincipalId: input.localPrincipalId,
         workspaceId: input.workspaceId,
         idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
         expectedStatus: "reserved",
         nextStatus: "accepted",
         updatedAt: timestamp(1_000),
@@ -209,20 +236,20 @@ for (const adapter of adapters) {
         localPrincipalId: input.localPrincipalId,
         workspaceId: input.workspaceId,
         idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
         expectedStatus: "accepted",
         nextStatus: "reserved",
         updatedAt: timestamp(2_000),
       }), { kind: "conflict", code: "command_status_conflict" });
-
-      const lease = await harness.store.acquireLease({
-        runId: input.runId,
-        attemptId: input.attemptId,
-        ownerId: "worker-1",
-        ttlMs: 60_000,
-        requestedAt: timestamp(2_000),
-      });
-      assert.equal(lease.kind, "acquired");
-      if (lease.kind !== "acquired") throw new Error("expected lease");
+      assert.deepEqual(await harness.store.transitionRunCommand({
+        localPrincipalId: input.localPrincipalId,
+        workspaceId: input.workspaceId,
+        idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
+        expectedStatus: "accepted",
+        nextStatus: "dispatched",
+        updatedAt: timestamp(2_000),
+      } as unknown as TransitionRunCommandInput), { kind: "conflict", code: "command_status_conflict" });
       const fingerprint = hashBytes("model-request-lifecycle");
       const startedInput = {
         runId: input.runId,
@@ -234,7 +261,10 @@ for (const adapter of adapters) {
       } as const;
       const started = await harness.store.startModelStep(startedInput);
       assert.equal(started.kind, "started");
-      assert.equal((await harness.store.startModelStep({ ...startedInput, leaseToken: "stale" })).kind, "replay");
+      assert.deepEqual(await harness.store.startModelStep(startedInput), {
+        kind: "conflict",
+        code: "model_step_in_progress",
+      });
       assert.deepEqual(await harness.store.startModelStep({
         ...startedInput,
         requestFingerprint: hashBytes("different-model-request"),
@@ -277,6 +307,7 @@ for (const adapter of adapters) {
         localPrincipalId: input.localPrincipalId,
         workspaceId: input.workspaceId,
         idempotencyKey: input.idempotencyKey,
+        ...transitionAuthority,
         expectedStatus: "dispatched",
         nextStatus: "terminal",
         terminalStatus: "completed",
@@ -294,14 +325,6 @@ for (const adapter of adapters) {
     try {
       const recoverable = commandInput("recoverable");
       assert.equal((await harness.store.reserveRunCommand(recoverable)).kind, "owner");
-      assert.equal((await harness.store.transitionRunCommand({
-        localPrincipalId: recoverable.localPrincipalId,
-        workspaceId: recoverable.workspaceId,
-        idempotencyKey: recoverable.idempotencyKey,
-        expectedStatus: "reserved",
-        nextStatus: "accepted",
-        updatedAt: timestamp(),
-      })).kind, "updated");
       const initialLease = await harness.store.acquireLease({
         runId: recoverable.runId,
         attemptId: recoverable.attemptId,
@@ -310,7 +333,32 @@ for (const adapter of adapters) {
         requestedAt: timestamp(),
       });
       assert.equal(initialLease.kind, "acquired");
+      if (initialLease.kind !== "acquired") throw new Error("expected initial lease");
+      assert.equal((await harness.store.transitionRunCommand({
+        localPrincipalId: recoverable.localPrincipalId,
+        workspaceId: recoverable.workspaceId,
+        idempotencyKey: recoverable.idempotencyKey,
+        runId: recoverable.runId,
+        attemptId: recoverable.attemptId,
+        leaseToken: initialLease.leaseToken,
+        expectedStatus: "reserved",
+        nextStatus: "accepted",
+        updatedAt: timestamp(),
+      })).kind, "updated");
       harness.advance(1_000);
+      assert.deepEqual(await harness.store.transitionRunCommand({
+        localPrincipalId: recoverable.localPrincipalId,
+        workspaceId: recoverable.workspaceId,
+        idempotencyKey: recoverable.idempotencyKey,
+        runId: recoverable.runId,
+        attemptId: recoverable.attemptId,
+        leaseToken: initialLease.leaseToken,
+        expectedStatus: "accepted",
+        nextStatus: "terminal",
+        terminalStatus: "failed",
+        terminalCode: "expired_worker",
+        updatedAt: timestamp(1_000),
+      }), { kind: "conflict", code: "lease_expired" });
       const recovered = await harness.store.createRunAttempt({
         sessionId: recoverable.sessionId,
         turnId: recoverable.turnId,
@@ -326,6 +374,19 @@ for (const adapter of adapters) {
       });
       assert.equal(recovered.kind, "created");
       if (recovered.kind !== "created") throw new Error("expected recovered Attempt");
+      assert.deepEqual(await harness.store.transitionRunCommand({
+        localPrincipalId: recoverable.localPrincipalId,
+        workspaceId: recoverable.workspaceId,
+        idempotencyKey: recoverable.idempotencyKey,
+        runId: recoverable.runId,
+        attemptId: recoverable.attemptId,
+        leaseToken: initialLease.leaseToken,
+        expectedStatus: "accepted",
+        nextStatus: "terminal",
+        terminalStatus: "failed",
+        terminalCode: "stale_worker",
+        updatedAt: timestamp(1_000),
+      }), { kind: "conflict", code: "run_attempt_conflict" });
       assert.equal((await harness.store.startModelStep({
         runId: recoverable.runId,
         attemptId: recovered.attempt.attemptId,
@@ -338,14 +399,6 @@ for (const adapter of adapters) {
 
       const unresolved = commandInput("unresolved", { reservedAt: timestamp(1_000) });
       assert.equal((await harness.store.reserveRunCommand(unresolved)).kind, "owner");
-      assert.equal((await harness.store.transitionRunCommand({
-        localPrincipalId: unresolved.localPrincipalId,
-        workspaceId: unresolved.workspaceId,
-        idempotencyKey: unresolved.idempotencyKey,
-        expectedStatus: "reserved",
-        nextStatus: "accepted",
-        updatedAt: timestamp(1_000),
-      })).kind, "updated");
       const unresolvedLease = await harness.store.acquireLease({
         runId: unresolved.runId,
         attemptId: unresolved.attemptId,
@@ -355,6 +408,17 @@ for (const adapter of adapters) {
       });
       assert.equal(unresolvedLease.kind, "acquired");
       if (unresolvedLease.kind !== "acquired") throw new Error("expected initial unresolved lease");
+      assert.equal((await harness.store.transitionRunCommand({
+        localPrincipalId: unresolved.localPrincipalId,
+        workspaceId: unresolved.workspaceId,
+        idempotencyKey: unresolved.idempotencyKey,
+        runId: unresolved.runId,
+        attemptId: unresolved.attemptId,
+        leaseToken: unresolvedLease.leaseToken,
+        expectedStatus: "reserved",
+        nextStatus: "accepted",
+        updatedAt: timestamp(1_000),
+      })).kind, "updated");
       assert.equal((await harness.store.startModelStep({
         runId: unresolved.runId,
         attemptId: unresolved.attemptId,
@@ -430,22 +494,25 @@ test("SQLite replays commands and unresolved Model Steps after restart", async (
   const input = commandInput("restart");
   const first = new SqliteSessionStore(path, options);
   assert.equal((await first.reserveRunCommand(input)).kind, "owner");
-  await first.transitionRunCommand({
-    localPrincipalId: input.localPrincipalId,
-    workspaceId: input.workspaceId,
-    idempotencyKey: input.idempotencyKey,
-    expectedStatus: "reserved",
-    nextStatus: "accepted",
-    updatedAt: timestamp(1_000),
-  });
   const lease = await first.acquireLease({
     runId: input.runId,
     attemptId: input.attemptId,
     ownerId: "worker-1",
     ttlMs: 60_000,
-    requestedAt: timestamp(2_000),
+    requestedAt: timestamp(),
   });
   if (lease.kind !== "acquired") throw new Error("expected lease");
+  await first.transitionRunCommand({
+    localPrincipalId: input.localPrincipalId,
+    workspaceId: input.workspaceId,
+    idempotencyKey: input.idempotencyKey,
+    runId: input.runId,
+    attemptId: input.attemptId,
+    leaseToken: lease.leaseToken,
+    expectedStatus: "reserved",
+    nextStatus: "accepted",
+    updatedAt: timestamp(1_000),
+  });
   await first.startModelStep({
     runId: input.runId,
     attemptId: input.attemptId,

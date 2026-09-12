@@ -32,6 +32,7 @@ import type {
   ReserveRunCommandInput,
   ReserveRunCommandResult,
   RunCommandScope,
+  RunCommandStatus,
   RunSnapshot,
   SessionRecord,
   SessionStorePort,
@@ -237,7 +238,12 @@ export class MemorySessionStore implements SessionStorePort {
     assertValidLocalPrincipalId(input.localPrincipalId);
     assertValidWorkspaceId(input.workspaceId);
     assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
     assertValidCommandTimestamp(input.updatedAt);
+    if ((input as { nextStatus: RunCommandStatus }).nextStatus === "dispatched") {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
     if (input.nextStatus === "terminal" && !input.terminalStatus) {
       return { kind: "conflict", code: "command_status_conflict" };
     }
@@ -248,6 +254,15 @@ export class MemorySessionStore implements SessionStorePort {
     const key = commandScopeKey(input);
     const existing = this.commands.get(key);
     if (!existing) return { kind: "not_found", code: "run_command_not_found" };
+    if (
+      existing.runId !== input.runId
+      || !this.attemptForRun(input.runId, input.attemptId)
+      || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId
+    ) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
 
     const isExactReplay = existing.status === input.nextStatus
       && existing.terminalStatus === input.terminalStatus
@@ -296,9 +311,12 @@ export class MemorySessionStore implements SessionStorePort {
     const key = modelStepKey(input.runId, input.modelStepId);
     const existing = this.modelSteps.get(key);
     if (existing) {
-      return existing.attemptId === input.attemptId && existing.requestFingerprint === input.requestFingerprint
-        ? { kind: "replay", checkpoint: existing }
-        : { kind: "conflict", code: "model_step_conflict" };
+      if (existing.attemptId !== input.attemptId || existing.requestFingerprint !== input.requestFingerprint) {
+        return { kind: "conflict", code: "model_step_conflict" };
+      }
+      return existing.status === "started"
+        ? { kind: "conflict", code: "model_step_in_progress" }
+        : { kind: "replay", checkpoint: existing };
     }
     const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
     if (leaseConflict) return { kind: "conflict", code: leaseConflict };

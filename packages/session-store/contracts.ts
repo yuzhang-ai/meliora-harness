@@ -132,13 +132,17 @@ export type RunCommandScope = Readonly<{
 }>;
 
 type TransitionRunCommandBase = RunCommandScope & Readonly<{
+  runId: string;
+  attemptId: string;
+  leaseToken: string;
   expectedStatus: RunCommandStatus;
   updatedAt: string;
 }>;
 
 export type TransitionRunCommandInput =
   | (TransitionRunCommandBase & Readonly<{
-      nextStatus: Exclude<RunCommandStatus, "terminal">;
+      /** `dispatched` is reserved for startModelStep's atomic checkpoint gate. */
+      nextStatus: Exclude<RunCommandStatus, "terminal" | "dispatched">;
       terminalStatus?: never;
       terminalCode?: never;
     }>)
@@ -151,7 +155,10 @@ export type TransitionRunCommandInput =
 export type TransitionRunCommandResult =
   | Readonly<{ kind: "updated"; command: StoredRunCommand }>
   | Readonly<{ kind: "replay"; command: StoredRunCommand }>
-  | Readonly<{ kind: "conflict"; code: "command_status_conflict" }>
+  | Readonly<{
+      kind: "conflict";
+      code: "command_status_conflict" | "run_attempt_conflict" | "lease_not_held" | "lease_expired";
+    }>
   | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
 
 export type ReadPrivateUserInputInput = Readonly<{

@@ -12,7 +12,7 @@ import type {
   PersistedRunRecord, PutArtifactInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
   ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReservationInput,
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
-  RunCommandScope, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
+  RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, TransitionRunCommandInput, TransitionRunCommandResult,
   TurnRecord, WriteSnapshotInput,
@@ -202,7 +202,12 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult> {
     this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
     assertValidCommandTimestamp(input.updatedAt);
+    if ((input as { nextStatus: RunCommandStatus }).nextStatus === "dispatched") {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
     if (input.nextStatus === "terminal") {
       if (!input.terminalStatus) return { kind: "conflict", code: "command_status_conflict" };
       if (input.terminalCode !== undefined) assertValidSafeCode(input.terminalCode);
@@ -214,6 +219,11 @@ export class SqliteSessionStore implements SessionStorePort {
         "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
       ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
       if (!row) return { kind: "not_found", code: "run_command_not_found" };
+      if (row.run_id !== input.runId || !this.isActiveAttempt(input.runId, input.attemptId)) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
       if (row.status === input.nextStatus) {
         const terminalMatches = input.nextStatus !== "terminal"
           || (row.terminal_status === input.terminalStatus && row.terminal_code === (input.terminalCode ?? null));
@@ -229,7 +239,6 @@ export class SqliteSessionStore implements SessionStorePort {
       }
 
       const acceptedAt = input.nextStatus === "accepted" ? input.updatedAt : row.accepted_at;
-      const dispatchedAt = input.nextStatus === "dispatched" ? input.updatedAt : row.dispatched_at;
       const terminalAt = input.nextStatus === "terminal" ? input.updatedAt : null;
       this.db.prepare(`
         UPDATE run_commands
@@ -239,7 +248,7 @@ export class SqliteSessionStore implements SessionStorePort {
         input.nextStatus,
         input.nextStatus === "terminal" ? input.terminalStatus : null,
         input.nextStatus === "terminal" ? input.terminalCode ?? null : null,
-        input.updatedAt, acceptedAt, dispatchedAt, terminalAt, row.run_id, input.expectedStatus,
+        input.updatedAt, acceptedAt, row.dispatched_at, terminalAt, row.run_id, input.expectedStatus,
       );
       const updated = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(row.run_id) as Row;
       return { kind: "updated", command: this.toRunCommand(updated) };
@@ -277,9 +286,12 @@ export class SqliteSessionStore implements SessionStorePort {
         const prior = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
           .get(input.runId, input.modelStepId) as Row | undefined;
         if (prior) {
-          return prior.attempt_id === input.attemptId && prior.request_fingerprint === input.requestFingerprint
-            ? { kind: "replay", checkpoint: this.toModelStep(prior) }
-            : { kind: "conflict", code: "model_step_conflict" };
+          if (prior.attempt_id !== input.attemptId || prior.request_fingerprint !== input.requestFingerprint) {
+            return { kind: "conflict", code: "model_step_conflict" };
+          }
+          return prior.status === "started"
+            ? { kind: "conflict", code: "model_step_in_progress" }
+            : { kind: "replay", checkpoint: this.toModelStep(prior) };
         }
         const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
         if (lease) return { kind: "conflict", code: lease };
