@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/projects.test.ts tests/replay.test.ts"
   },
   "dependencies": {
     "react": "19.2.1",

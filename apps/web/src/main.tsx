@@ -44,6 +44,7 @@ function App() {
   const [profileAvatar, setProfileAvatar] = useState(userAvatar);
   const [folderError, setFolderError] = useState("");
   const settingsDialog = useRef<HTMLDialogElement>(null);
+  const composerInput = useRef<HTMLTextAreaElement>(null);
 
   const projectList = library.projects;
   const activeProject = projectList.find((project) => project.chats.some((chat) => chat.id === library.activeId))!;
@@ -54,9 +55,11 @@ function App() {
   const scenario = scenarios.find((item) => item.id === scenarioId)!;
 
   const messages = [
-    { id: "user-message", role: "user" as const, content: message || `${scenario.title}：请展示 ${scenario.description} 的执行过程。` },
-    { id: "assistant-message", role: "assistant" as const, content: "我会根据公开事件逐步展示任务状态，并把工具、审批、验证和最终结果保留在可追踪的消息流中。" },
+    ...(message.trim() || events.length ? [{ id: "user-message", role: "user" as const, content: message || `${scenario.title}：请展示 ${scenario.description} 的执行过程。` }] : []),
+    ...(events.length ? [{ id: "assistant-message", role: "assistant" as const, content: "我会根据公开事件逐步展示任务状态，并把工具、审批、验证和最终结果保留在可追踪的消息流中。" }] : []),
   ];
+  const showEmpty = !message.trim() && events.length === 0 && !playing && scenarioId !== "reconnecting";
+  const showLoading = events.length === 0 && (playing || Boolean(message.trim()));
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -216,11 +219,13 @@ function App() {
 
       <section className="message-stream" aria-label="消息流">
         <div className="message-column">
+          {showEmpty && <section className="timeline-empty" aria-labelledby="empty-title"><span aria-hidden="true">✦</span><h2 id="empty-title">开始一个新任务</h2><p>输入目标后，公开运行事件会在这里逐步呈现。</p><button onClick={() => composerInput.current?.focus()}>在输入框中开始</button></section>}
           {messages.map((item) => <article className={`message ${item.role}`} key={item.id}>
             <span className="message-author">{item.role === "assistant" ? "M" : userAvatar}</span>
             <div className="message-body">{item.role === "assistant" ? <><h2>任务执行概览</h2><p>{item.content}</p><h3>当前计划</h3><ul><li>读取公开事件</li><li>展示工具与验证状态</li><li>生成可检查的最终结果</li></ul><div className="message-actions"><button onClick={() => setNotice("已复制消息摘要（演示）。")}>□ 复制</button><button aria-pressed={reaction === "like"} onClick={() => setReaction("like")}>♡ 点赞</button><button aria-pressed={reaction === "dislike"} onClick={() => setReaction("dislike")}>▽ 点踩</button></div></> : <p>{item.content} <a href="#composer">查看执行输入</a></p>}</div>
           </article>)}
           {scenarioId === "reconnecting" && <aside className="reconnect-banner"><strong>连接恢复</strong><span>从事件序号 {resumePoint(scenarioId)} 之后继续，不创建新任务。</span></aside>}
+          {showLoading && <section className="timeline-loading" aria-live="polite" aria-busy="true"><span className="loading-avatar"/><div><span/><span/><span/></div><p>{playing ? "正在读取公开事件…" : "等待公开事件…"}</p></section>}
           <div className="event-flow">{events.map((event) => <article key={event.eventId} data-event={event.kind}>{renderEvent(event)}</article>)}</div>
         </div>
       </section>
@@ -228,7 +233,7 @@ function App() {
       <footer className="composer-area">{notice && <p className="notice" role="status">{notice}</p>}<form onSubmit={(event) => { event.preventDefault(); send(); }}>
         <button type="button" className="attachment-button" aria-label="添加附件" onClick={() => setNotice("附件功能等待文件服务接入。")}>＋</button>
         <label className="sr-only" htmlFor="composer">输入指令</label>
-        <textarea id="composer" maxLength={20_000} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入指令..." onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
+        <textarea ref={composerInput} id="composer" maxLength={20_000} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入指令..." onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
         <button type="button" className={`voice-button ${voiceActive ? "active" : ""}`} aria-label="语音输入" aria-pressed={voiceActive} onClick={() => setVoiceActive((value) => !value)}>♩</button>
         <label className="model-picker"><span className="sr-only">模型</span><select value={modelName} onChange={(event) => setModelName(event.target.value)}><option>DeepSeek V3</option><option>Kimi K2</option><option>MiniMax M2</option></select></label>
         <button className="send-button" aria-label="发送" disabled={!draft.trim() || playing}>↑</button>
@@ -236,7 +241,7 @@ function App() {
     </main>
 
     <button className="mobile-backdrop" aria-label="关闭侧面板" onClick={() => setMobilePanel(null)}/>
-    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}>×</button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title} eventCount={eventCount} noticeVisible={noticeVisible} onCloseNotice={() => setNoticeVisible(false)}/></aside>
+    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}>×</button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title} noticeVisible={noticeVisible} onCloseNotice={() => setNoticeVisible(false)}/></aside>
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" onClick={() => setDialogMode(null)}>×</button>

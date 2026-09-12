@@ -72,7 +72,7 @@ export function Sidebar(props: SidebarProps) {
     <div className="sidebar-scroll">
       <label className="search-field"><span aria-hidden="true">⌕</span><input ref={searchInput} aria-label="搜索项目和对话" placeholder="搜索" value={search} onChange={(event) => setSearch(event.target.value)}/><kbd>⌘L</kbd></label>
       <nav className="quick-actions" aria-label="快捷操作">
-        <button onClick={props.onNewAgent}><span>＋</span>新建</button>
+        <button aria-label="新建对话" onClick={props.onNewAgent}><span>＋</span>新建</button>
         <button onClick={props.onAutomations}><span>◷</span>自动化</button>
         <button onClick={props.onCustomize}><span>✦</span>自定义</button>
       </nav>
