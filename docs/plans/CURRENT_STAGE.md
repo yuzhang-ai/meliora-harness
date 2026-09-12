@@ -131,11 +131,11 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | Ready | 施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；先做 durable command contract，不提前接 UI |
-| Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | In progress | Issue #13；冻结 Command/API/Model Step contract，新增 SQLite `0002`、Memory/SQLite adapter 与共同恢复测试，不包含 HTTP handler |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，当前进入 WP-1 Server composition |
+| Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport 已分别通过 PR #3、#5、#8、#10 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；Issue #13 已启动 WP-0 durable command 与 Model Step checkpoint，秦峻溥负责 SQLite command reservation/migration，完成 contract、共同 adapter tests 与独立审查后再进入 Server composition；不向 PR #8 继续追加范围。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command 与 Model Step checkpoint 已通过 PR #3、#5、#8、#10、#14 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；后端进入 WP-1 Server composition，装配受控 workspace、local principal、Provider/Tool adapters 与 `POST /api/turns`，不提前扩展 snapshot/recovery 或 Web 范围。秦峻溥冻结 PR #14，等待 WP-3 的 snapshot/resume adapter 独立任务。
