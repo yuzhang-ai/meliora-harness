@@ -1,9 +1,10 @@
 import { publicRunEventReplays } from "../../../fixtures/contracts/v1/public-run-event-replays";
 import { PUBLIC_RUN_EVENT_SCHEMA_VERSION, type PublicRunEvent } from "../../../packages/agent-runtime/public-events";
-export type Scenario = keyof typeof publicRunEventReplays | "blocked" | "compacting";
+export type Scenario = keyof typeof publicRunEventReplays | "approval-live-demo" | "blocked" | "compacting";
 export const scenarios: {id: Scenario; title: string; description: string}[] = [
   {id:"read-only-success",title:"工作区检查",description:"正常运行 · 工具调用 · 验证"},
   {id:"approval-required",title:"修改文件审批",description:"等待审批 · 参数绑定"},
+  {id:"approval-live-demo",title:"待处理审批演示",description:"未过期审批 · 前端交互演示"},
   {id:"tool-failure",title:"Git 检查失败",description:"工具失败 · 可重试"},
   {id:"cancelled",title:"已取消的任务",description:"取消 · 保留执行记录"},
   {id:"reconnecting",title:"恢复断开的会话",description:"SSE 重连 · 事件去重"},
@@ -13,6 +14,11 @@ export const scenarios: {id: Scenario; title: string; description: string}[] = [
 const envelope = (id: string) => ({schemaVersion:PUBLIC_RUN_EVENT_SCHEMA_VERSION,eventId:"web-demo-"+id,sessionId:"web-demo-"+id,runId:"web-demo-"+id,sequence:1,timestamp:"2026-09-12T00:00:00.000Z",visibility:"public" as const});
 export function streamFor(id:Scenario): readonly PublicRunEvent[] {
   // Supplemental UI-only examples use existing contracts, never modify shared fixtures.
+  if(id==="approval-live-demo") return publicRunEventReplays["approval-required"].events.map((event) => event.kind === "approval_requested" ? {
+    ...event,
+    eventId:`${event.eventId}-live-demo`,
+    payload:{...event.payload,expiresAt:"2099-12-31T23:59:59.000Z"},
+  } : event);
   if(id==="blocked") return [{...envelope(id),kind:"run_blocked",payload:{code:"workspace_selection_required",message:"尚未选择可用的工作区，任务暂时无法继续。",userActions:["确认工作区目录。","接入真实服务后，重新提交任务。"]}}];
   if(id==="compacting") return [{...envelope(id),kind:"context_compacted",payload:{checkpointId:"web-demo-checkpoint",summary:"已保存目标、约束与执行进度，可从检查点继续。"}}];
   return publicRunEventReplays[id].events;

@@ -13,6 +13,7 @@ const path = require("node:path");
 
   for (const width of [1440, 1100, 1099, 1024, 768, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    await page.waitForTimeout(350);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     if ([1440, 1100, 768, 390].includes(width)) {
       await page.screenshot({ path: path.join(__dirname, `web-${width}.png`), fullPage: true });
@@ -39,6 +40,19 @@ const path = require("node:path");
   await page.getByRole("button", { name: /修改文件审批/ }).click();
   await page.getByText("此历史审批已过期，当前仅供查看。", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), false);
+  await page.getByRole("button", { name: /待处理审批演示/ }).click();
+  await page.locator('[data-event="approval_requested"]').waitFor();
+  assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), true);
+  await page.getByRole("button", { name: "允许本次", exact: true }).click();
+  await page.getByText("已允许本次（演示，不会执行修改）。", { exact: true }).waitFor();
+
+  assert.equal(await page.getByText("暂无文件变更", { exact: true }).isVisible(), true);
+  assert.equal(await page.getByText("+156", { exact: true }).count(), 0);
+  await page.getByRole("button", { name: "新建对话", exact: true }).click();
+  await page.getByRole("heading", { name: "开始一个新任务", exact: true }).waitFor();
+  assert.equal(await page.getByRole("heading", { name: "任务执行概览", exact: true }).count(), 0);
+  await page.getByRole("button", { name: "重新回放", exact: true }).click();
+  await page.locator(".timeline-loading").waitFor();
 
   await page.keyboard.press("Control+KeyL");
   assert.equal(await page.getByRole("textbox", { name: "搜索项目和对话" }).evaluate((element) => element === document.activeElement), true);
@@ -81,6 +95,6 @@ const path = require("node:path");
   await page.keyboard.press("Escape");
 
   assert.deepEqual(pageErrors, []);
-  console.log("PASS: five required PublicRunEvent replays, six responsive widths, four screenshots, keyboard shortcuts/drawers/tabs, animated collapse, expired approval, escaped input; no page errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
