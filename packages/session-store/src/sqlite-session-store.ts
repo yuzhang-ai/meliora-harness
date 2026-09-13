@@ -14,7 +14,8 @@ import type {
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
-  StoredPrivateUserInput, StoredRunCommand, TransitionRunCommandInput, TransitionRunCommandResult,
+  StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
+  SettleRunCommandWithTerminalEventResult, TransitionRunCommandInput, TransitionRunCommandResult,
   TurnRecord, WriteSnapshotInput,
 } from "../contracts.js";
 import {
@@ -252,6 +253,96 @@ export class SqliteSessionStore implements SessionStorePort {
       );
       const updated = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(row.run_id) as Row;
       return { kind: "updated", command: this.toRunCommand(updated) };
+    }).immediate();
+  }
+
+  async settleRunCommandWithTerminalEvent(
+    input: SettleRunCommandWithTerminalEventInput,
+  ): Promise<SettleRunCommandWithTerminalEventResult> {
+    this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidCommandTimestamp(input.updatedAt);
+    if (input.terminalCode !== undefined) assertValidSafeCode(input.terminalCode);
+    if (!Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "event_sequence_conflict" };
+    }
+    const event = input.terminalEvent;
+    if (
+      event.schemaVersion !== "meliora.session-event.v1"
+      || event.kind !== `run_${input.terminalStatus}`
+      || event.visibility !== "public"
+    ) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    assertValidGeneratedId(event.eventId);
+    requireTimestamp(event.createdAt, "terminalEvent.createdAt");
+    assertPersistableJson(event.payload, "terminal_event.payload");
+
+    return this.db.transaction((): SettleRunCommandWithTerminalEventResult => {
+      const commandRow = this.db.prepare(
+        "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+      ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+      if (!commandRow) return { kind: "not_found", code: "run_command_not_found" };
+      if (commandRow.run_id !== input.runId || !this.isActiveAttempt(input.runId, input.attemptId)) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      const attempt = this.db.prepare(
+        "SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?",
+      ).get(input.runId, input.attemptId) as Row;
+      const expectedEvent: StoredEvent = {
+        ...event,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        sequence: input.expectedSequence + 1,
+      };
+      const eventRow = this.db.prepare("SELECT * FROM events WHERE event_id=?")
+        .get(event.eventId) as Row | undefined;
+
+      if (commandRow.status === "terminal") {
+        if (
+          commandRow.terminal_status !== input.terminalStatus
+          || commandRow.terminal_code !== (input.terminalCode ?? null)
+          || attempt.last_event_sequence !== input.expectedSequence + 1
+          || !eventRow
+          || !sameJson(this.toEvent(eventRow), expectedEvent)
+        ) return { kind: "conflict", code: "command_status_conflict" };
+        return { kind: "replay", command: this.toRunCommand(commandRow), event: this.toEvent(eventRow) };
+      }
+      if (commandRow.status !== input.expectedCommandStatus || !canTransitionRunCommand(commandRow.status, "terminal")) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+      if (Date.parse(input.updatedAt) < Date.parse(commandRow.updated_at)) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+      if (attempt.last_event_sequence !== input.expectedSequence) {
+        return { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt.last_event_sequence };
+      }
+      if (eventRow) return { kind: "conflict", code: "command_status_conflict" };
+
+      const payload = canonicalJson(expectedEvent.payload);
+      this.db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+        expectedEvent.eventId, expectedEvent.runId, expectedEvent.attemptId, expectedEvent.sequence,
+        expectedEvent.schemaVersion, expectedEvent.kind, expectedEvent.visibility, payload,
+        hashBytes(json(expectedEvent)), expectedEvent.createdAt, expectedEvent.causationId ?? null,
+        expectedEvent.correlationId ?? null,
+      );
+      this.db.prepare(
+        "UPDATE run_attempts SET last_event_sequence=?,updated_at=? WHERE run_id=? AND attempt_id=?",
+      ).run(expectedEvent.sequence, input.updatedAt, input.runId, input.attemptId);
+      this.db.prepare(`
+        UPDATE run_commands
+        SET status='terminal',terminal_status=?,terminal_code=?,updated_at=?,terminal_at=?
+        WHERE run_id=? AND status=?
+      `).run(
+        input.terminalStatus, input.terminalCode ?? null, input.updatedAt, input.updatedAt,
+        input.runId, input.expectedCommandStatus,
+      );
+      const settled = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?")
+        .get(input.runId) as Row;
+      return { kind: "settled", command: this.toRunCommand(settled), event: expectedEvent };
     }).immediate();
   }
 

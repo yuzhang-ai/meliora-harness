@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
@@ -51,6 +52,28 @@ const startServer = async (
   };
 };
 
+const rawGet = async (
+  baseUrl: string,
+  path: string,
+  headers: Readonly<Record<string, string>> = {},
+): Promise<Readonly<{ statusCode: number | undefined; body: string }>> => new Promise((resolve, reject) => {
+  const url = new URL(baseUrl);
+  const request = httpRequest({
+    headers,
+    hostname: url.hostname,
+    method: "GET",
+    path,
+    port: url.port,
+  }, (response) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk: string) => { body += chunk; });
+    response.on("end", () => resolve({ statusCode: response.statusCode, body }));
+  });
+  request.on("error", reject);
+  request.end();
+});
+
 test("SSE resumes from numeric Last-Event-ID and filters private events", async () => {
   const fixture = [
     storedEvent(1, "assistant_text_delta"),
@@ -59,9 +82,9 @@ test("SSE resumes from numeric Last-Event-ID and filters private events", async 
   ];
   const app = await startServer(fakeStore(fixture));
   try {
-    const response = await fetch(`${app.url}/api/runs/run-1/events`, { headers: { "Last-Event-ID": "1" } });
-    assert.equal(response.status, 200);
-    const body = await response.text();
+    const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": "1" });
+    assert.equal(response.statusCode, 200);
+    const body = response.body;
     assert.match(body, /id: 3\nevent: run_completed/u);
     assert.doesNotMatch(body, /model\.reasoning_delta|event-2/u);
     const data = JSON.parse(body.split("\n").find((line) => line.startsWith("data: "))!.slice(6)) as PublicRunEvent;
@@ -77,9 +100,9 @@ test("SSE resumes from numeric Last-Event-ID and filters private events", async 
 test("run_blocked is terminal and closes SSE without heartbeats", async () => {
   const app = await startServer(fakeStore([storedEvent(1, "run_blocked")]));
   try {
-    const response = await fetch(`${app.url}/api/runs/run-1/events`);
-    assert.equal(response.status, 200);
-    const body = await response.text();
+    const response = await rawGet(app.url, "/api/runs/run-1/events");
+    assert.equal(response.statusCode, 200);
+    const body = response.body;
     assert.match(body, /id: 1\nevent: run_blocked/u);
     assert.doesNotMatch(body, /heartbeat/u);
   } finally { await app.close(); }
@@ -93,9 +116,9 @@ test("unknown public events are quarantined so a later terminal event remains re
   ];
   const app = await startServer(fakeStore(fixture));
   try {
-    const response = await fetch(`${app.url}/api/runs/run-1/events`, { headers: { "Last-Event-ID": "1" } });
-    assert.equal(response.status, 200);
-    const body = await response.text();
+    const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": "1" });
+    assert.equal(response.statusCode, 200);
+    const body = response.body;
     assert.match(body, /id: 3\nevent: run_completed/u);
     assert.doesNotMatch(body, /invented_public_kind|event-2/u);
   } finally { await app.close(); }
@@ -110,9 +133,9 @@ test("private and unavailable sequences cannot be public cursors", async () => {
   for (const cursor of ["2", "99"]) {
     const app = await startServer(store);
     try {
-      const response = await fetch(`${app.url}/api/runs/run-1/events`, { headers: { "Last-Event-ID": cursor } });
-      assert.equal(response.status, 409);
-      assert.equal((await response.json() as { error: string }).error, "event_cursor_conflict");
+      const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": cursor });
+      assert.equal(response.statusCode, 409);
+      assert.equal((JSON.parse(response.body) as { error: string }).error, "event_cursor_conflict");
     } finally { await app.close(); }
   }
 });
@@ -121,9 +144,9 @@ test("malformed Last-Event-ID values return 400", async () => {
   for (const cursor of ["event-1", "-1", "1.5", "9007199254740992"]) {
     const app = await startServer(fakeStore([]));
     try {
-      const response = await fetch(`${app.url}/api/runs/run-1/events`, { headers: { "Last-Event-ID": cursor } });
-      assert.equal(response.status, 400);
-      assert.deepEqual(await response.json(), { error: "invalid_event_cursor" });
+      const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": cursor });
+      assert.equal(response.statusCode, 400);
+      assert.deepEqual(JSON.parse(response.body), { error: "invalid_event_cursor" });
     } finally { await app.close(); }
   }
 });
@@ -131,9 +154,9 @@ test("malformed Last-Event-ID values return 400", async () => {
 test("missing Run projection returns 404", async () => {
   const app = await startServer(fakeStore([]), async () => null);
   try {
-    const response = await fetch(`${app.url}/api/runs/missing/events`);
-    assert.equal(response.status, 404);
-    assert.deepEqual(await response.json(), { error: "run_not_found" });
+    const response = await rawGet(app.url, "/api/runs/missing/events");
+    assert.equal(response.statusCode, 404);
+    assert.deepEqual(JSON.parse(response.body), { error: "run_not_found" });
   } finally { await app.close(); }
 });
 
@@ -145,9 +168,9 @@ test("local persistence composition resolves Runs through the SQLite adapter", a
   });
   try {
     const port = (local.server.address() as AddressInfo).port;
-    const response = await fetch(`http://127.0.0.1:${port}/api/runs/missing/events`);
-    assert.equal(response.status, 404);
-    assert.deepEqual(await response.json(), { error: "run_not_found" });
+    const response = await rawGet(`http://127.0.0.1:${port}`, "/api/runs/missing/events");
+    assert.equal(response.statusCode, 404);
+    assert.deepEqual(JSON.parse(response.body), { error: "run_not_found" });
   } finally {
     local.server.closeAllConnections();
     await new Promise<void>((resolve, reject) => local.server.close((error) => error ? reject(error) : resolve()));
@@ -159,18 +182,18 @@ test("unexpected store failures return 500", async () => {
   const store = { readEvents: async () => { throw new Error("database unavailable"); } } as unknown as SessionStorePort;
   const app = await startServer(store);
   try {
-    const response = await fetch(`${app.url}/api/runs/run-1/events`);
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), { error: "event_stream_failed" });
+    const response = await rawGet(app.url, "/api/runs/run-1/events");
+    assert.equal(response.statusCode, 500);
+    assert.deepEqual(JSON.parse(response.body), { error: "event_stream_failed" });
   } finally { await app.close(); }
 });
 
 test("malformed encoded run ids return 400", async () => {
   const app = await startServer(fakeStore([]));
   try {
-    const response = await fetch(`${app.url}/api/runs/%E0%A4%A/events`);
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: "invalid_run_id" });
+    const response = await rawGet(app.url, "/api/runs/%E0%A4%A/events");
+    assert.equal(response.statusCode, 400);
+    assert.deepEqual(JSON.parse(response.body), { error: "invalid_run_id" });
   } finally { await app.close(); }
 });
 

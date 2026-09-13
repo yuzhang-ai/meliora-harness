@@ -1,9 +1,9 @@
 # M0 真实纵向集成施工单
 
-> 状态：Ready for contract slice
-> 版本：v0.1
-> 最后更新：2026-09-11
-> Base：`main@2b4157dc`
+> 状态：WP-1/WP-2 local implementation under review
+> 版本：v0.3
+> 最后更新：2026-09-12
+> Base：`main@9a212541`
 > 权威范围：M0 首条真实只读 Run 的集成顺序、工作包、验收和交接边界
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md)、[当前阶段施工单](CURRENT_STAGE.md)、[Harness 链路](../architecture/HARNESS_CHAIN.md)、[持久化与事件](../architecture/PERSISTENCE_AND_EVENTS.md)、[意图与输出层](../architecture/INTENT_AND_OUTPUT.md)、[前端规范](../frontend/VISUAL_SYSTEM.md)
@@ -77,9 +77,11 @@ Owner：你 + Codex。
 
 验收：请求返回稳定 IDs；模型第二步收到正确 Tool Result；HTTP handler 不等待完整 Run。
 
+本地实现证据（待独立审查与 PR CI 确认）：`apps/server/src/turn-command-composition.ts` 装配 workspace registry、固定 local principal、冻结 L0 catalog、Provider-to-model adapter、NodeWorkspaceHost、private artifact writer、model-visible 安全 Tool Result 与独立 public projector、后台 worker；`apps/server/src/server.ts` 新增 `POST /api/turns` 严格解析。`ReadOnlyRunLoop` 的 Model Step checkpoint gate 为必需依赖，未得到全新 `started` 不允许调用 Provider。`apps/server/tests/turn-command.test.ts` 覆盖 HTTP command 创建、durable replay/hash conflict、非法 authority 字段、未知 workspace、SQLite + SSE 完整只读路径、Model Step checkpoint 冲突时不调用 Provider、非终态 replay 不重复 Provider、dispatched unknown outcome fail-closed、敏感输入拒绝。
+
 ### WP-2：Server-level vertical fixture
 
-Owner：你 + Codex；独立 Terra high Agent 审查安全与恢复边界。
+Owner：你 + Codex；独立 gpt-5.5 xhigh Agent 审查安全与恢复边界。
 
 新增 `server-real-readonly-vertical.test.ts`，使用临时 Git workspace、临时 SQLite 和本地 fake OpenAI SSE Provider，证明：
 
@@ -88,6 +90,8 @@ Owner：你 + Codex；独立 Terra high Agent 审查安全与恢复边界。
 - 关闭并重开 SQLite/Server 后，仅重连 SSE 即可读到终态，Provider call count 不增加；
 - API Key、未投影 workspace 原文、private Artifact ID、reasoning 和原始错误不会进入 HTTP response、`PublicRunEvent`、public artifact 或未来的 public receipt projection；
 - 真实成功流与 `publicRunEventReplays["read-only-success"]` 的 schema 和公开字段兼容。
+
+本地实现证据（待独立审查与 PR CI 确认）：`apps/server/tests/server-real-readonly-vertical.test.ts` 使用临时 Git workspace、临时 SQLite 和本地 fake DeepSeek/OpenAI SSE Provider，覆盖 `POST -> Provider -> L0 Tool -> receipt/verification -> completed -> SSE`；验证第二次 Provider 请求使用 Runtime `invocationId` 关联 Tool Result；重启 SQLite/Server 后只重连 SSE 可读终态；同一 idempotency key 终态 replay 不增加 Provider call count；HTTP/SSE 不含 fake API key、私有 workspace marker 或 private artifact ID。
 
 ### WP-3：Recovery、snapshot 与 resume-point
 

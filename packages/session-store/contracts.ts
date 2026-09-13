@@ -161,6 +161,33 @@ export type TransitionRunCommandResult =
     }>
   | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
 
+/**
+ * A public terminal event and its durable command state form one observable
+ * fact.  Adapters must either write both or write neither; callers must not
+ * compose appendEvents() and transitionRunCommand() for this boundary.
+ */
+export type SettleRunCommandWithTerminalEventInput = RunCommandScope & Readonly<{
+  runId: string;
+  attemptId: string;
+  leaseToken: string;
+  expectedCommandStatus: Exclude<RunCommandStatus, "terminal">;
+  expectedSequence: number;
+  terminalStatus: RunCommandTerminalStatus;
+  terminalCode?: string;
+  updatedAt: string;
+  terminalEvent: NewEvent;
+}>;
+
+export type SettleRunCommandWithTerminalEventResult =
+  | Readonly<{ kind: "settled"; command: StoredRunCommand; event: StoredEvent }>
+  | Readonly<{ kind: "replay"; command: StoredRunCommand; event: StoredEvent }>
+  | Readonly<{
+      kind: "conflict";
+      code: "command_status_conflict" | "event_sequence_conflict" | "run_attempt_conflict" | "lease_not_held" | "lease_expired";
+      currentSequence?: number;
+    }>
+  | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
+
 export type ReadPrivateUserInputInput = Readonly<{
   sessionId: string;
   turnId: string;
@@ -534,6 +561,9 @@ export interface SessionStorePort {
   reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult>;
   readRunCommand(input: RunCommandScope): Promise<StoredRunCommand | null>;
   transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult>;
+  settleRunCommandWithTerminalEvent(
+    input: SettleRunCommandWithTerminalEventInput,
+  ): Promise<SettleRunCommandWithTerminalEventResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
   finishModelStep(input: FinishModelStepInput): Promise<FinishModelStepResult>;

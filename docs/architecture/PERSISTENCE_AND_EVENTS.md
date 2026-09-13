@@ -80,6 +80,8 @@ canonical request 只包含版本化的 `workspace_id + user_message`，不包�
 
 Command 状态为 `reserved -> accepted -> dispatched -> terminal`。`terminal` 另带 `completed / blocked / failed / cancelled` 之一及可选安全 code。通用状态更新必须同时携带 Command scope、`run_id + active attempt_id + lease_token` 并使用 expected-status CAS；Store 在同一原子操作内验证 active Attempt 与未过期 lease，旧 worker 即使知道 Command scope 也不得推进状态。`accepted -> dispatched` 不属于通用状态更新，只能由 `startModelStep` 在写入新 checkpoint 的同一事务中完成。恢复协调器可以用当前 Attempt 与有效 lease 把未能继续接管的 `reserved / accepted / dispatched` Command 收口为 terminal blocked，不能留下无人接管的永久 `202`。
 
+`run_blocked(model_step_outcome_unknown)` 的 Command 收口必须调用 Store 的单一原子操作：它接收 Command scope、`run_id / active attempt_id / lease_token`、expected Command status、expected event sequence、terminal status/code 和**恰好一个** public terminal event。Store 先验证 scope、active Attempt、lease、Command CAS、sequence 与 `terminalStatus <-> run_<terminalStatus>` 事件种类一致性，再在同一临界区插入 event、推进 Attempt 的 `last_event_sequence` 并把 Command 写为 `terminal`。任一验证、插入或更新失败时三项都不得改变；完全相同的 replay 返回既有 Command 和 event，绝不追加第二个终态事件。SQLite adapter 使用 `BEGIN IMMEDIATE`，Memory adapter 在无 `await` 的同步临界段完成同样语义。该路径不得把 `appendEvents` 和 `transitionRunCommand` 拼接；持久化失败或冲突时必须保留 `dispatched + started`，等待安全恢复且不得重调 Provider。
+
 新 Command 的 reservation、通过长度与敏感信息校验的 private user input、Session、Turn、Run 和 Attempt #1 必须由一个 Store 方法在同一事务内写入。private user input 是 Turn 级、`role=user`、`visibility=private` 的 model-visible 事实，创建后续 Attempt 时继续复用。敏感信息检查必须在把原文绑定给任何 SQL 语句之前完成；仅依赖事务 rollback 不能保证原文不会进入 WAL/SHM。
 
 ### 3.2 Model Step Checkpoint
