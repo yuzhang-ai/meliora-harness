@@ -13,7 +13,7 @@ test("implements frozen port with durable replay, snapshot and server resolver",
   const appended = await store.appendEvents({ runId: "run-1", attemptId: "attempt-1", expectedSequence: 0, leaseToken: lease.leaseToken, events: [event("event-1"), event("event-2", "private")] });
   assert.equal(appended.kind, "appended");
   assert.deepEqual(await store.appendEvents({ runId: "run-1", attemptId: "attempt-1", expectedSequence: 0, leaseToken: lease.leaseToken, events: [] }), { kind: "conflict", code: "event_sequence_conflict", currentSequence: 2 });
-  await store.writeSnapshot({ snapshot: { schemaVersion: "meliora.run-snapshot.v1", snapshotId: "snapshot-1", runId: "run-1", attemptId: "attempt-1", throughSequence: 2, state: { status: "running" }, createdAt: timestamp(2) }, expectedSequence: 2, leaseToken: lease.leaseToken });
+  await store.writeSnapshot({ snapshot: { schemaVersion: "meliora.run-snapshot.v1", snapshotId: "snapshot-1", runId: "run-1", attemptId: "attempt-1", throughSequence: 2, state: { schemaVersion: "meliora.private-run-snapshot-state.v1", phase: "model_streaming", catalogHash: "catalog-hash", intentRevision: 1, modelHistoryArtifact: { artifactId: "history-1", contentHash: "a".repeat(64), mediaType: "application/json", byteLength: 1, visibility: "private" }, pendingInvocations: [], receiptRefs: [], verificationRefs: [] }, createdAt: timestamp(2) }, expectedSequence: 2, leaseToken: lease.leaseToken });
   const content = new TextEncoder().encode("verification output");
   await store.putArtifact({ artifactId: "artifact-1", contentHash: hashBytes(content), mediaType: "text/plain", content, visibility: "private", metadata: { source: "test" }, createdAt: timestamp(3) });
   assert.equal(await store.readRunSessionId("run-1"), "session-1");
@@ -205,8 +205,8 @@ test("lease expiry is based on the store clock, never caller timestamps", async 
 
 test("same-sequence snapshot accepts exact replay and rejects drift", async (t) => {
   const store = new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(timestamp()) }); const lease = await seed(store);
-  const input = { snapshot: { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: "snapshot-1", runId: "run-1", attemptId: "attempt-1", throughSequence: 0, state: { value: 1 }, createdAt: timestamp() }, expectedSequence: 0, leaseToken: lease.leaseToken };
+  const input = { snapshot: { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: "snapshot-1", runId: "run-1", attemptId: "attempt-1", throughSequence: 0, state: { schemaVersion: "meliora.private-run-snapshot-state.v1" as const, phase: "model_streaming" as const, catalogHash: "catalog-hash", intentRevision: 1, modelHistoryArtifact: { artifactId: "history-1", contentHash: "a".repeat(64), mediaType: "application/json", byteLength: 1, visibility: "private" as const }, pendingInvocations: [], receiptRefs: [], verificationRefs: [] }, createdAt: timestamp() }, expectedSequence: 0, leaseToken: lease.leaseToken };
   await store.writeSnapshot(input); await store.writeSnapshot(input);
-  await assert.rejects(store.writeSnapshot({ ...input, snapshot: { ...input.snapshot, state: { value: 2 } } }), IdempotencyConflictError);
+  await assert.rejects(store.writeSnapshot({ ...input, snapshot: { ...input.snapshot, state: { ...input.snapshot.state, phase: "blocked" } } }), IdempotencyConflictError);
   store.close();
 });

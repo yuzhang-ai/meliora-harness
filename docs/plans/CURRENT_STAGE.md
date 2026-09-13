@@ -131,7 +131,7 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已本地实现并等待独立审查/CI |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已本地实现并等待独立审查/CI；WP-3A Store Recovery Read Contract 已本地实现，仍需独立审查与 CI |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |

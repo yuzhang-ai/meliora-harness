@@ -98,7 +98,7 @@ Provider 响应完成处理后，`finishModelStep` 将同一 checkpoint 以 CAS 
 
 错误响应只使用冻结的安全 code 和 retryable 标志；不得携带用户原文、hash 材料、workspace path、数据库路径、Provider 原始响应或 SQLite 错误。浏览器输入错误、未知 workspace、幂等冲突与服务端故障必须映射到不同且稳定的 code。
 
-创建 Run 时原子创建 Attempt #1；恢复通过 `createRunAttempt` 创建递增 Attempt，不修改旧 Attempt 的终态。恢复必须同时以 `expected_latest_attempt_number` CAS 检查 Attempt 版本和旧 lease 的过期状态：同一 Run 任一未过期 lease 都返回 `lease_held`，不得写入新 Attempt 或第二 lease；仅在旧 lease 已过期时，才能原子创建新 Attempt 与新 lease。所有状态写入、事件追加、Snapshot、Invocation reservation 与 Receipt commit 都绑定 `run_id + attempt_id + lease_token`。`appendEvents` 还必须携带 `expected_sequence`，由 Store 原子分配连续 sequence。Port contract 需定义事务边界、冲突错误、分页、顺序、时钟和一致性，不把 SQLite 特性暴露给调用方。
+创建 Run 时原子创建 Attempt #1；恢复通过 `createRunAttempt` 创建递增 Attempt，不修改旧 Attempt 的终态。`StoredRunCommand.initialAttemptId` 是创建命令时的不可变身份，兼容字段 `attemptId` 恒等于它；二者都不是 lease/CAS authority。唯一未来写 authority 是 `Run.activeAttemptId` 加新 Attempt 的 `expected_latest_attempt_number` CAS。恢复必须同时检查 Attempt 版本和旧 lease 的过期状态：同一 Run 任一未过期 lease 都返回 `lease_held`，不得写入新 Attempt 或第二 lease；仅在旧 lease 已过期时，才能原子创建新 Attempt 与新 lease。所有状态写入、事件追加、Snapshot、Invocation reservation 与 Receipt commit 都绑定 `run_id + attempt_id + lease_token`。`appendEvents` 还必须携带 `expected_sequence`，由 Store 原子分配连续 sequence。Port contract 需定义事务边界、冲突错误、分页、顺序、时钟和一致性，不把 SQLite 特性暴露给调用方。
 
 ## 4. Event Log
 
@@ -121,6 +121,11 @@ Public SSE 只读取 `visibility=public` 的投影事件。Private 事件可用�
 
 ## 5. Snapshot 与恢复
 
+- `RunSnapshot` 是 private-only 结构化恢复快照，不接受裸 JSON state：至少包含 state schema version、phase、catalog hash、intent revision、private model-history artifact ref、可选 terminal model-step-result binding、pending invocation refs、receipt refs 与 verification refs。pending ref 只含 invocation identity/attempt/hash/status（可含 tool identity），完整调用参数和 idempotency 原文只从 recovery bundle 的 durable invocation records 读取。模型原文、凭证和原始工具输出不进入快照；所有 artifact ref 写入与读回都重新经过结构和敏感数据校验。
+- terminal model-step result binding 必须同时绑定 `attemptId / modelStepId / requestFingerprint / private artifact ref`；写 Snapshot 的同一 adapter 临界区/SQLite transaction 必须确认 checkpoint 存在且已 `terminal`，读回和 recovery bundle 也再次核对。checkpoint 或 binding 漂移是 `snapshot_integrity_conflict`，不得继续恢复。artifact 的实体存在性/内容 readback 不在 WP-3A 原子多实体写范围内，留给后续 B slice；本切片至少 fail closed 于 ref 结构、visibility、hash 格式和敏感扫描。
+- `RecoveryReadPort` 独立于写 Port：`listRecoverableCommands({limit: 1..64})` 按不可变 `(createdAt, runId)` 扫描非终态 command 并返回 `sweepComplete`，不发明 cursor。扫描 DTO 只能含 `runId / initialAttemptId / status / createdAt`，不得泄露 principal、workspace、idempotency、request hash、Session 或 Turn。`readRecoveryBundle` 以单一 read view 返回 command、Run 的 active Attempt、private input/snapshot、事件分页、latest model step 与 invocation reconciliation records。SQLite 必须在同一 read transaction 内完成，Memory 必须深拷贝。
+- bundle 的 `expectedActiveAttemptId` 不匹配返回 `run_attempt_conflict`；事件分页不完整时只返回 `tailComplete=false`、`nextAfterSequence` 等分页事实。超过 128 个 invocation 的 bundle 返回 `recovery_bundle_too_large`，不得静默截断。
+- recovery bundle 缺失 command 绑定的 private user input 是完整性失败（`recovery_bundle_incomplete`），不得返回看似可恢复的 `found + null`。invocation reconciliation 固定按 `(reservedAt, invocationId)` 排序。
 - Snapshot 记录应用到哪个 event sequence。
 - 恢复先读最近 Snapshot，再重放后续事件。
 - Snapshot 写失败不影响已提交事件。
@@ -153,7 +158,7 @@ Last-Event-ID: <event_id>
 - 心跳不进入业务事件日志。
 - 客户端重复收到事件时按 ID 去重。
 - 终态事件后连接可关闭。
-- 事件保留不足时返回 snapshot + resume point，而不是静默丢段。
+- public snapshot/resume-point 的存储和 projector/SSE 契约尚未在此切片实现；在其冻结前，事件保留不足不得把 private `RunSnapshot` 当作 public payload 或构造 escape hatch。
 - 页面刷新只做 read，不创建新 Run。
 
 ## 9. 数据安全
