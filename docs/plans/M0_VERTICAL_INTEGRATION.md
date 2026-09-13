@@ -98,6 +98,7 @@ Owner：你 + Codex；独立 gpt-5.5 xhigh Agent 审查安全与恢复边界。
 Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证崩溃窗口。
 
 - Recovery coordinator 从 durable command、snapshot 和 event log 重建 model-visible 状态；旧 Attempt 不回退，旧 lease 过期后以 CAS 创建新 Attempt。
+- WP-3A 先冻结并实现 Store-only Recovery Read Contract：initial command identity 与 `Run.activeAttemptId` authority 分离、Memory/SQLite 同一 bundle 读语义、private structured snapshot 与 bounded invocation read；不在此子包实现 public snapshot、projector 或 SSE。
 - `reserved / accepted` 且未 dispatch 的 command 可安全派发；`dispatched` 且非终态的 command 必须先对照 Model Step、Invocation reservation 和 Receipt 恢复，不能盲目重放工具。
 - Model Step 为 `started` 且无 terminal/failed 时，默认持久化 `run_blocked(model_step_outcome_unknown)`；除非对应 Provider 另有经过 fixture 验证的查询或幂等机制，否则禁止自动再次调用。
 - 写入可供 Runtime 重建的 `RunSnapshot`；retained event 不足时，Server 返回 public snapshot + resume-point，而不是永久 `409`。

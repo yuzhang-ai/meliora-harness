@@ -12,12 +12,14 @@ import type {
   PersistedRunRecord, PutArtifactInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
   ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReservationInput,
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
+  RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
   SettleRunCommandWithTerminalEventResult, TransitionRunCommandInput, TransitionRunCommandResult,
   TurnRecord, WriteSnapshotInput,
 } from "../contracts.js";
+import { assertValidRunSnapshot } from "../contracts.js";
 import {
   assertValidCommandTimestamp,
   assertValidGeneratedId,
@@ -352,18 +354,76 @@ export class SqliteSessionStore implements SessionStorePort {
     const row = this.db.prepare(
       "SELECT * FROM run_command_inputs WHERE session_id=? AND turn_id=?",
     ).get(input.sessionId, input.turnId) as Row | undefined;
-    if (!row) return null;
-    if (hashBytes(row.content) !== row.content_hash) throw new StoreIntegrityError("private_user_input_hash_drift");
-    return {
-      schemaVersion: "meliora.private-user-input.v1",
-      sessionId: row.session_id,
-      turnId: row.turn_id,
-      role: "user",
-      visibility: "private",
-      content: row.content,
-      contentHash: row.content_hash,
+    return row ? this.toPrivateUserInput(row) : null;
+  }
+
+  async listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage> {
+    this.requireRecoveryLimit(input.limit, 64, "invalid_recovery_command_limit");
+    const rows = this.db.prepare(`
+      SELECT run_id,attempt_id,status,created_at FROM run_commands
+      WHERE status != 'terminal'
+      ORDER BY created_at ASC, run_id ASC
+      LIMIT ?
+    `).all(input.limit + 1) as Row[];
+    const commands: RecoverableCommandRef[] = rows.slice(0, input.limit).map((row) => ({
+      runId: row.run_id,
+      initialAttemptId: row.attempt_id,
+      status: row.status,
       createdAt: row.created_at,
-    };
+    }));
+    return { commands, sweepComplete: rows.length <= input.limit };
+  }
+
+  async readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult> {
+    this.requireRecoveryLimit(input.eventLimit, 500, "invalid_recovery_event_limit");
+    if (input.afterSequence !== undefined && (!Number.isInteger(input.afterSequence) || input.afterSequence < 0)) {
+      throw new TypeError("invalid_recovery_after_sequence");
+    }
+    return this.db.transaction((): RecoveryBundleResult => {
+      const runRow = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!runRow) return { kind: "not_found", code: "run_not_found" };
+      const run = this.toRun(runRow);
+      if (input.expectedActiveAttemptId !== undefined && input.expectedActiveAttemptId !== run.activeAttemptId) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const commandRow = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!commandRow) return { kind: "not_found", code: "run_command_not_found" };
+      const attemptRow = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, run.activeAttemptId) as Row | undefined;
+      if (!attemptRow) return { kind: "conflict", code: "run_attempt_conflict" };
+      const invocationRows = this.db.prepare("SELECT * FROM invocations WHERE run_id=? ORDER BY reserved_at ASC, invocation_id ASC LIMIT 129").all(input.runId) as Row[];
+      if (invocationRows.length > 128) return { kind: "failure", code: "recovery_bundle_too_large" };
+      const snapshotRow = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(input.runId) as Row | undefined;
+      const snapshot = snapshotRow ? this.toSnapshot(snapshotRow) : null;
+      const effectiveAfterSequence = Math.max(input.afterSequence ?? 0, snapshot?.throughSequence ?? 0);
+      const eventRows = this.db.prepare("SELECT * FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(input.runId, effectiveAfterSequence, input.eventLimit + 1) as Row[];
+      const tailEvents = eventRows.slice(0, input.eventLimit).map((row) => this.toEvent(row));
+      const tailComplete = eventRows.length <= input.eventLimit;
+      const inputRow = this.db.prepare("SELECT * FROM run_command_inputs WHERE run_id=?").get(input.runId) as Row | undefined;
+      const latestModelStepRow = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND attempt_id=? ORDER BY started_at DESC, model_step_id DESC LIMIT 1").get(input.runId, run.activeAttemptId) as Row | undefined;
+      const invocations = invocationRows.map((row) => ({
+        reservation: this.toReservation(row),
+        invocation: this.toInvocation(row),
+        receipt: this.receiptForReservation(row.reservation_id),
+      }));
+      if (!inputRow) return { kind: "failure", code: "recovery_bundle_incomplete" };
+      const bundle: RecoveryBundle = {
+        command: this.toRunCommand(commandRow),
+        run,
+        activeAttempt: this.toAttempt(attemptRow),
+        readActiveAttemptId: run.activeAttemptId,
+        latestAttemptNumber: run.latestAttemptNumber,
+        privateUserInput: this.toPrivateUserInput(inputRow),
+        privateSnapshot: snapshot,
+        tailEvents,
+        effectiveAfterSequence,
+        eventHeadSequence: attemptRow.last_event_sequence,
+        tailComplete,
+        nextAfterSequence: tailComplete ? null : tailEvents.at(-1)?.sequence ?? effectiveAfterSequence,
+        latestModelStep: latestModelStepRow ? this.toModelStep(latestModelStepRow) : null,
+        invocations,
+      };
+      return { kind: "found", bundle };
+    })();
   }
 
   async startModelStep(input: StartModelStepInput): Promise<StartModelStepResult> {
@@ -582,11 +642,13 @@ export class SqliteSessionStore implements SessionStorePort {
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
-    const snapshot = input.snapshot; assertPersistableJson(snapshot.state, "snapshot.state");
+    const snapshot = input.snapshot; assertValidRunSnapshot(snapshot);
+    if (!Number.isInteger(snapshot.throughSequence) || snapshot.throughSequence < 0) throw new SequenceConflictError(snapshot.runId, input.expectedSequence, -1);
     this.db.transaction(() => {
       const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?").get(snapshot.runId, snapshot.attemptId) as Row | undefined;
       if (!attempt || attempt.last_event_sequence !== input.expectedSequence || snapshot.throughSequence > input.expectedSequence) throw new SequenceConflictError(snapshot.runId, input.expectedSequence, attempt?.last_event_sequence ?? -1);
       const lease = this.leaseConflict(snapshot.runId, snapshot.attemptId, input.leaseToken); if (lease) throw new IdempotencyConflictError(lease);
+      this.assertSnapshotIntegrity(snapshot);
       const state = canonicalJson(snapshot.state); const stateHash = hashBytes(state);
       const prior = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(snapshot.runId) as Row | undefined;
       if (prior?.through_sequence === snapshot.throughSequence) {
@@ -600,9 +662,7 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async readSnapshot(runId: string): Promise<RunSnapshot | null> {
     const row = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(runId) as Row | undefined;
-    if (!row) return null;
-    if (hashBytes(row.state_json) !== row.state_hash) throw new StoreIntegrityError("snapshot_hash_drift");
-    return { schemaVersion: "meliora.run-snapshot.v1", snapshotId: row.snapshot_id, runId: row.run_id, attemptId: row.attempt_id, throughSequence: row.through_sequence, state: JSON.parse(row.state_json) as JsonValue, createdAt: row.created_at };
+    return row ? this.toSnapshot(row) : null;
   }
 
   async reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult> {
@@ -765,6 +825,7 @@ export class SqliteSessionStore implements SessionStorePort {
       sessionId: row.session_id,
       turnId: row.turn_id,
       runId: row.run_id,
+      initialAttemptId: row.attempt_id,
       attemptId: row.attempt_id,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -799,10 +860,40 @@ export class SqliteSessionStore implements SessionStorePort {
     };
   }
   private requireTtl(ttlMs: number): void { if (!Number.isInteger(ttlMs) || ttlMs < 1) throw new TypeError("lease_ttl_invalid"); }
+  private requireRecoveryLimit(limit: number, maximum: number, message: string): void {
+    if (!Number.isInteger(limit) || limit < 1 || limit > maximum) throw new TypeError(message);
+  }
   private toSession(row: Row): SessionRecord { return { schemaVersion: "meliora.session.v1", sessionId: row.session_id, workspaceId: row.workspace_id, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private toTurn(row: Row): TurnRecord { return { schemaVersion: "meliora.turn.v1", sessionId: row.session_id, turnId: row.turn_id, intentRevision: row.intent_revision, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private toRun(row: Row): PersistedRunRecord { return { schemaVersion: "meliora.persisted-run.v1", sessionId: row.session_id, turnId: row.turn_id, runId: row.run_id, activeAttemptId: row.active_attempt_id, latestAttemptNumber: row.latest_attempt_number, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private toAttempt(row: Row): PersistedRunAttempt { return { schemaVersion: "meliora.persisted-run-attempt.v1", sessionId: row.session_id, turnId: row.turn_id, runId: row.run_id, attemptId: row.attempt_id, attemptNumber: row.attempt_number, status: row.status, lastEventSequence: row.last_event_sequence, catalogHash: row.catalog_hash, intentRevision: row.intent_revision, runtimeState: JSON.parse(row.runtime_state_json) as JsonValue, createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private toPrivateUserInput(row: Row): StoredPrivateUserInput {
+    if (hashBytes(row.content) !== row.content_hash) throw new StoreIntegrityError("private_user_input_hash_drift");
+    return { schemaVersion: "meliora.private-user-input.v1", sessionId: row.session_id, turnId: row.turn_id, role: "user", visibility: "private", content: row.content, contentHash: row.content_hash, createdAt: row.created_at };
+  }
+  private toSnapshot(row: Row): RunSnapshot {
+    if (hashBytes(row.state_json) !== row.state_hash) throw new StoreIntegrityError("snapshot_hash_drift");
+    const state = JSON.parse(row.state_json);
+    const snapshot = { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: row.snapshot_id, runId: row.run_id, attemptId: row.attempt_id, throughSequence: row.through_sequence, state, createdAt: row.created_at };
+    // Hash verification only proves byte stability. Revalidate the complete
+    // runtime envelope before exposing anything to recovery callers.
+    assertValidRunSnapshot(snapshot);
+    this.assertSnapshotIntegrity(snapshot);
+    return snapshot;
+  }
+  private assertSnapshotIntegrity(snapshot: RunSnapshot): void {
+    assertValidRunSnapshot(snapshot);
+    const terminal = snapshot.state.terminalModelStepResult;
+    if (!terminal) return;
+    const checkpoint = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?").get(snapshot.runId, terminal.modelStepId) as Row | undefined;
+    if (
+      terminal.attemptId !== snapshot.attemptId
+      || !checkpoint
+      || checkpoint.status !== "terminal"
+      || checkpoint.attempt_id !== terminal.attemptId
+      || checkpoint.request_fingerprint !== terminal.requestFingerprint
+    ) throw new StoreIntegrityError("snapshot_integrity_conflict");
+  }
   private toEvent(row: Row): StoredEvent {
     const event: StoredEvent = { schemaVersion: row.schema_version, eventId: row.event_id, runId: row.run_id, attemptId: row.attempt_id, sequence: row.sequence, kind: row.kind, visibility: row.visibility, payload: JSON.parse(row.payload_json) as JsonValue, createdAt: row.created_at, ...(row.causation_id === null ? {} : { causationId: row.causation_id }), ...(row.correlation_id === null ? {} : { correlationId: row.correlation_id }) };
     if (hashBytes(json(event)) !== row.event_hash) throw new StoreIntegrityError("event_hash_drift");

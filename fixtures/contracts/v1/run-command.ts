@@ -36,6 +36,7 @@ export const reservedRunCommandFixture: StoredRunCommand = {
   sessionId: "session-command-1",
   turnId: "turn-command-1",
   runId: "run-command-1",
+  initialAttemptId: "attempt-command-1",
   attemptId: "attempt-command-1",
   status: "reserved",
   createdAt: RUN_COMMAND_FIXTURE_TIMESTAMP,
@@ -60,7 +61,7 @@ export const acceptedRunCommandResponseFixture: TurnCommandResponse = {
   turnId: reservedRunCommandFixture.turnId,
   runId: reservedRunCommandFixture.runId,
   attemptId: reservedRunCommandFixture.attemptId,
-  commandStatus: reservedRunCommandFixture.status,
+  commandStatus: "reserved",
 };
 
 export const idempotencyConflictResponseFixture: TurnCommandErrorResponse = {

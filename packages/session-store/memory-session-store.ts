@@ -28,6 +28,11 @@ import type {
   ReadInvocationByIdempotencyKeyInput,
   ReadReceiptInput,
   ReadReservationInput,
+  RecoveryBundle,
+  RecoveryBundleInput,
+  RecoveryBundleResult,
+  RecoveryCommandPage,
+  RecoverableCommandRef,
   ReservationResult,
   ReserveRunCommandInput,
   ReserveRunCommandResult,
@@ -51,6 +56,7 @@ import type {
   WriteSnapshotInput,
   InvocationReconciliationRecord,
 } from "./contracts";
+import { assertValidRunSnapshot } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
 import {
   assertValidCommandTimestamp,
@@ -65,6 +71,7 @@ import {
   privateUserInputContentHash,
 } from "./run-command-contract";
 import { assertPersistableJson } from "./src/sensitive-data";
+import { canonicalJson, hashBytes } from "./src/integrity";
 
 type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
 
@@ -83,6 +90,7 @@ const commandScopeKey = (scope: RunCommandScope) =>
   `${scope.localPrincipalId}\u0000${scope.workspaceId}\u0000${scope.idempotencyKey}`;
 const modelStepKey = (runId: string, modelStepId: string) => `${runId}\u0000${modelStepId}`;
 const sameDocument = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
+const deepCopy = <T>(value: T): T => structuredClone(value);
 const sameInvocationRequest = (
   left: NormalizedToolInvocation,
   right: NormalizedToolInvocation,
@@ -163,6 +171,7 @@ export class MemorySessionStore implements SessionStorePort {
       sessionId: input.sessionId,
       turnId: input.turnId,
       runId: input.runId,
+      initialAttemptId: input.attemptId,
       attemptId: input.attemptId,
       status: "reserved",
       createdAt: input.reservedAt,
@@ -219,22 +228,23 @@ export class MemorySessionStore implements SessionStorePort {
       updatedAt: input.reservedAt,
     };
 
-    this.sessions.set(session.sessionId, session);
-    this.turns.set(turn.turnId, turn);
-    this.runs.set(run.runId, run);
-    this.attempts.set(attemptKey(run.runId, attempt.attemptId), attempt);
+    this.sessions.set(session.sessionId, deepCopy(session));
+    this.turns.set(turn.turnId, deepCopy(turn));
+    this.runs.set(run.runId, deepCopy(run));
+    this.attempts.set(attemptKey(run.runId, attempt.attemptId), deepCopy(attempt));
     this.events.set(run.runId, []);
-    this.privateUserInputs.set(turn.turnId, privateUserInput);
-    this.commands.set(scopeKey, command);
+    this.privateUserInputs.set(turn.turnId, deepCopy(privateUserInput));
+    this.commands.set(scopeKey, deepCopy(command));
     this.commandScopeByRunId.set(run.runId, scopeKey);
-    return { kind: "owner", command };
+    return { kind: "owner", command: deepCopy(command) };
   }
 
   async readRunCommand(input: RunCommandScope): Promise<StoredRunCommand | null> {
     assertValidLocalPrincipalId(input.localPrincipalId);
     assertValidWorkspaceId(input.workspaceId);
     assertValidIdempotencyKey(input.idempotencyKey);
-    return this.commands.get(commandScopeKey(input)) ?? null;
+    const command = this.commands.get(commandScopeKey(input));
+    return command ? deepCopy(command) : null;
   }
 
   async transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult> {
@@ -385,7 +395,72 @@ export class MemorySessionStore implements SessionStorePort {
 
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
     const record = this.privateUserInputs.get(input.turnId);
-    return record?.sessionId === input.sessionId ? record : null;
+    return record?.sessionId === input.sessionId ? deepCopy(record) : null;
+  }
+
+  async listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage> {
+    this.assertRecoveryLimit(input.limit, 64, "invalid_recovery_command_limit");
+    const commands: RecoverableCommandRef[] = [...this.commands.values()]
+      .filter((command) => command.status !== "terminal")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId))
+      .map((command) => ({ runId: command.runId, initialAttemptId: command.initialAttemptId, status: command.status, createdAt: command.createdAt }));
+    return { commands: deepCopy(commands.slice(0, input.limit)), sweepComplete: commands.length <= input.limit };
+  }
+
+  async readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult> {
+    this.assertRecoveryLimit(input.eventLimit, 500, "invalid_recovery_event_limit");
+    if (input.afterSequence !== undefined && (!Number.isInteger(input.afterSequence) || input.afterSequence < 0)) {
+      throw new TypeError("invalid_recovery_after_sequence");
+    }
+    const run = this.runs.get(input.runId);
+    if (!run) return { kind: "not_found", code: "run_not_found" };
+    if (input.expectedActiveAttemptId !== undefined && input.expectedActiveAttemptId !== run.activeAttemptId) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const commandScope = this.commandScopeByRunId.get(input.runId);
+    const command = commandScope ? this.commands.get(commandScope) : undefined;
+    if (!command) return { kind: "not_found", code: "run_command_not_found" };
+    const activeAttempt = this.attemptForRun(input.runId, run.activeAttemptId);
+    if (!activeAttempt) return { kind: "conflict", code: "run_attempt_conflict" };
+    const privateUserInput = this.privateUserInputs.get(run.turnId);
+    if (!privateUserInput) return { kind: "failure", code: "recovery_bundle_incomplete" };
+    const invocations = [...this.reservations.values()]
+      .filter((reservation) => reservation.runId === input.runId)
+      .sort((left, right) => left.reservedAt.localeCompare(right.reservedAt) || left.invocationId.localeCompare(right.invocationId));
+    if (invocations.length > 128) return { kind: "failure", code: "recovery_bundle_too_large" };
+    const snapshot = this.snapshots.get(input.runId) ?? null;
+    if (snapshot) this.assertSnapshotIntegrity(snapshot);
+    const effectiveAfterSequence = Math.max(input.afterSequence ?? 0, snapshot?.throughSequence ?? 0);
+    const eligible = (this.events.get(input.runId) ?? []).filter((event) => event.sequence > effectiveAfterSequence);
+    const tailEvents = eligible.slice(0, input.eventLimit);
+    const tailComplete = eligible.length <= tailEvents.length;
+    const records: InvocationReconciliationRecord[] = invocations.map((reservation) => {
+      const invocation = this.invocations.get(invocationKey(reservation.runId, reservation.attemptId, reservation.invocationId));
+      if (!invocation) throw new Error("recovery_invocation_drift");
+      const receiptId = this.receiptByReservation.get(reservation.reservationId);
+      return { reservation, invocation, receipt: receiptId ? this.receipts.get(receiptKey(reservation.runId, reservation.attemptId, receiptId)) ?? null : null };
+    });
+    const latestModelStep = [...this.modelSteps.values()]
+      .filter((step) => step.runId === input.runId && step.attemptId === run.activeAttemptId)
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.modelStepId.localeCompare(right.modelStepId))
+      .at(-1) ?? null;
+    const bundle: RecoveryBundle = {
+      command,
+      run,
+      activeAttempt,
+      readActiveAttemptId: run.activeAttemptId,
+      latestAttemptNumber: run.latestAttemptNumber,
+      privateUserInput,
+      privateSnapshot: snapshot,
+      tailEvents,
+      effectiveAfterSequence,
+      eventHeadSequence: activeAttempt.lastEventSequence,
+      tailComplete,
+      nextAfterSequence: tailComplete ? null : tailEvents.at(-1)?.sequence ?? effectiveAfterSequence,
+      latestModelStep,
+      invocations: records,
+    };
+    return { kind: "found", bundle: deepCopy(bundle) };
   }
 
   async startModelStep(input: StartModelStepInput): Promise<StartModelStepResult> {
@@ -607,7 +682,7 @@ export class MemorySessionStore implements SessionStorePort {
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
     };
-    const lease = this.newLease(input.ownerId, input.ttlMs, input.requestedAt);
+    const lease = this.newLease(input.ownerId, input.ttlMs);
     const updatedRun: PersistedRunRecord = {
       ...run,
       activeAttemptId: input.attemptId,
@@ -621,6 +696,14 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   async appendEvents(input: AppendEventsInput): Promise<AppendEventsResult> {
+    if (!Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "event_sequence_conflict" };
+    }
+    for (const event of input.events) {
+      assertValidGeneratedId(event.eventId);
+      assertValidCommandTimestamp(event.createdAt);
+      assertPersistableJson(event.payload, "event.payload");
+    }
     const attempt = this.attempts.get(attemptKey(input.runId, input.attemptId));
     if (!attempt) return { kind: "conflict", code: "run_attempt_conflict" };
     const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
@@ -636,19 +719,19 @@ export class MemorySessionStore implements SessionStorePort {
       sequence: input.expectedSequence + index + 1,
     }));
     const lastSequence = input.expectedSequence + appended.length;
-    this.events.set(input.runId, [...previous, ...appended]);
+    this.events.set(input.runId, deepCopy([...previous, ...appended]));
     this.attempts.set(attemptKey(input.runId, input.attemptId), {
       ...attempt,
       lastEventSequence: lastSequence,
       updatedAt: this.clock().toISOString(),
     });
-    return { kind: "appended", events: appended, lastSequence };
+    return { kind: "appended", events: deepCopy(appended), lastSequence };
   }
 
   async readEvents(input: ReadEventsInput): Promise<EventPage> {
     const after = input.afterSequence ?? 0;
     const eligible = (this.events.get(input.runId) ?? []).filter((event) => event.sequence > after);
-    const events = eligible.slice(0, input.limit);
+    const events = deepCopy(eligible.slice(0, input.limit));
     return {
       events,
       nextSequence: eligible.length > events.length ? events.at(-1)?.sequence ?? null : null,
@@ -656,15 +739,32 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
+    this.assertSnapshotIntegrity(input.snapshot);
+    if (!Number.isInteger(input.snapshot.throughSequence) || input.snapshot.throughSequence < 0) {
+      throw new Error("snapshot_sequence_conflict");
+    }
     const attempt = this.attempts.get(attemptKey(input.snapshot.runId, input.snapshot.attemptId));
-    if (!attempt || attempt.lastEventSequence !== input.expectedSequence) throw new Error("snapshot_sequence_conflict");
+    if (!attempt || attempt.lastEventSequence !== input.expectedSequence || input.snapshot.throughSequence > input.expectedSequence) throw new Error("snapshot_sequence_conflict");
     const leaseConflict = this.leaseConflict(input.snapshot.runId, input.snapshot.attemptId, input.leaseToken);
     if (leaseConflict) throw new Error(leaseConflict);
-    this.snapshots.set(input.snapshot.runId, input.snapshot);
+    const prior = this.snapshots.get(input.snapshot.runId);
+    if (prior?.throughSequence === input.snapshot.throughSequence) {
+      if (
+        prior.snapshotId !== input.snapshot.snapshotId
+        || prior.attemptId !== input.snapshot.attemptId
+        || canonicalJson(prior.state) !== canonicalJson(input.snapshot.state)
+      ) throw new Error("snapshot_content_conflict");
+      return;
+    }
+    if (prior && prior.throughSequence > input.snapshot.throughSequence) throw new Error("snapshot_sequence_conflict");
+    this.snapshots.set(input.snapshot.runId, deepCopy(input.snapshot));
   }
 
   async readSnapshot(runId: string): Promise<RunSnapshot | null> {
-    return this.snapshots.get(runId) ?? null;
+    const snapshot = this.snapshots.get(runId);
+    if (!snapshot) return null;
+    this.assertSnapshotIntegrity(snapshot);
+    return deepCopy(snapshot);
   }
 
   async reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult> {
@@ -701,21 +801,23 @@ export class MemorySessionStore implements SessionStorePort {
       status: input.invocation.status,
       reservedAt: input.reservedAt,
     };
-    this.invocations.set(key, input.invocation);
-    this.reservations.set(reservationId, reservation);
+    this.invocations.set(key, deepCopy(input.invocation));
+    this.reservations.set(reservationId, deepCopy(reservation));
     this.reservationByRunIdempotencyKey.set(idempotencyKey, reservationId);
     return { kind: "owner", reservationId };
   }
 
   async readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null> {
-    return this.invocations.get(invocationKey(input.runId, input.attemptId, input.invocationId)) ?? null;
+    const invocation = this.invocations.get(invocationKey(input.runId, input.attemptId, input.invocationId));
+    return invocation ? deepCopy(invocation) : null;
   }
 
   async readReservation(input: ReadReservationInput): Promise<StoredInvocationReservation | null> {
     const invocation = await this.readInvocation(input);
     if (!invocation) return null;
     const reservationId = this.reservationByRunIdempotencyKey.get(`${input.runId}\u0000${invocation.idempotencyKey}`);
-    return reservationId ? this.reservations.get(reservationId) ?? null : null;
+    const reservation = reservationId ? this.reservations.get(reservationId) : undefined;
+    return reservation ? deepCopy(reservation) : null;
   }
 
   async readInvocationByIdempotencyKey(
@@ -728,11 +830,11 @@ export class MemorySessionStore implements SessionStorePort {
     const invocation = this.invocations.get(invocationKey(reservation.runId, reservation.attemptId, reservation.invocationId));
     if (!invocation) return null;
     const receiptId = this.receiptByReservation.get(reservation.reservationId);
-    return {
+    return deepCopy({
       reservation,
       invocation,
       receipt: receiptId ? this.receipts.get(receiptKey(reservation.runId, reservation.attemptId, receiptId)) ?? null : null,
-    };
+    });
   }
 
   async commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult> {
@@ -775,6 +877,20 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
+    assertPersistableJson(input.metadata ?? null, "artifact.metadata");
+    if (hashBytes(input.content) !== input.contentHash) throw new Error("artifact_content_hash_conflict");
+    const prior = this.artifacts.get(input.artifactId);
+    if (prior) {
+      if (
+        prior.contentHash !== input.contentHash
+        || prior.mediaType !== input.mediaType
+        || prior.visibility !== input.visibility
+        || prior.createdAt !== input.createdAt
+        || prior.content.byteLength !== input.content.byteLength
+        || !sameDocument(prior.metadata ?? null, input.metadata ?? null)
+      ) throw new Error("artifact_conflict");
+      return deepCopy({ artifactId: prior.artifactId, contentHash: prior.contentHash, mediaType: prior.mediaType, byteLength: prior.byteLength, visibility: prior.visibility });
+    }
     const artifact: Artifact = {
       artifactId: input.artifactId,
       contentHash: input.contentHash,
@@ -783,19 +899,23 @@ export class MemorySessionStore implements SessionStorePort {
       visibility: input.visibility,
       createdAt: input.createdAt,
       content: new Uint8Array(input.content),
-      metadata: input.metadata,
+      metadata: input.metadata === undefined ? undefined : deepCopy(input.metadata),
     };
-    this.artifacts.set(artifact.artifactId, artifact);
+    this.artifacts.set(artifact.artifactId, deepCopy(artifact));
     const { content: _content, createdAt: _createdAt, metadata: _metadata, ...reference } = artifact;
-    return reference;
+    return deepCopy(reference);
   }
 
   async getArtifact(id: string): Promise<Artifact | null> {
     const artifact = this.artifacts.get(id);
-    return artifact ? { ...artifact, content: new Uint8Array(artifact.content) } : null;
+    if (!artifact) return null;
+    if (hashBytes(artifact.content) !== artifact.contentHash) throw new Error("artifact_hash_drift");
+    return deepCopy(artifact);
   }
 
   async acquireLease(input: LeaseRequest): Promise<LeaseResult> {
+    this.requireTtl(input.ttlMs);
+    assertValidCommandTimestamp(input.requestedAt);
     if (!this.attemptForRun(input.runId, input.attemptId)) {
       return { kind: "conflict", code: "run_attempt_conflict" };
     }
@@ -805,24 +925,26 @@ export class MemorySessionStore implements SessionStorePort {
     }
     const activeLease = this.activeLeaseForRun(input.runId);
     if (activeLease) return { kind: "held", expiresAt: activeLease.expiresAt };
-    const lease = this.newLease(input.ownerId, input.ttlMs, input.requestedAt);
+    const lease = this.newLease(input.ownerId, input.ttlMs);
     this.leases.set(attemptKey(input.runId, input.attemptId), lease);
     return { kind: "acquired", leaseToken: lease.token, expiresAt: lease.expiresAt };
   }
 
   async renewLease(input: LeaseRenewal): Promise<boolean> {
+    this.requireTtl(input.ttlMs);
+    assertValidCommandTimestamp(input.renewedAt);
     const key = attemptKey(input.runId, input.attemptId);
     const lease = this.leases.get(key);
     if (!lease || lease.token !== input.leaseToken || this.isExpired(lease)) return false;
     this.leases.set(key, {
       ...lease,
-      expiresAt: this.expiresAt(input.renewedAt, input.ttlMs),
+      expiresAt: this.expiresAt(this.clock().toISOString(), input.ttlMs),
     });
     return true;
   }
 
-  private newLease(ownerId: string, ttlMs: number, requestedAt: string): Lease {
-    return { token: this.nextLeaseToken(), ownerId, expiresAt: this.expiresAt(requestedAt, ttlMs) };
+  private newLease(ownerId: string, ttlMs: number): Lease {
+    return { token: this.nextLeaseToken(), ownerId, expiresAt: this.expiresAt(this.clock().toISOString(), ttlMs) };
   }
 
   private expiresAt(requestedAt: string, ttlMs: number): string {
@@ -854,6 +976,28 @@ export class MemorySessionStore implements SessionStorePort {
       receipt.toolVersion === invocation.toolVersion &&
       receipt.argumentsHash === invocation.argumentsHash &&
       receipt.catalogHash === invocation.catalogHash;
+  }
+
+  private assertRecoveryLimit(limit: number, maximum: number, message: string): void {
+    if (!Number.isInteger(limit) || limit < 1 || limit > maximum) throw new TypeError(message);
+  }
+
+  private requireTtl(ttlMs: number): void {
+    if (!Number.isInteger(ttlMs) || ttlMs < 1) throw new TypeError("lease_ttl_invalid");
+  }
+
+  private assertSnapshotIntegrity(snapshot: RunSnapshot): void {
+    assertValidRunSnapshot(snapshot);
+    const terminal = snapshot.state.terminalModelStepResult;
+    if (!terminal) return;
+    const checkpoint = this.modelSteps.get(modelStepKey(snapshot.runId, terminal.modelStepId));
+    if (
+      terminal.attemptId !== snapshot.attemptId
+      || !checkpoint
+      || checkpoint.status !== "terminal"
+      || checkpoint.attemptId !== terminal.attemptId
+      || checkpoint.requestFingerprint !== terminal.requestFingerprint
+    ) throw new Error("snapshot_integrity_conflict");
   }
 
   private leaseConflict(runId: string, attemptId: string, leaseToken: string): "lease_not_held" | "lease_expired" | null {

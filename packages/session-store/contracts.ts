@@ -3,6 +3,8 @@ import type {
   NormalizedToolInvocation,
   ToolReceipt,
 } from "../tool-runtime/contracts";
+import { assertValidCommandTimestamp, assertValidGeneratedId } from "./run-command-contract";
+import { assertPersistableJson } from "./src/sensitive-data";
 
 export const SESSION_STORE_SCHEMA_VERSION = "meliora.session-store.v1" as const;
 
@@ -34,6 +36,8 @@ export type SessionStoreErrorCode =
   | "run_attempt_not_found"
   | "run_command_not_found"
   | "artifact_not_found"
+  | "recovery_bundle_too_large"
+  | "recovery_bundle_incomplete"
   | "schema_version_unsupported";
 
 export type SessionStoreFailure = Readonly<{
@@ -72,6 +76,12 @@ type StoredRunCommandBase = Readonly<{
   sessionId: string;
   turnId: string;
   runId: string;
+  /**
+   * Immutable identity of the Attempt created with this command.  It is only
+   * a command identity: Run.activeAttemptId is the sole lease/CAS authority.
+   */
+  initialAttemptId: string;
+  /** @deprecated Compatibility alias for initialAttemptId; they are always equal. */
   attemptId: string;
   createdAt: string;
   updatedAt: string;
@@ -404,9 +414,149 @@ export type RunSnapshot = Readonly<{
   runId: string;
   attemptId: string;
   throughSequence: number;
-  state: JsonValue;
+  /** Private-only recovery state. It is never a public/SSE payload. */
+  state: PrivateRunSnapshotState;
   createdAt: string;
 }>;
+
+export type PrivateArtifactRef = Readonly<{
+  artifactId: string;
+  contentHash: string;
+  mediaType: string;
+  byteLength: number;
+  visibility: "private";
+}>;
+
+export const PRIVATE_RUN_SNAPSHOT_PHASES = [
+  "created", "preparing", "model_streaming", "tool_assembling",
+  "awaiting_approval", "executing_tools", "compacting", "verifying",
+  "completed", "failed", "cancelled", "blocked",
+] as const;
+export type PrivateRunSnapshotPhase = typeof PRIVATE_RUN_SNAPSHOT_PHASES[number];
+
+export type SnapshotPendingInvocationRef = Readonly<{
+  invocationId: string;
+  attemptId: string;
+  argumentsHash: string;
+  status: NormalizedToolInvocation["status"];
+  toolName?: string;
+  toolVersion?: string;
+}>;
+
+export type TerminalModelStepResultRef = Readonly<{
+  attemptId: string;
+  modelStepId: string;
+  requestFingerprint: string;
+  artifact: PrivateArtifactRef;
+}>;
+
+/**
+ * The Store persists references, not model text, credentials, or raw outputs.
+ * Runtime owns the phase vocabulary and validates referenced artifacts before
+ * making them model-visible again.
+ */
+export type PrivateRunSnapshotState = Readonly<{
+  schemaVersion: "meliora.private-run-snapshot-state.v1";
+  phase: PrivateRunSnapshotPhase;
+  catalogHash: string;
+  intentRevision: number;
+  modelHistoryArtifact: PrivateArtifactRef;
+  terminalModelStepResult?: TerminalModelStepResultRef;
+  pendingInvocations: readonly SnapshotPendingInvocationRef[];
+  receiptRefs: readonly ToolReceipt["receiptId"][];
+  verificationRefs: readonly ArtifactRef[];
+}>;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const isIdentifier = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f]/u.test(value);
+const isHash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+const hasOnlyKeys = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key));
+const isJsonValue = (value: unknown): boolean => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every(isJsonValue);
+};
+const assertArtifactRef = (value: unknown, privateOnly: boolean): void => {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ["artifactId", "contentHash", "mediaType", "byteLength", "visibility"])
+    || !isIdentifier(value.artifactId)
+    || !isHash(value.contentHash)
+    || typeof value.mediaType !== "string" || value.mediaType.length === 0 || value.mediaType.length > 200
+    || typeof value.byteLength !== "number" || !Number.isSafeInteger(value.byteLength) || value.byteLength < 0
+    || (value.visibility !== "public" && value.visibility !== "private")
+    || (privateOnly && value.visibility !== "private")) throw new TypeError("invalid_private_run_snapshot");
+};
+const assertPendingInvocation = (value: unknown): void => {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ["invocationId", "attemptId", "argumentsHash", "status", "toolName", "toolVersion"])
+    || !isIdentifier(value.invocationId) || !isIdentifier(value.attemptId)
+    || !isHash(value.argumentsHash)
+    || (value.toolName !== undefined && !isIdentifier(value.toolName))
+    || (value.toolVersion !== undefined && !isIdentifier(value.toolVersion))
+    || !["reserved", "awaiting_approval", "executing", "succeeded", "failed", "cancelled", "outcome_unknown"].includes(value.status as string)) {
+    throw new TypeError("invalid_private_run_snapshot");
+  }
+};
+
+export function assertPrivateRunSnapshotState(state: unknown): asserts state is PrivateRunSnapshotState {
+  if (!isRecord(state)
+    || !hasOnlyKeys(state, ["schemaVersion", "phase", "catalogHash", "intentRevision", "modelHistoryArtifact", "terminalModelStepResult", "pendingInvocations", "receiptRefs", "verificationRefs"])
+    || state.schemaVersion !== "meliora.private-run-snapshot-state.v1"
+    || !PRIVATE_RUN_SNAPSHOT_PHASES.includes(state.phase as PrivateRunSnapshotPhase)
+    || !isIdentifier(state.catalogHash)
+    || typeof state.intentRevision !== "number" || !Number.isSafeInteger(state.intentRevision) || state.intentRevision < 0
+    || !Array.isArray(state.pendingInvocations) || !Array.isArray(state.receiptRefs) || !Array.isArray(state.verificationRefs)) {
+    throw new TypeError("invalid_private_run_snapshot");
+  }
+  assertArtifactRef(state.modelHistoryArtifact, true);
+  if (state.terminalModelStepResult !== undefined) {
+    const terminal = state.terminalModelStepResult;
+    if (!isRecord(terminal)
+      || !hasOnlyKeys(terminal, ["attemptId", "modelStepId", "requestFingerprint", "artifact"])
+      || !isIdentifier(terminal.attemptId) || !isIdentifier(terminal.modelStepId)
+      || !isHash(terminal.requestFingerprint)) throw new TypeError("invalid_private_run_snapshot");
+    assertArtifactRef(terminal.artifact, true);
+  }
+  state.pendingInvocations.forEach(assertPendingInvocation);
+  if (!state.receiptRefs.every(isIdentifier)) throw new TypeError("invalid_private_run_snapshot");
+  state.verificationRefs.forEach((ref) => assertArtifactRef(ref, false));
+}
+
+/**
+ * Validates the complete private snapshot envelope before it crosses an
+ * adapter boundary. State-only validation is insufficient: every envelope
+ * string is durable data and must be subject to the same credential policy.
+ */
+export function assertValidRunSnapshot(snapshot: unknown): asserts snapshot is RunSnapshot {
+  if (!isRecord(snapshot)
+    || !hasOnlyKeys(snapshot, ["schemaVersion", "snapshotId", "runId", "attemptId", "throughSequence", "state", "createdAt"])
+    || snapshot.schemaVersion !== "meliora.run-snapshot.v1") {
+    throw new TypeError("invalid_run_snapshot");
+  }
+
+  // Scan before structural errors so a rejected envelope is never able to
+  // bypass the sensitive-data policy by choosing an invalid generated ID.
+  assertPersistableJson(snapshot as JsonValue, "snapshot");
+
+  if (typeof snapshot.snapshotId !== "string"
+    || typeof snapshot.runId !== "string"
+    || typeof snapshot.attemptId !== "string"
+    || typeof snapshot.createdAt !== "string"
+    || typeof snapshot.throughSequence !== "number"
+    || !Number.isSafeInteger(snapshot.throughSequence)
+    || snapshot.throughSequence < 0) {
+    throw new TypeError("invalid_run_snapshot");
+  }
+  assertValidGeneratedId(snapshot.snapshotId);
+  assertValidGeneratedId(snapshot.runId);
+  assertValidGeneratedId(snapshot.attemptId);
+  assertValidCommandTimestamp(snapshot.createdAt);
+  assertPrivateRunSnapshotState(snapshot.state);
+}
 
 export type WriteSnapshotInput = Readonly<{
   snapshot: RunSnapshot;
@@ -557,7 +707,57 @@ export type LeaseRenewal = Readonly<{
   renewedAt: string;
 }>;
 
-export interface SessionStorePort {
+export type RecoveryReadPort = Readonly<{
+  listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage>;
+  readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult>;
+}>;
+
+export type RecoveryCommandPage = Readonly<{
+  commands: readonly RecoverableCommandRef[];
+  /** No cursor exists: false means another bounded sweep is required. */
+  sweepComplete: boolean;
+}>;
+
+/** Deliberately minimal scan DTO; it is not a command read API. */
+export type RecoverableCommandRef = Readonly<{
+  runId: string;
+  initialAttemptId: string;
+  status: Exclude<RunCommandStatus, "terminal">;
+  createdAt: string;
+}>;
+
+export type RecoveryBundleInput = Readonly<{
+  runId: string;
+  expectedActiveAttemptId?: string;
+  afterSequence?: number;
+  eventLimit: number;
+}>;
+
+export type RecoveryBundle = Readonly<{
+  command: StoredRunCommand;
+  run: PersistedRunRecord;
+  activeAttempt: PersistedRunAttempt;
+  readActiveAttemptId: string;
+  latestAttemptNumber: number;
+  /** A found recovery bundle is complete; absence is recovery_bundle_incomplete. */
+  privateUserInput: StoredPrivateUserInput;
+  privateSnapshot: RunSnapshot | null;
+  tailEvents: readonly StoredEvent[];
+  effectiveAfterSequence: number;
+  eventHeadSequence: number;
+  tailComplete: boolean;
+  nextAfterSequence: number | null;
+  latestModelStep: StoredModelStepCheckpoint | null;
+  invocations: readonly InvocationReconciliationRecord[];
+}>;
+
+export type RecoveryBundleResult =
+  | Readonly<{ kind: "found"; bundle: RecoveryBundle }>
+  | Readonly<{ kind: "not_found"; code: "run_not_found" | "run_command_not_found" }>
+  | Readonly<{ kind: "conflict"; code: "run_attempt_conflict" }>
+  | Readonly<{ kind: "failure"; code: "recovery_bundle_too_large" | "recovery_bundle_incomplete" }>;
+
+export interface SessionStorePort extends RecoveryReadPort {
   reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult>;
   readRunCommand(input: RunCommandScope): Promise<StoredRunCommand | null>;
   transitionRunCommand(input: TransitionRunCommandInput): Promise<TransitionRunCommandResult>;

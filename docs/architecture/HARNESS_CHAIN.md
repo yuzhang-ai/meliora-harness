@@ -53,7 +53,7 @@ created
 
 规则：
 
-- 状态属于 Run Attempt；Run 只保存 active/latest attempt 指针。
+- 状态属于 Run Attempt；Run 只保存 active/latest attempt 指针。command 的初始 Attempt identity 只用于幂等命令关联，不能作为恢复后的 lease 或 CAS authority。
 - Attempt 终态不可回退，恢复操作创建新的 attempt。
 - 状态变化先持久化，再向前端投影。
 - 同一个 Run 同时只有一个有效 lease owner。

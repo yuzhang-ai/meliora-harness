@@ -109,7 +109,7 @@ visibility=public
 
 三者禁止共用一个未经处理的 payload。
 
-公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`，不能直接暴露内部 Artifact ID 字符串。
+公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`，不能直接暴露内部 Artifact ID 字符串。WP-3 的 private recovery snapshot 不是 public resume snapshot；public snapshot/resume-point 会在单独的 projector/SSE 契约中冻结，不能用 private artifact ref 旁路本层边界。
 
 ## 7. Outcome Contract
 
