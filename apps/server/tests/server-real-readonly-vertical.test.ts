@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 
 import { deepseekStreamTextSingleToolFixture } from "../../../fixtures/contracts/v1/deepseek-stream-text-single-tool.js";
-import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
+import { publicRunEventReplays } from "../../../fixtures/contracts/v1/public-run-event-replays.js";
+import {
+  PUBLIC_RUN_EVENT_SCHEMA_VERSION,
+  type PublicRunEvent,
+} from "../../../packages/agent-runtime/public-events.js";
 import { createDeepSeekChatTransport } from "../../../packages/providers/index.js";
+import type { StoredEvent } from "../../../packages/session-store/contracts.js";
 import { SqliteSessionStore } from "../../../packages/session-store/index.js";
 import {
   TURN_COMMAND_REQUEST_SCHEMA_VERSION,
@@ -19,11 +26,86 @@ import {
   createFrozenReadOnlyWorkspaceCatalog,
   createProviderBackedReadOnlyRunModel,
   createTurnCommandSubmitter,
+  type TurnCommandIds,
 } from "../src/turn-command-composition.js";
 
 const fixedNow = "2026-09-12T04:00:00.000Z";
 const workspaceId = "workspace-provider-vertical";
 const privateMarker = "SERVER_VERTICAL_PRIVATE_MARKER";
+const execFileAsync = promisify(execFile);
+
+const deterministicIds = (): TurnCommandIds => {
+  const counters = new Map<string, number>();
+  const next = (prefix: string): string => {
+    const value = (counters.get(prefix) ?? 0) + 1;
+    counters.set(prefix, value);
+    return `${prefix}-${value}`;
+  };
+  return {
+    nextSessionId: () => next("session"),
+    nextTurnId: () => next("turn"),
+    nextRunId: () => next("run"),
+    nextAttemptId: () => next("attempt"),
+    nextArtifactId: () => next("artifact"),
+    nextVerificationId: () => next("verification"),
+    nextModelStepId: () => next("model-step"),
+    nextEventId: () => next("event"),
+    nextReceiptId: () => next("receipt"),
+    nextOutcomeId: () => next("outcome"),
+  };
+};
+
+const safeGitEnvironment = (source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => Object.fromEntries(
+  Object.entries(source).filter(([name]) => !name.toUpperCase().startsWith("GIT_")),
+);
+
+const initializeGitWorkspace = async (workspaceRoot: string, sourceEnvironment?: NodeJS.ProcessEnv): Promise<void> => {
+  const env = {
+    ...safeGitEnvironment(sourceEnvironment),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  await execFileAsync("git", ["init", "--quiet", workspaceRoot], { env, windowsHide: true });
+  const { stdout } = await execFileAsync("git", ["-C", workspaceRoot, "rev-parse", "--is-inside-work-tree"], {
+    env,
+    windowsHide: true,
+  });
+  assert.equal(stdout.trim(), "true", "vertical workspace must be a real Git repository");
+};
+
+test("Server vertical Git initialization clears case-variant inherited Git environment", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "meliora-server-git-workspace-"));
+  const workspaceRoot = join(parent, "workspace");
+  let foreignParent: string | undefined;
+  let bodyError: unknown;
+  try {
+    foreignParent = await mkdtemp(join(tmpdir(), "meliora-server-foreign-git-"));
+    const foreignGitDirectory = join(foreignParent, "must-not-be-created");
+    await mkdir(workspaceRoot, { recursive: true });
+    await initializeGitWorkspace(workspaceRoot, {
+      ...process.env,
+      gIt_DiR: foreignGitDirectory,
+    });
+    await assert.rejects(access(foreignGitDirectory), { code: "ENOENT" });
+  } catch (error) {
+    bodyError = error;
+    throw error;
+  } finally {
+    let cleanupError: unknown;
+    try {
+      await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+    } catch (error) {
+      cleanupError ??= error;
+    } finally {
+      try {
+        if (foreignParent !== undefined) await rm(foreignParent, { recursive: true, force: true, maxRetries: 3 });
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (bodyError === undefined && cleanupError !== undefined) throw cleanupError;
+  }
+});
 
 type CapturedProviderRequest = Readonly<{
   authorization: string | undefined;
@@ -182,11 +264,20 @@ const startApp = async (
     resolveSessionId: (runId) => store.readRunSessionId(runId),
     pollIntervalMs: 10,
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = (server.address() as AddressInfo).port;
+  let port: number | undefined;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const candidate = (server.address() as AddressInfo).port;
+    if (candidate !== 6000) {
+      port = candidate;
+      break;
+    }
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+  if (port === undefined) throw new Error("could_not_allocate_fetch_safe_loopback_port");
   return {
     url: `http://127.0.0.1:${port}`,
     close: async () => {
@@ -200,6 +291,89 @@ const sseEvents = (body: string): PublicRunEvent[] =>
   body.split("\n")
     .filter((line) => line.startsWith("data: "))
     .map((line) => JSON.parse(line.slice(6)) as PublicRunEvent);
+
+type PublicEventCandidate = Readonly<{
+  schemaVersion: unknown;
+  eventId: unknown;
+  sessionId: unknown;
+  runId: unknown;
+  sequence: unknown;
+  timestamp: unknown;
+  visibility: unknown;
+  kind: unknown;
+  payload: unknown;
+}>;
+
+const publicEventCandidatesFromStored = (
+  events: readonly StoredEvent[],
+  sessionId: string,
+): readonly PublicEventCandidate[] => events.map((event) => ({
+  schemaVersion: PUBLIC_RUN_EVENT_SCHEMA_VERSION,
+  eventId: event.eventId,
+  sessionId,
+  runId: event.runId,
+  sequence: event.sequence,
+  timestamp: event.createdAt,
+  visibility: event.visibility,
+  kind: event.kind,
+  payload: event.payload,
+}));
+
+const assertPayloadShapeCompatible = (actual: unknown, expected: unknown, label: string): void => {
+  assert.equal(typeof actual, typeof expected, `${label} must retain its public payload value type`);
+  if (Array.isArray(expected)) {
+    assert.ok(Array.isArray(actual), `${label} must remain an array`);
+    if (expected.length > 0) {
+      for (const [index, item] of actual.entries()) {
+        assertPayloadShapeCompatible(item, expected[0], `${label}[${index}]`);
+      }
+    }
+    return;
+  }
+  if (expected !== null && typeof expected === "object") {
+    assert.notEqual(actual, null, `${label} must remain an object`);
+    assert.equal(Array.isArray(actual), false, `${label} must not become an array`);
+    const actualRecord = actual as Record<string, unknown>;
+    const expectedRecord = expected as Record<string, unknown>;
+    assert.deepEqual(Object.keys(actualRecord).sort(), Object.keys(expectedRecord).sort(), `${label} public fields must not drift`);
+    for (const [key, value] of Object.entries(expectedRecord)) {
+      assertPayloadShapeCompatible(actualRecord[key], value, `${label}.${key}`);
+    }
+  }
+};
+
+const assertReadOnlySuccessPublicCompatibility = (events: readonly PublicEventCandidate[]): void => {
+  const fixture = publicRunEventReplays["read-only-success"];
+  const fixtureEvents: ReadonlyMap<string, Readonly<{ payload: unknown }>> = new Map(
+    fixture.events.map((event) => [event.kind, event]),
+  );
+  for (const event of events) {
+    assert.equal(event.schemaVersion, fixture.events[0]?.schemaVersion, "runtime SSE must use the frozen PublicRunEvent schema");
+    assert.equal(event.visibility, "public", "runtime SSE must only contain public events");
+    assert.equal(typeof event.eventId, "string");
+    assert.equal(typeof event.sessionId, "string");
+    assert.equal(typeof event.runId, "string");
+    assert.equal(typeof event.sequence, "number");
+    assert.ok(typeof event.sequence === "number" && event.sequence > 0);
+    assert.equal(typeof event.timestamp, "string");
+    assert.equal(typeof event.kind, "string");
+    const kind = typeof event.kind === "string" ? event.kind : "";
+    const fixtureEvent = fixtureEvents.get(kind);
+    if (fixtureEvent) {
+      assertPayloadShapeCompatible(event.payload, fixtureEvent.payload, `${kind}.payload`);
+    } else {
+      assert.equal(kind, "assistant_text_delta", "runtime must not introduce a kind outside the frozen read-only success stream");
+      assertPayloadShapeCompatible(event.payload, { delta: "" }, "assistant_text_delta.payload");
+    }
+  }
+  for (const kind of ["tool_call_presented", "tool_result_presented", "verification_updated", "run_completed"] as const) {
+    const runtimeEvent = events.find((event) => event.kind === kind);
+    const fixtureEvent = fixtureEvents.get(kind);
+    assert.ok(runtimeEvent, `runtime success flow must project ${kind}`);
+    assert.ok(fixtureEvent, `read-only-success fixture must define ${kind}`);
+    assertPayloadShapeCompatible(runtimeEvent.payload, fixtureEvent.payload, `${kind}.payload`);
+  }
+};
 
 const postTurn = async (url: string, message: string, idempotencyKey = "provider-vertical-key"): Promise<Response> =>
   fetch(`${url}/api/turns`, {
@@ -224,21 +398,28 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     `export const redactionProbe = "provider must not echo raw workspace text publicly";`,
   ].join("\n");
   const attemptedAssistantText = echoScenario.assistantText({ toolContent: sourceContent, sourceContent });
-  const provider = await startFakeProvider(echoScenario.assistantText, sourceContent);
-  await mkdir(join(workspaceRoot, "packages", "agent-runtime"), { recursive: true });
-  await writeFile(sourcePath, `${sourceContent}\n`, "utf8");
+  let provider: Awaited<ReturnType<typeof startFakeProvider>> | undefined;
+  let store: SqliteSessionStore | undefined;
+  let app: Awaited<ReturnType<typeof startApp>> | undefined;
+  let bodyError: unknown;
+  try {
+    const activeProvider = await startFakeProvider(echoScenario.assistantText, sourceContent);
+    provider = activeProvider;
+    await mkdir(join(workspaceRoot, "packages", "agent-runtime"), { recursive: true });
+    await initializeGitWorkspace(workspaceRoot);
+    await writeFile(sourcePath, `${sourceContent}\n`, "utf8");
 
-  let storeNonce = 0;
+    let storeNonce = 0;
   const createStore = () => new SqliteSessionStore(databasePath, {
     clock: () => new Date(fixedNow),
     nonce: () => `vertical-nonce-${++storeNonce}`,
   });
   const catalog = createFrozenReadOnlyWorkspaceCatalog();
   const transport = createDeepSeekChatTransport({
-    endpoint: `${provider.origin}/deepseek/chat/completions`,
+    endpoint: `${activeProvider.origin}/deepseek/chat/completions`,
     model: "deepseek-chat",
     apiKey: "local-vertical-fixture-token",
-    trustedEndpointOrigins: [provider.origin],
+    trustedEndpointOrigins: [activeProvider.origin],
   });
   const model = createProviderBackedReadOnlyRunModel({
     provider: "deepseek",
@@ -247,31 +428,41 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     now: () => fixedNow,
   });
 
-  let store = createStore();
+  store = createStore();
   const submitTurnCommand = createTurnCommandSubmitter({
     store,
     workspaceRoots: new Map([[workspaceId, workspaceRoot]]),
     model,
+    ids: deterministicIds(),
     now: () => fixedNow,
   });
-  let app = await startApp(store, submitTurnCommand);
+  app = await startApp(store, submitTurnCommand);
   let created: TurnCommandResponse;
   try {
     const create = await postTurn(app.url, "读取入口文件并给出只读结论");
     assert.equal(create.status, 202);
-    created = await create.json() as TurnCommandResponse;
+    const createBody = await create.text();
+    created = JSON.parse(createBody) as TurnCommandResponse;
     assert.equal(created.disposition, "created");
 
     const firstReplay = await fetch(`${app.url}/api/runs/${created.runId}/events`);
     assert.equal(firstReplay.status, 200);
     const firstBody = await firstReplay.text();
     const events = sseEvents(firstBody);
+    assertReadOnlySuccessPublicCompatibility(events);
     const visibleAssistantText = events
       .filter((event): event is Extract<PublicRunEvent, { kind: "assistant_text_delta" }> => event.kind === "assistant_text_delta")
       .map((event) => event.payload.delta)
       .join("");
     const publicStoredEvents = (await store.readEvents({ runId: created.runId, limit: 100 })).events
       .filter((event) => event.visibility === "public");
+    const publicStoredEventCandidates = publicEventCandidatesFromStored(publicStoredEvents, created.sessionId);
+    assertReadOnlySuccessPublicCompatibility(publicStoredEventCandidates);
+    assert.deepEqual(
+      publicStoredEventCandidates,
+      events,
+      "persisted public events must already match the SSE contract before Server projection",
+    );
     const publicArtifactIds = new Set<string>();
     for (const event of events) {
       if (event.kind === "tool_result_presented") {
@@ -284,9 +475,15 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     const publicArtifactContents: string[] = [];
     for (const artifactId of publicArtifactIds) {
       const artifact = await store.getArtifact(artifactId);
+      assert.equal(artifact?.visibility, "public", "public event references must never resolve to private artifacts");
       if (artifact?.visibility === "public") publicArtifactContents.push(new TextDecoder().decode(artifact.content));
     }
+    const privateArtifactId = "artifact-1";
+    const privateArtifact = await store.getArtifact(privateArtifactId);
+    assert.equal(privateArtifact?.visibility, "private", "deterministic fixture IDs must identify the raw tool artifact");
+    assert.equal(publicArtifactIds.has(privateArtifactId), false, "public event references must exclude the raw tool artifact");
     const publicSurface = JSON.stringify({
+      createBody,
       sseBody: firstBody,
       events,
       publicStoredEvents,
@@ -300,6 +497,7 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
       ...sourceContent.split("\n"),
       attemptedAssistantText,
       encodeURIComponent(sourceContent),
+      privateArtifactId,
       "local-vertical-fixture-token",
     ]) {
       assert.equal(publicSurface.includes(forbiddenValue), false, "public projection must not leak private Provider, workspace, or artifact data");
@@ -309,13 +507,16 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     assert.match(visibleAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u);
     assert.ok(events.some((event) => event.kind === "run_completed"));
   } finally {
-    await app.close();
-    store.close();
+    const closingApp = app;
+    app = undefined;
+    await closingApp?.close();
+    store?.close();
+    store = undefined;
   }
 
-  assert.equal(provider.captured.length, 2);
-  assert.match(provider.captured[0]?.authorization ?? "", /^Bearer local-vertical-fixture-token$/u);
-  const secondMessages = provider.captured[1]?.body.messages;
+  assert.equal(activeProvider.captured.length, 2);
+  assert.match(activeProvider.captured[0]?.authorization ?? "", /^Bearer local-vertical-fixture-token$/u);
+  const secondMessages = activeProvider.captured[1]?.body.messages;
   assert.ok(Array.isArray(secondMessages));
   const assistant = secondMessages.find((message) =>
     typeof message === "object" && message !== null && (message as { role?: unknown }).role === "assistant",
@@ -337,10 +538,13 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     const replayBody = await replay.text();
     assert.ok(sseEvents(replayBody).some((event) => event.kind === "run_completed"));
   } finally {
-    await app.close();
-    store.close();
+    const closingApp = app;
+    app = undefined;
+    await closingApp?.close();
+    store?.close();
+    store = undefined;
   }
-  assert.equal(provider.captured.length, 2);
+  assert.equal(activeProvider.captured.length, 2);
 
   store = createStore();
   const replaySubmitter = createTurnCommandSubmitter({
@@ -359,12 +563,47 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     assert.equal(replayed.terminalStatus, "completed");
     assert.equal(replayed.runId, created.runId);
   } finally {
-    await app.close();
-    store.close();
-    await provider.close();
-    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+    const closingApp = app;
+    app = undefined;
+    await closingApp?.close();
+    store?.close();
+    store = undefined;
   }
-  assert.equal(provider.captured.length, 2);
+  } catch (error) {
+    bodyError = error;
+    throw error;
+  } finally {
+    let cleanupError: unknown;
+    const closingApp = app;
+    app = undefined;
+    try {
+      await closingApp?.close();
+    } catch (error) {
+      cleanupError ??= error;
+    } finally {
+      try {
+        store?.close();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+      store = undefined;
+      try {
+        await provider?.close();
+      } catch (error) {
+        cleanupError ??= error;
+      } finally {
+        try {
+          await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+        } catch (error) {
+          cleanupError ??= error;
+        }
+      }
+    }
+    if (bodyError === undefined && cleanupError !== undefined) throw cleanupError;
+  }
+  const capturedProvider = provider;
+  assert.ok(capturedProvider);
+  assert.equal(capturedProvider.captured.length, 2);
 });
 }
 
