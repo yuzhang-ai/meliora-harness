@@ -35,14 +35,13 @@ function App() {
   const [voiceActive, setVoiceActive] = useState(false);
   const [modelName, setModelName] = useState("DeepSeek V3");
   const [reaction, setReaction] = useState<"like" | "dislike" | "">("");
-  const [theme, setTheme] = useState<"light" | "dark">(() => savedPreference("meliora-theme-v2", "dark") === "light" ? "light" : "dark");
+  const [theme, setTheme] = useState<"light" | "dark">(() => savedPreference("meliora-theme-v2", "light") === "dark" ? "dark" : "light");
   const [userName, setUserName] = useState(() => savedPreference("meliora-user-name", "张子恒"));
   const [userAvatar, setUserAvatar] = useState(() => savedPreference("meliora-user-avatar", "张"));
   const [dialogMode, setDialogMode] = useState<"project" | "automations" | "customize" | null>(null);
   const [projectName, setProjectName] = useState("");
   const [profileName, setProfileName] = useState(userName);
   const [profileAvatar, setProfileAvatar] = useState(userAvatar);
-  const [folderError, setFolderError] = useState("");
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
 
@@ -142,7 +141,6 @@ function App() {
     setProfileName(userName);
     setProfileAvatar(userAvatar);
     setProjectName("");
-    setFolderError("");
     setDialogMode(mode);
   }
 
@@ -153,18 +151,6 @@ function App() {
     selectChat(next.projects.at(-1)!.chats[0]);
     setDialogMode(null);
     setNotice("项目已加入本地项目库。当前演示不会上传或修改文件。");
-  }
-
-  async function pickFolder() {
-    const picker = (window as unknown as { showDirectoryPicker?: (options: { mode: "read" }) => Promise<{ name: string }> }).showDirectoryPicker;
-    if (!picker) { setFolderError("当前浏览器不支持文件夹选择，可先用项目名称创建。 "); return; }
-    try {
-      const handle = await picker.call(window, { mode: "read" });
-      createProject(handle.name, "folder");
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      setFolderError("未能选择文件夹，请重试。");
-    }
   }
 
   function replay() {
@@ -245,7 +231,7 @@ function App() {
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" onClick={() => setDialogMode(null)}>×</button>
-      {dialogMode === "project" && <><h2>添加存储库</h2><p>选择一个本地文件夹，或先用名称创建项目。</p><button className="primary" onClick={pickFolder}>选择文件夹</button>{folderError && <p role="status">{folderError}</p>}<form onSubmit={(event) => { event.preventDefault(); createProject(projectName, "manual"); }}><label htmlFor="project-name">项目名称</label><input id="project-name" value={projectName} maxLength={200} onChange={(event) => setProjectName(event.target.value)} placeholder="例如：个人网站"/><button className="primary" disabled={!projectName.trim()}>创建项目</button></form><small>当前版本只保存文件夹名称，不读取、上传或修改其中的文件。</small></>}
+      {dialogMode === "project" && <><h2>添加项目</h2><p>当前纯浏览器版本不申请工作区目录权限。工作区选择将在 Runtime/Server 能力接入后提供。</p><form onSubmit={(event) => { event.preventDefault(); createProject(projectName, "manual"); }}><label htmlFor="project-name">项目名称</label><input id="project-name" value={projectName} maxLength={200} onChange={(event) => setProjectName(event.target.value)} placeholder="例如：个人网站"/><button className="primary" disabled={!projectName.trim()}>创建项目</button></form><small>这里只保存项目名称，不读取、上传或修改本地文件。</small></>}
       {dialogMode === "automations" && <><h2>自动化</h2><p>这里将展示定时任务和运行状态。当前版本尚未连接调度服务。</p><button onClick={() => { setDialogMode(null); createAgent(); }}>先开始一个对话</button></>}
       {dialogMode === "customize" && <><h2>自定义</h2><form onSubmit={(event) => { event.preventDefault(); setUserName(profileName.trim() || "本地用户"); setUserAvatar(profileAvatar); setDialogMode(null); }}><label htmlFor="user-name">用户昵称</label><input id="user-name" value={profileName} maxLength={32} onChange={(event) => setProfileName(event.target.value)}/><label>头像</label><div className="avatar-options">{["张", "M", "🌱", "🐱", "🚀"].map((avatar) => <button type="button" key={avatar} aria-pressed={profileAvatar === avatar} onClick={() => setProfileAvatar(avatar)}>{avatar}</button>)}</div><button className="primary">保存</button></form></>}
     </dialog>

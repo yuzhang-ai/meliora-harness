@@ -6,10 +6,16 @@ const path = require("node:path");
   const browser = await chromium.launch({ channel: "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const pageErrors = [];
+  const consoleErrors = [];
+  const failedRequests = [];
+  const failedResponses = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
+  page.on("requestfailed", (request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText || "unknown error"}`));
+  page.on("response", (response) => { if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`); });
   await page.goto("http://127.0.0.1:5173");
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
-  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "dark");
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "light");
 
   for (const width of [1440, 1100, 1099, 1024, 768, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
@@ -22,13 +28,21 @@ const path = require("node:path");
 
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.waitForTimeout(320);
+  const leftWidth = await page.locator(".left-panel").evaluate((element) => element.getBoundingClientRect().width);
+  const rightWidth = await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width);
+  assert.equal(leftWidth, 220);
+  assert.equal(rightWidth, 360);
   const centerBefore = await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width);
   await page.getByRole("button", { name: "收起侧栏", exact: true }).click();
   await page.waitForTimeout(320);
   const centerAfter = await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width);
-  assert.ok(centerAfter > centerBefore + 190);
+  assert.ok(centerAfter > centerBefore + 150);
   await page.getByRole("button", { name: "新建对话", exact: true }).waitFor();
   await page.getByRole("button", { name: "展开侧栏", exact: true }).click();
+  await page.getByRole("button", { name: "右键或点击添加项目", exact: true }).click();
+  await page.getByRole("heading", { name: "添加项目", exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: /选择文件夹/ }).count(), 0);
+  await page.getByRole("button", { name: "×", exact: true }).click();
 
   await page.getByRole("button", { name: /工作区检查/ }).click();
   await page.locator('[data-event="tool_call_presented"]').waitFor();
@@ -95,6 +109,9 @@ const path = require("node:path");
   await page.keyboard.press("Escape");
 
   assert.deepEqual(pageErrors, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page errors.");
+  assert.deepEqual(consoleErrors, []);
+  assert.deepEqual(failedRequests, []);
+  assert.deepEqual(failedResponses, []);
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });

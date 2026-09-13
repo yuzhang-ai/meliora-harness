@@ -96,7 +96,7 @@ export function Sidebar(props: SidebarProps) {
           </div>;
         })}
         {!visibleProjects.length && <p className="empty-copy">没有匹配的项目或对话。</p>}
-        <button className="add-repository" onClick={props.onNewProject}>右键或点击添加本地文件夹</button>
+        <button className="add-repository" onClick={props.onNewProject}>右键或点击添加项目</button>
       </section>
     </div>
 
@@ -117,7 +117,7 @@ export function Sidebar(props: SidebarProps) {
 
     <dialog ref={projectMenu} className="project-menu" aria-label="存储库操作" style={{left: menuPosition.left, top: menuPosition.top}}
       onClick={(event) => { if (event.target === event.currentTarget) projectMenu.current?.close(); }} onClose={() => libraryRegion.current?.focus()}>
-      <button onClick={() => { projectMenu.current?.close(); props.onNewProject(); }}>▱ 选择文件夹建立项目</button>
+      <button onClick={() => { projectMenu.current?.close(); props.onNewProject(); }}>＋ 创建项目</button>
       <button onClick={() => projectMenu.current?.close()}>取消</button>
     </dialog>
   </>;

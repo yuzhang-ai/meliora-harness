@@ -1,4 +1,4 @@
-# Meliora Web Shell 深色三栏版
+# Meliora Web Shell 三栏版
 
 只使用公开事件 fixture 的 React 三栏工作台。修改范围限于 apps/web；不包含真实模型调用、数据库接入、文件写入或有效审批。
 
@@ -22,7 +22,8 @@ npm.cmd run dev
 - 刷新恢复本地演示项目、对话与进度；不发送 Run 或 Provider 请求。
 - 新建对话和零事件状态分别展示真实 empty/loading 反馈，不沿用固定完成内容。
 - 同时保留过期审批只读态与未过期审批交互态；所有按钮都明确为前端演示，不会产生真实授权。
-- 选择文件夹只保存文件夹名称，不保留句柄、不读取内容、不上传文件。
+- 首期默认使用浅色主题，也可在界面中切换深色主题。
+- 纯浏览器界面不申请工作区目录 capability；工作区选择等待 Runtime/Server 能力接入。
 - BoardUI 仅依照可见信息架构参考；未复制商业模板源码。
 
 尚未接真实 HTTP/SSE、完整 RunSnapshot、ApprovalRequest 和 Artifact API；这里的重连是固定事件恢复演示。不要将演示通过表述为后端端到端验收。
