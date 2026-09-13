@@ -83,9 +83,11 @@ const path = require("node:path");
   await page.locator(".timeline-loading").waitFor();
 
   const applicationUrl = page.url();
+  const searchInput = page.getByRole("textbox", { name: "搜索项目和对话" });
   await page.keyboard.press("Control+Shift+KeyK");
   assert.equal(page.url(), applicationUrl);
-  assert.equal(await page.getByRole("textbox", { name: "搜索项目和对话" }).evaluate((element) => element === document.activeElement), true);
+  await page.waitForFunction((element) => element === document.activeElement, await searchInput.elementHandle());
+  assert.equal(await searchInput.evaluate((element) => element === document.activeElement), true);
   await page.keyboard.type("Git");
   assert.equal(await page.getByRole("button", { name: /Git 检查失败/ }).isVisible(), true);
   await page.getByRole("textbox", { name: "搜索项目和对话" }).fill("");
@@ -110,7 +112,8 @@ const path = require("node:path");
 
   await page.setViewportSize({ width: 768, height: 900 });
   await page.keyboard.press("Control+Shift+KeyK");
-  assert.equal(await page.getByRole("textbox", { name: "搜索项目和对话" }).evaluate((element) => element === document.activeElement), true);
+  await page.waitForFunction((element) => element === document.activeElement, await searchInput.elementHandle());
+  assert.equal(await searchInput.evaluate((element) => element === document.activeElement), true);
   assert.equal(await page.getByRole("region", { name: "存储库", exact: true }).isVisible(), true);
   await page.keyboard.press("Escape");
 
@@ -128,6 +131,6 @@ const path = require("node:path");
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(failedRequests, []);
   assert.deepEqual(failedResponses, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, Chrome-safe Ctrl/Command+Shift+K search focus, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, rAF-settled Chrome-safe Ctrl/Command+Shift+K search focus, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
