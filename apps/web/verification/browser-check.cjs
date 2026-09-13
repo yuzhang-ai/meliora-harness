@@ -16,11 +16,25 @@ const path = require("node:path");
   await page.goto("http://127.0.0.1:5173");
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "light");
+  const responsiveConditions = await page.evaluate(() => Array.from(document.styleSheets)
+    .flatMap((sheet) => Array.from(sheet.cssRules))
+    .filter((rule) => "conditionText" in rule)
+    .map((rule) => rule.conditionText));
+  assert.ok(responsiveConditions.includes("(width < 1100px)"), `missing gap-free desktop breakpoint: ${responsiveConditions.join(", ")}`);
 
   for (const width of [1440, 1100, 1099, 1024, 768, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     await page.waitForTimeout(350);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    assert.equal(await page.evaluate(() => matchMedia("(width < 1100px)").matches), width < 1100);
+    if (width === 1100) {
+      assert.equal(await page.getByRole("button", { name: "打开代码面板", exact: true }).isVisible(), false);
+      assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 360);
+    }
+    if (width === 1099) {
+      assert.equal(await page.getByRole("button", { name: "打开代码面板", exact: true }).isVisible(), true);
+      assert.ok(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().left >= innerWidth));
+    }
     if ([1440, 1100, 768, 390].includes(width)) {
       await page.screenshot({ path: path.join(__dirname, `web-${width}.png`), fullPage: true });
     }
@@ -112,6 +126,6 @@ const path = require("node:path");
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(failedRequests, []);
   assert.deepEqual(failedResponses, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
