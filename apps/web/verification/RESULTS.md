@@ -1,0 +1,42 @@
+# 第一版浏览器验证
+日期：2026-09-12。Base：9a212541。验证环境为本地，未部署。
+
+## 已执行
+- npm test：11 项项目状态与回放测试通过；Windows 使用显式测试文件路径，不依赖 shell glob 展开。
+- npm run build：TypeScript + Vite 7.3.6 构建通过。
+- npm audit：0 漏洞。
+- Chrome headless：八个场景，1440/1100/1099/1024/768/390 宽度无横向溢出。
+- 新建对话 empty、零事件 loading、无 Diff 空态、过期审批只读态和未过期审批交互态通过。
+- 重连从序号4恢复，重复恢复仍仅3个后续事件；刷新保持位置。
+- 多行中文输入、HTML文本转义、Ctrl/⌘+Enter、Ctrl/⌘+Shift+K 站内搜索、Shift+F10、方向键标签切换、Escape关闭和手机导航通过；桌面与 768px 搜索断言均等待异步焦点稳定。
+- 页面无未处理 JavaScript 异常、console error、失败请求或 4xx/5xx 资源响应。
+- 等待布局 transition 后生成并目视检查 web-1440.png、web-1100.png、web-768.png 与 web-390.png。
+- 根 `npm run check` 已包含 Web 的 `npm ci`、test 和 build。
+
+## 复跑浏览器
+先 npm run dev -- --port 5173 --strictPort。需要本机 Chrome 与 Playwright。
+验证脚本：browser-check.cjs；可通过 PLAYWRIGHT_MODULE 指定现有 Playwright 模块路径，然后 node verification/browser-check.cjs。
+
+## 限制
+真实中文输入法候选词选择、人工200%缩放、真实HTTP/SSE与审批不在本次自动验证范围。
+只读fixture的计划没有后续completed计划事件，因此保留历史“进行中”，不凭最终文字改写计划。
+无Diff/文件/终端/浏览器正文时显示空态；正式服务对接仍需后续开发。
+截图含固定示例数据，不含真实工作区内容或凭证。
+
+
+
+## 三栏界面调整（2026-09-13）
+已实际查看 https://www.boardui.com/templates/ai-chat 的可见页面，自主实现浅色优先的三栏面板、树状导航、消息卡片与蓝色操作按钮；未复制模板源码。
+新增会话搜索、桌面侧栏收起/展开、empty/loading/no-diff 以及未过期审批演示。共享 fixtures 和演示边界保持。
+验证：build、11 项 tests 通过；浏览器检查搜索/清空、侧栏收起/展开、两类审批、平板与手机抽屉；390/768/1024/1099/1100/1440 均无页面横向溢出。目视检查桌面和手机布局。
+本目录PNG为第一版截图，最新外观以本地运行页面为准。
+
+最新验证：
+- 默认浅色主题；1440px 下三栏为 220px / 860px / 360px，右栏符合 360–560px 规范。
+- 折叠左栏后为 56px / 1024px / 360px，中栏平滑扩展。
+- 768px 与 390px 下为单栏布局，导航与代码面板可分别通过键盘打开和关闭。
+- 浏览器验收从已解析 CSSOM 断言 `width < 1100px` 连续范围，并分别验证 1100px 桌面三栏与 1099px 抽屉，因此旧的 `max-width: 1099px` 空档实现会回归失败。
+- 项目树、二级对话、搜索、New Agent、主题、模型、语音开关与右侧标签可操作。
+- 最新构建通过；11 项单元/回放测试通过；npm audit 为 0 漏洞；浏览器无页面异常、console error、失败请求或错误资源响应。
+- 当前 fixtures 不含 Diff，右栏展示明确空态，不显示示例文件或虚构增删统计。
+- 项目入口只创建前端演示项目，不调用 `showDirectoryPicker()`；工作区选择等待 Runtime/Server 提供 capability。
