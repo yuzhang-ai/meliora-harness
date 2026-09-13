@@ -3,6 +3,8 @@ import type {
   NormalizedToolInvocation,
   ToolReceipt,
 } from "../tool-runtime/contracts";
+import { assertValidCommandTimestamp, assertValidGeneratedId } from "./run-command-contract";
+import { assertPersistableJson } from "./src/sensitive-data";
 
 export const SESSION_STORE_SCHEMA_VERSION = "meliora.session-store.v1" as const;
 
@@ -522,6 +524,38 @@ export function assertPrivateRunSnapshotState(state: unknown): asserts state is 
   state.pendingInvocations.forEach(assertPendingInvocation);
   if (!state.receiptRefs.every(isIdentifier)) throw new TypeError("invalid_private_run_snapshot");
   state.verificationRefs.forEach((ref) => assertArtifactRef(ref, false));
+}
+
+/**
+ * Validates the complete private snapshot envelope before it crosses an
+ * adapter boundary. State-only validation is insufficient: every envelope
+ * string is durable data and must be subject to the same credential policy.
+ */
+export function assertValidRunSnapshot(snapshot: unknown): asserts snapshot is RunSnapshot {
+  if (!isRecord(snapshot)
+    || !hasOnlyKeys(snapshot, ["schemaVersion", "snapshotId", "runId", "attemptId", "throughSequence", "state", "createdAt"])
+    || snapshot.schemaVersion !== "meliora.run-snapshot.v1") {
+    throw new TypeError("invalid_run_snapshot");
+  }
+
+  // Scan before structural errors so a rejected envelope is never able to
+  // bypass the sensitive-data policy by choosing an invalid generated ID.
+  assertPersistableJson(snapshot as JsonValue, "snapshot");
+
+  if (typeof snapshot.snapshotId !== "string"
+    || typeof snapshot.runId !== "string"
+    || typeof snapshot.attemptId !== "string"
+    || typeof snapshot.createdAt !== "string"
+    || typeof snapshot.throughSequence !== "number"
+    || !Number.isSafeInteger(snapshot.throughSequence)
+    || snapshot.throughSequence < 0) {
+    throw new TypeError("invalid_run_snapshot");
+  }
+  assertValidGeneratedId(snapshot.snapshotId);
+  assertValidGeneratedId(snapshot.runId);
+  assertValidGeneratedId(snapshot.attemptId);
+  assertValidCommandTimestamp(snapshot.createdAt);
+  assertPrivateRunSnapshotState(snapshot.state);
 }
 
 export type WriteSnapshotInput = Readonly<{

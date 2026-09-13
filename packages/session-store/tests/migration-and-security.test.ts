@@ -80,3 +80,60 @@ test("sensitive values never reach database, WAL or SHM", async (t) => {
     for (const artifact of cookieArtifacts) assert.equal(bytes.includes(artifact.content), false);
   }
 });
+
+test("sensitive snapshot envelopes never reach database, WAL or SHM", async (t) => {
+  const path = createTempDatabase(t); const store = new SqliteSessionStore(path); const lease = await seed(store);
+  const attacks = [
+    "Bearer opaque-snapshot-bearer-secret",
+    "Bearer abcdefghijklmnop",
+    "bEaReR = abcdefghijklmnop",
+    "Bearer: opaque-snapshot-bearer-colon-secret",
+    "Bearer : opaque-snapshot-bearer-space-colon-secret",
+    "Bearer=opaque-snapshot-bearer-equals-secret",
+    "bEaReR = opaque-snapshot-bearer-case-secret",
+    "Cookie: sessionid=opaque-snapshot-cookie-secret",
+    "Set-Cookie: sessionid=opaque-snapshot-set-cookie-secret; HttpOnly",
+    "x-api-key: opaque-snapshot-api-key-secret",
+    "X_API_KEY : opaque-snapshot-api-key-variant",
+    "set_cookie : sessionid=opaque-snapshot-set-cookie-variant",
+  ] as const;
+  const snapshot = {
+    schemaVersion: "meliora.run-snapshot.v1" as const,
+    snapshotId: "snapshot-security",
+    runId: "run-1",
+    attemptId: "attempt-1",
+    throughSequence: 0,
+    state: {
+      schemaVersion: "meliora.private-run-snapshot-state.v1" as const,
+      phase: "model_streaming" as const,
+      catalogHash: "catalog-hash",
+      intentRevision: 1,
+      modelHistoryArtifact: { artifactId: "history-1", contentHash: "a".repeat(64), mediaType: "application/json", byteLength: 1, visibility: "private" as const },
+      pendingInvocations: [], receiptRefs: [], verificationRefs: [],
+    },
+    createdAt: new Date().toISOString(),
+  };
+  for (const value of attacks) {
+    await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: value }, expectedSequence: 0, leaseToken: lease.leaseToken }), SensitiveDataError);
+    await assert.rejects(store.writeSnapshot({
+      snapshot: {
+        ...snapshot,
+        state: {
+          ...snapshot.state,
+          modelHistoryArtifact: { ...snapshot.state.modelHistoryArtifact, mediaType: value },
+        },
+      },
+      expectedSequence: 0,
+      leaseToken: lease.leaseToken,
+    }), SensitiveDataError);
+  }
+  store.close();
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    const bytes = readFileSync(candidate);
+    for (const value of attacks) {
+      assert.equal(bytes.includes(Buffer.from(value, "utf8")), false);
+      assert.equal(bytes.includes(Buffer.from(value, "utf16le")), false);
+    }
+  }
+});

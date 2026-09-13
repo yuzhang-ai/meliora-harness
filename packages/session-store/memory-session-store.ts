@@ -56,7 +56,7 @@ import type {
   WriteSnapshotInput,
   InvocationReconciliationRecord,
 } from "./contracts";
-import { assertPrivateRunSnapshotState } from "./contracts";
+import { assertValidRunSnapshot } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
 import {
   assertValidCommandTimestamp,
@@ -987,8 +987,7 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   private assertSnapshotIntegrity(snapshot: RunSnapshot): void {
-    assertPrivateRunSnapshotState(snapshot.state);
-    assertPersistableJson(snapshot.state, "snapshot.state");
+    assertValidRunSnapshot(snapshot);
     const terminal = snapshot.state.terminalModelStepResult;
     if (!terminal) return;
     const checkpoint = this.modelSteps.get(modelStepKey(snapshot.runId, terminal.modelStepId));

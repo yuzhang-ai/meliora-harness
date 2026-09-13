@@ -19,7 +19,7 @@ import type {
   SettleRunCommandWithTerminalEventResult, TransitionRunCommandInput, TransitionRunCommandResult,
   TurnRecord, WriteSnapshotInput,
 } from "../contracts.js";
-import { assertPrivateRunSnapshotState } from "../contracts.js";
+import { assertValidRunSnapshot } from "../contracts.js";
 import {
   assertValidCommandTimestamp,
   assertValidGeneratedId,
@@ -642,7 +642,7 @@ export class SqliteSessionStore implements SessionStorePort {
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
-    const snapshot = input.snapshot; assertPrivateRunSnapshotState(snapshot.state); assertPersistableJson(snapshot.state, "snapshot.state");
+    const snapshot = input.snapshot; assertValidRunSnapshot(snapshot);
     if (!Number.isInteger(snapshot.throughSequence) || snapshot.throughSequence < 0) throw new SequenceConflictError(snapshot.runId, input.expectedSequence, -1);
     this.db.transaction(() => {
       const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?").get(snapshot.runId, snapshot.attemptId) as Row | undefined;
@@ -874,15 +874,15 @@ export class SqliteSessionStore implements SessionStorePort {
   private toSnapshot(row: Row): RunSnapshot {
     if (hashBytes(row.state_json) !== row.state_hash) throw new StoreIntegrityError("snapshot_hash_drift");
     const state = JSON.parse(row.state_json);
-    assertPrivateRunSnapshotState(state);
-    assertPersistableJson(state, "snapshot.state");
     const snapshot = { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: row.snapshot_id, runId: row.run_id, attemptId: row.attempt_id, throughSequence: row.through_sequence, state, createdAt: row.created_at };
+    // Hash verification only proves byte stability. Revalidate the complete
+    // runtime envelope before exposing anything to recovery callers.
+    assertValidRunSnapshot(snapshot);
     this.assertSnapshotIntegrity(snapshot);
     return snapshot;
   }
   private assertSnapshotIntegrity(snapshot: RunSnapshot): void {
-    assertPrivateRunSnapshotState(snapshot.state);
-    assertPersistableJson(snapshot.state, "snapshot.state");
+    assertValidRunSnapshot(snapshot);
     const terminal = snapshot.state.terminalModelStepResult;
     if (!terminal) return;
     const checkpoint = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?").get(snapshot.runId, terminal.modelStepId) as Row | undefined;

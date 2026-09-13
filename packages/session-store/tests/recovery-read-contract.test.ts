@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { MemorySessionStore } from "../memory-session-store.js";
 import { canonicalRunCommandRequestHash } from "../run-command-contract.js";
-import type { NewEvent, PrivateRunSnapshotState, SessionStorePort } from "../contracts.js";
+import { SensitiveDataError } from "../src/errors.js";
+import { assertPersistableText } from "../src/sensitive-data.js";
+import { assertValidRunSnapshot, type NewEvent, type PrivateRunSnapshotState, type SessionStorePort } from "../contracts.js";
 import { hashBytes } from "../src/integrity.js";
 import { SqliteSessionStore } from "../src/sqlite-session-store.js";
 import { createTempDatabase, timestamp } from "./helpers.js";
@@ -53,6 +55,104 @@ const commandInput = (id: number, createdAt = timestamp(id * 1_000)) => {
   reservedAt: createdAt,
   };
 };
+
+const snapshotHeaderAttacks = [
+  "Bearer opaque-provider-credential",
+  "bEaReR\topaque-provider-credential",
+  "Bearer abcdefghijklmnop",
+  "bEaReR = abcdefghijklmnop",
+  "Bearer: opaque-provider-credential",
+  "Bearer : opaque-provider-credential",
+  "Bearer=opaque-provider-credential",
+  "bEaReR = opaque-provider-credential",
+  "Cookie: sessionid=opaque-cookie-secret",
+  "Set-Cookie: sessionid=opaque-set-cookie-secret; HttpOnly",
+  "x-api-key: opaque-api-key-secret",
+  "X_API_KEY : opaque-api-key-variant",
+  "set_cookie : sessionid=opaque-set-cookie-variant",
+] as const;
+
+test("sensitive text recognizes bearer credentials without rejecting ordinary bearer prose", () => {
+  for (const value of ["bearer", "bearer:", "bearer=", "bearer of good news", "Bearer abcdefghijklmno"]) {
+    assert.doesNotThrow(() => assertPersistableText(value));
+  }
+  for (const value of snapshotHeaderAttacks.filter((value) => /^bearer/iu.test(value))) {
+    assert.throws(() => assertPersistableText(value), SensitiveDataError);
+  }
+});
+
+const withSnapshotEnvelopeSecurity = (name: string, build: (now: () => number, t: TestContext) => Store) => {
+  test(`${name} rejects credential-shaped strings anywhere in a snapshot envelope`, async (t) => {
+    const now = Date.parse(timestamp());
+    const store = build(() => now, t);
+    try {
+      const command = commandInput(77);
+      assert.equal((await store.reserveRunCommand(command)).kind, "owner");
+      const lease = await store.acquireLease({ runId: command.runId, attemptId: command.attemptId, ownerId: "worker", ttlMs: 1_000, requestedAt: timestamp() });
+      assert.equal(lease.kind, "acquired");
+      if (lease.kind !== "acquired") throw new Error("lease expected");
+      const snapshot = {
+        schemaVersion: "meliora.run-snapshot.v1" as const,
+        snapshotId: "snapshot-security",
+        runId: command.runId,
+        attemptId: command.attemptId,
+        throughSequence: 0,
+        state: snapshotState(),
+        createdAt: timestamp(),
+      };
+      for (const field of ["snapshotId", "runId", "attemptId", "createdAt"] as const) {
+        for (const value of snapshotHeaderAttacks) {
+          await assert.rejects(
+            store.writeSnapshot({ snapshot: { ...snapshot, [field]: value }, expectedSequence: 0, leaseToken: lease.leaseToken }),
+            SensitiveDataError,
+          );
+        }
+      }
+      for (const value of snapshotHeaderAttacks) {
+        await assert.rejects(
+          store.writeSnapshot({
+            snapshot: {
+              ...snapshot,
+              state: {
+                ...snapshotState(),
+                modelHistoryArtifact: { ...snapshotState().modelHistoryArtifact, mediaType: value },
+              },
+            },
+            expectedSequence: 0,
+            leaseToken: lease.leaseToken,
+          }),
+          SensitiveDataError,
+        );
+      }
+      assert.equal(await store.readSnapshot(command.runId), null);
+    } finally {
+      store.close?.();
+    }
+  });
+};
+
+test("RunSnapshot validator rejects malformed envelope fields before adapters persist", () => {
+  const snapshot = {
+    schemaVersion: "meliora.run-snapshot.v1" as const,
+    snapshotId: "snapshot-validator",
+    runId: "run-validator",
+    attemptId: "attempt-validator",
+    throughSequence: 0,
+    state: snapshotState(),
+    createdAt: timestamp(),
+  };
+  assert.doesNotThrow(() => assertValidRunSnapshot(snapshot));
+  for (const malformed of [
+    { ...snapshot, schemaVersion: "meliora.run-snapshot.v0" },
+    { ...snapshot, snapshotId: "snapshot invalid" },
+    { ...snapshot, runId: "run invalid" },
+    { ...snapshot, attemptId: "attempt invalid" },
+    { ...snapshot, throughSequence: 0.5 },
+    { ...snapshot, throughSequence: Number.MAX_SAFE_INTEGER + 1 },
+    { ...snapshot, createdAt: "not-a-time" },
+    { ...snapshot, state: { ...snapshotState(), phase: "not-a-phase" } },
+  ]) assert.throws(() => assertValidRunSnapshot(malformed));
+});
 
 const withStore = (name: string, build: (now: () => number, t: TestContext) => Store) => {
   test(`RecoveryReadPort parity: ${name}`, async (t) => {
@@ -183,6 +283,8 @@ const withStore = (name: string, build: (now: () => number, t: TestContext) => S
 
 withStore("memory", (now) => new MemorySessionStore({ clock: () => new Date(now()) }));
 withStore("sqlite", (now, t) => new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(now()) }));
+withSnapshotEnvelopeSecurity("memory", (now) => new MemorySessionStore({ clock: () => new Date(now()) }));
+withSnapshotEnvelopeSecurity("sqlite", (now, t) => new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(now()) }));
 
 test("SQLite rejects a structurally tampered private snapshot even with a matching state hash", async (t) => {
   const store = new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(timestamp()) });
@@ -207,6 +309,9 @@ test("SQLite rejects a structurally tampered private snapshot even with a matchi
     const keyedStateJson = JSON.stringify({ ...snapshotState(), authorization: "Bearer sk-abcdefghijklmnop" });
     db.prepare("UPDATE run_snapshots SET state_json=?,state_hash=? WHERE run_id=?").run(keyedStateJson, hashBytes(keyedStateJson), input.runId);
     await assert.rejects(store.readSnapshot(input.runId));
+    const safeStateJson = JSON.stringify(snapshotState());
+    db.prepare("UPDATE run_snapshots SET state_json=?,state_hash=?,snapshot_id=? WHERE run_id=?").run(safeStateJson, hashBytes(safeStateJson), "Cookie: sessionid=outer-envelope-tamper", input.runId);
+    await assert.rejects(store.readSnapshot(input.runId), SensitiveDataError);
   } finally {
     store.close();
   }
