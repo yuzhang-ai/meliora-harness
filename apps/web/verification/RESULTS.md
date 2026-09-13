@@ -8,7 +8,7 @@
 - Chrome headless：八个场景，1440/1100/1099/1024/768/390 宽度无横向溢出。
 - 新建对话 empty、零事件 loading、无 Diff 空态、过期审批只读态和未过期审批交互态通过。
 - 重连从序号4恢复，重复恢复仍仅3个后续事件；刷新保持位置。
-- 多行中文输入、HTML文本转义、Ctrl/⌘+Enter、Ctrl/⌘+L、Shift+F10、方向键标签切换、Escape关闭和手机导航通过。
+- 多行中文输入、HTML文本转义、Ctrl/⌘+Enter、Ctrl/⌘+Shift+K 站内搜索、Shift+F10、方向键标签切换、Escape关闭和手机导航通过。
 - 页面无未处理 JavaScript 异常、console error、失败请求或 4xx/5xx 资源响应。
 - 等待布局 transition 后生成并目视检查 web-1440.png、web-1100.png、web-768.png 与 web-390.png。
 - 根 `npm run check` 已包含 Web 的 `npm ci`、test 和 build。

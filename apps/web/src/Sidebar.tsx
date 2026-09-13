@@ -36,7 +36,7 @@ export function Sidebar(props: SidebarProps) {
 
   useEffect(() => {
     const focusSearch = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === "l") {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLocaleLowerCase() === "k") {
         event.preventDefault();
         if (window.innerWidth <= 768) props.onReveal();
         window.requestAnimationFrame(() => searchInput.current?.focus());
@@ -70,7 +70,7 @@ export function Sidebar(props: SidebarProps) {
     </div>
 
     <div className="sidebar-scroll">
-      <label className="search-field"><span aria-hidden="true">⌕</span><input ref={searchInput} aria-label="搜索项目和对话" placeholder="搜索" value={search} onChange={(event) => setSearch(event.target.value)}/><kbd>⌘L</kbd></label>
+      <label className="search-field"><span aria-hidden="true">⌕</span><input ref={searchInput} aria-label="搜索项目和对话" placeholder="搜索" value={search} onChange={(event) => setSearch(event.target.value)}/><kbd title="Ctrl/⌘ + Shift + K">⇧⌘K</kbd></label>
       <nav className="quick-actions" aria-label="快捷操作">
         <button aria-label="新建对话" onClick={props.onNewAgent}><span>＋</span>新建</button>
         <button onClick={props.onAutomations}><span>◷</span>自动化</button>

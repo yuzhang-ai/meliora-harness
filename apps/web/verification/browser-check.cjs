@@ -82,7 +82,9 @@ const path = require("node:path");
   await page.getByRole("button", { name: "重新回放", exact: true }).click();
   await page.locator(".timeline-loading").waitFor();
 
-  await page.keyboard.press("Control+KeyL");
+  const applicationUrl = page.url();
+  await page.keyboard.press("Control+Shift+KeyK");
+  assert.equal(page.url(), applicationUrl);
   assert.equal(await page.getByRole("textbox", { name: "搜索项目和对话" }).evaluate((element) => element === document.activeElement), true);
   await page.keyboard.type("Git");
   assert.equal(await page.getByRole("button", { name: /Git 检查失败/ }).isVisible(), true);
@@ -107,7 +109,7 @@ const path = require("node:path");
   await page.getByRole("button", { name: "关闭代码面板", exact: true }).click();
 
   await page.setViewportSize({ width: 768, height: 900 });
-  await page.keyboard.press("Control+KeyL");
+  await page.keyboard.press("Control+Shift+KeyK");
   assert.equal(await page.getByRole("textbox", { name: "搜索项目和对话" }).evaluate((element) => element === document.activeElement), true);
   assert.equal(await page.getByRole("region", { name: "存储库", exact: true }).isVisible(), true);
   await page.keyboard.press("Escape");
@@ -126,6 +128,6 @@ const path = require("node:path");
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(failedRequests, []);
   assert.deepEqual(failedResponses, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard shortcuts/drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, Chrome-safe Ctrl/Command+Shift+K search focus, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
