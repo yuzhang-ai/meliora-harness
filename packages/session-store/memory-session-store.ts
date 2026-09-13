@@ -3,8 +3,12 @@ import type {
   AppendEventsResult,
   Artifact,
   ArtifactRef,
+  BeginInvocationExecutionInput,
+  BeginInvocationExecutionResult,
   CommitReceiptInput,
   CommitReceiptResult,
+  CommitTerminalModelStepResultAndSnapshotInput,
+  CommitTerminalModelStepResultAndSnapshotResult,
   FinishModelStepInput,
   FinishModelStepResult,
   CreateRunAttemptInput,
@@ -55,8 +59,10 @@ import type {
   TurnRecord,
   WriteSnapshotInput,
   InvocationReconciliationRecord,
+  PrivateArtifactRef,
+  TerminalModelStepResultRef,
 } from "./contracts";
-import { assertValidRunSnapshot } from "./contracts";
+import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
 import {
   assertValidCommandTimestamp,
@@ -70,7 +76,7 @@ import {
   canTransitionRunCommand,
   privateUserInputContentHash,
 } from "./run-command-contract";
-import { assertPersistableJson } from "./src/sensitive-data";
+import { assertPersistableBytes, assertPersistableJson } from "./src/sensitive-data";
 import { canonicalJson, hashBytes } from "./src/integrity";
 
 type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
@@ -79,6 +85,8 @@ type MemorySessionStoreOptions = Readonly<{
   clock?: () => Date;
   nextLeaseToken?: () => string;
   nextReservationId?: () => string;
+  /** Test-only adapter hook; validates atomic rollback without changing the Port. */
+  onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
 }>;
 
 const attemptKey = (runId: string, attemptId: string) => `${runId}\u0000${attemptId}`;
@@ -120,6 +128,8 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly attempts = new Map<string, PersistedRunAttempt>();
   private readonly events = new Map<string, StoredEvent[]>();
   private readonly snapshots = new Map<string, RunSnapshot>();
+  private readonly terminalSnapshotHistory = new Map<string, Readonly<{ snapshot: RunSnapshot; commitOrdinal: number }>>();
+  private readonly terminalModelStepResults = new Map<string, TerminalModelStepResultRef & Readonly<{ snapshotId: string; commitOrdinal: number; throughSequence: number; stateHash: string; snapshotEnvelopeHash: string; finishedAt: string }>>();
   private readonly invocations = new Map<string, NormalizedToolInvocation>();
   private readonly reservations = new Map<string, StoredInvocationReservation>();
   private readonly reservationByRunIdempotencyKey = new Map<string, string>();
@@ -133,11 +143,13 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly clock: () => Date;
   private readonly nextLeaseToken: () => string;
   private readonly nextReservationId: () => string;
+  private readonly onAtomicTerminalWrite?: MemorySessionStoreOptions["onAtomicTerminalWrite"];
 
   constructor(options: MemorySessionStoreOptions = {}) {
     this.clock = options.clock ?? (() => new Date());
     this.nextLeaseToken = options.nextLeaseToken ?? (() => `lease-${++this.leaseSequence}`);
     this.nextReservationId = options.nextReservationId ?? (() => `reservation-${++this.reservationSequence}`);
+    this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
   }
 
   async reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult> {
@@ -430,6 +442,7 @@ export class MemorySessionStore implements SessionStorePort {
     if (invocations.length > 128) return { kind: "failure", code: "recovery_bundle_too_large" };
     const snapshot = this.snapshots.get(input.runId) ?? null;
     if (snapshot) this.assertSnapshotIntegrity(snapshot);
+    const terminalModelStepResult = this.assertTerminalResultSnapshotInvariant(input.runId, snapshot);
     const effectiveAfterSequence = Math.max(input.afterSequence ?? 0, snapshot?.throughSequence ?? 0);
     const eligible = (this.events.get(input.runId) ?? []).filter((event) => event.sequence > effectiveAfterSequence);
     const tailEvents = eligible.slice(0, input.eventLimit);
@@ -458,6 +471,7 @@ export class MemorySessionStore implements SessionStorePort {
       tailComplete,
       nextAfterSequence: tailComplete ? null : tailEvents.at(-1)?.sequence ?? effectiveAfterSequence,
       latestModelStep,
+      terminalModelStepResult,
       invocations: records,
     };
     return { kind: "found", bundle: deepCopy(bundle) };
@@ -760,14 +774,100 @@ export class MemorySessionStore implements SessionStorePort {
     this.snapshots.set(input.snapshot.runId, deepCopy(input.snapshot));
   }
 
+  async commitTerminalModelStepResultAndSnapshot(
+    input: CommitTerminalModelStepResultAndSnapshotInput,
+  ): Promise<CommitTerminalModelStepResultAndSnapshotResult> {
+    assertValidGeneratedId(input.runId); assertValidGeneratedId(input.attemptId); assertValidGeneratedId(input.modelStepId);
+    assertValidModelStepFingerprint(input.requestFingerprint); assertValidCommandTimestamp(input.finishedAt);
+    assertPersistableBytes(input.normalizedResult.content, "terminal_model_step_result.content");
+    assertPersistableJson(input.normalizedResult.metadata ?? null, "terminal_model_step_result.metadata");
+    const artifact: ArtifactRef = {
+      artifactId: input.normalizedResult.artifactId, contentHash: input.normalizedResult.contentHash,
+      mediaType: PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE, byteLength: input.normalizedResult.content.byteLength, visibility: "private",
+    };
+    const terminal = input.snapshot.state.terminalModelStepResult;
+    if (
+      hashBytes(input.normalizedResult.content) !== input.normalizedResult.contentHash
+      || input.snapshot.runId !== input.runId || input.snapshot.attemptId !== input.attemptId
+      || input.snapshot.throughSequence > input.expectedSequence || !terminal
+      || !sameDocument(terminal, { attemptId: input.attemptId, modelStepId: input.modelStepId, requestFingerprint: input.requestFingerprint, artifact })
+    ) return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+    assertValidRunSnapshot(input.snapshot);
+    const attempt = this.attemptForRun(input.runId, input.attemptId);
+    if (!attempt || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    if (attempt.lastEventSequence !== input.expectedSequence) return { kind: "conflict", code: "snapshot_sequence_conflict" };
+    const stepKey = modelStepKey(input.runId, input.modelStepId);
+    const step = this.modelSteps.get(stepKey);
+    if (!step || step.attemptId !== input.attemptId || step.requestFingerprint !== input.requestFingerprint) return { kind: "conflict", code: "model_step_conflict" };
+    const stateHash = hashBytes(canonicalJson(input.snapshot.state));
+    const snapshotEnvelopeHash = hashBytes(canonicalJson(input.snapshot));
+    const previousResult = this.terminalModelStepResults.get(stepKey);
+    const previousSnapshot = this.snapshots.get(input.runId);
+    if (previousResult || step.status === "terminal") {
+      const priorArtifact = this.artifacts.get(artifact.artifactId);
+      const priorHistory = previousResult ? this.terminalSnapshotHistory.get(previousResult.snapshotId) : undefined;
+      const exact = !!previousResult && !!priorHistory && step.status === "terminal"
+        && step.finishedAt === input.finishedAt
+        && sameDocument(previousResult, { ...terminal, snapshotId: input.snapshot.snapshotId, commitOrdinal: priorHistory.commitOrdinal, throughSequence: input.snapshot.throughSequence, stateHash, snapshotEnvelopeHash, finishedAt: input.finishedAt })
+        && previousResult.commitOrdinal === priorHistory.commitOrdinal
+        && sameDocument(priorHistory.snapshot, input.snapshot)
+        && !!priorArtifact && sameDocument({ ...priorArtifact, content: Array.from(priorArtifact.content) }, {
+          ...artifact, createdAt: input.finishedAt, content: Array.from(input.normalizedResult.content), ...(input.normalizedResult.metadata === undefined ? {} : { metadata: input.normalizedResult.metadata }),
+        });
+      if (exact) this.assertTerminalResultSnapshotInvariant(input.runId, previousSnapshot ?? null);
+      return exact
+        ? { kind: "replay", checkpoint: step, artifact: artifact as PrivateArtifactRef, snapshot: deepCopy(input.snapshot) }
+        : { kind: "conflict", code: "terminal_model_step_result_conflict" };
+    }
+    if (step.status !== "started" || Date.parse(input.finishedAt) < Date.parse(step.startedAt) || this.artifacts.has(artifact.artifactId) || this.terminalSnapshotHistory.has(input.snapshot.snapshotId)) {
+      return { kind: "conflict", code: step.status === "started" ? "terminal_model_step_result_conflict" : "model_step_conflict" };
+    }
+    this.assertTerminalResultSnapshotInvariant(input.runId, previousSnapshot ?? null);
+    if (previousSnapshot && previousSnapshot.throughSequence > input.snapshot.throughSequence) {
+      return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+    }
+    const commitOrdinal = Math.max(0, ...[...this.terminalSnapshotHistory.values()]
+      .filter((history) => history.snapshot.runId === input.runId)
+      .map((history) => history.commitOrdinal)) + 1;
+    // All possibly failing validation is above. These synchronous map writes are the
+    // Memory adapter's critical section and mirror SQLite's BEGIN IMMEDIATE unit.
+    const checkpoint: StoredModelStepCheckpoint = { ...step, status: "terminal", finishedAt: input.finishedAt };
+    const storedArtifact: Artifact = { ...artifact, createdAt: input.finishedAt, content: new Uint8Array(input.normalizedResult.content), ...(input.normalizedResult.metadata === undefined ? {} : { metadata: deepCopy(input.normalizedResult.metadata) }) };
+    const priorArtifact = this.artifacts.get(artifact.artifactId); const priorStep = this.modelSteps.get(stepKey);
+    const priorResult = this.terminalModelStepResults.get(stepKey); const priorSnapshot = this.snapshots.get(input.runId);
+    const priorHistory = this.terminalSnapshotHistory.get(input.snapshot.snapshotId);
+    try {
+      this.onAtomicTerminalWrite?.("artifact"); this.artifacts.set(artifact.artifactId, storedArtifact);
+      this.onAtomicTerminalWrite?.("checkpoint"); this.modelSteps.set(stepKey, checkpoint);
+      this.onAtomicTerminalWrite?.("terminal_result"); this.terminalSnapshotHistory.set(input.snapshot.snapshotId, { snapshot: deepCopy(input.snapshot), commitOrdinal });
+      this.terminalModelStepResults.set(stepKey, { ...deepCopy(terminal), snapshotId: input.snapshot.snapshotId, commitOrdinal, throughSequence: input.snapshot.throughSequence, stateHash, snapshotEnvelopeHash, finishedAt: input.finishedAt });
+      this.onAtomicTerminalWrite?.("snapshot"); this.snapshots.set(input.runId, deepCopy(input.snapshot));
+    } catch (error) {
+      if (priorArtifact) this.artifacts.set(artifact.artifactId, priorArtifact); else this.artifacts.delete(artifact.artifactId);
+      if (priorStep) this.modelSteps.set(stepKey, priorStep); else this.modelSteps.delete(stepKey);
+      if (priorResult) this.terminalModelStepResults.set(stepKey, priorResult); else this.terminalModelStepResults.delete(stepKey);
+      if (priorHistory) this.terminalSnapshotHistory.set(input.snapshot.snapshotId, priorHistory); else this.terminalSnapshotHistory.delete(input.snapshot.snapshotId);
+      if (priorSnapshot) this.snapshots.set(input.runId, priorSnapshot); else this.snapshots.delete(input.runId);
+      throw error;
+    }
+    return { kind: "committed", checkpoint, artifact: artifact as PrivateArtifactRef, snapshot: deepCopy(input.snapshot) };
+  }
+
   async readSnapshot(runId: string): Promise<RunSnapshot | null> {
     const snapshot = this.snapshots.get(runId);
-    if (!snapshot) return null;
+    if (!snapshot) {
+      this.assertTerminalResultSnapshotInvariant(runId, null);
+      return null;
+    }
     this.assertSnapshotIntegrity(snapshot);
+    this.assertTerminalResultSnapshotInvariant(runId, snapshot);
     return deepCopy(snapshot);
   }
 
   async reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult> {
+    if (input.invocation.status !== "reserved") return { kind: "conflict", code: "invocation_reservation_conflict" };
     if (!this.attemptForRun(input.invocation.runId, input.invocation.attemptId)) {
       return { kind: "conflict", code: "run_attempt_conflict" };
     }
@@ -805,6 +905,26 @@ export class MemorySessionStore implements SessionStorePort {
     this.reservations.set(reservationId, deepCopy(reservation));
     this.reservationByRunIdempotencyKey.set(idempotencyKey, reservationId);
     return { kind: "owner", reservationId };
+  }
+
+  async beginInvocationExecution(input: BeginInvocationExecutionInput): Promise<BeginInvocationExecutionResult> {
+    if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    const reservation = this.reservations.get(input.reservationId);
+    if (!reservation || reservation.runId !== input.runId || reservation.attemptId !== input.attemptId) return { kind: "conflict", code: "invocation_execution_conflict" };
+    const receiptId = this.receiptByReservation.get(input.reservationId);
+    if (receiptId) return { kind: "receipt_replay", receiptId };
+    if (reservation.status === "executing" || reservation.status === "outcome_unknown") {
+      return reservation.status === "executing" ? { kind: "already_executing_or_unknown", executionStartedAt: reservation.executionStartedAt } : { kind: "already_executing_or_unknown" };
+    }
+    if (reservation.status !== "reserved" || reservation.executionStartedAt !== undefined) return { kind: "conflict", code: "invocation_execution_conflict" };
+    const invocation = this.invocations.get(invocationKey(input.runId, input.attemptId, reservation.invocationId));
+    if (!invocation) return { kind: "conflict", code: "invocation_execution_conflict" };
+    const executionStartedAt = this.clock().toISOString();
+    this.invocations.set(invocationKey(input.runId, input.attemptId, reservation.invocationId), { ...invocation, status: "executing" });
+    this.reservations.set(input.reservationId, { ...reservation, status: "executing", executionStartedAt });
+    return { kind: "started", executionStartedAt };
   }
 
   async readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null> {
@@ -998,6 +1118,42 @@ export class MemorySessionStore implements SessionStorePort {
       || checkpoint.attemptId !== terminal.attemptId
       || checkpoint.requestFingerprint !== terminal.requestFingerprint
     ) throw new Error("snapshot_integrity_conflict");
+  }
+
+  /** The terminal result row and private Snapshot binding must exist together. */
+  private assertTerminalResultSnapshotInvariant(
+    runId: string,
+    snapshot: RunSnapshot | null,
+  ): TerminalModelStepResultRef | null {
+    const rows = [...this.terminalModelStepResults.entries()]
+      .filter(([key]) => key.startsWith(`${runId}\u0000`));
+    const histories = [...this.terminalSnapshotHistory.values()]
+      .filter((history) => history.snapshot.runId === runId);
+    if (rows.length !== histories.length) throw new Error("snapshot_integrity_conflict");
+    if (rows.length === 0) {
+      if (snapshot?.state.terminalModelStepResult) throw new Error("snapshot_integrity_conflict");
+      return null;
+    }
+    for (const [, result] of rows) {
+      const history = this.terminalSnapshotHistory.get(result.snapshotId);
+      const artifact = this.artifacts.get(result.artifact.artifactId);
+      const checkpoint = this.modelSteps.get(modelStepKey(runId, result.modelStepId));
+      if (!history || history.commitOrdinal !== result.commitOrdinal || history.commitOrdinal <= 0 || history.snapshot.attemptId !== result.attemptId || history.snapshot.throughSequence !== result.throughSequence
+        || result.stateHash !== hashBytes(canonicalJson(history.snapshot.state))
+        || result.snapshotEnvelopeHash !== hashBytes(canonicalJson(history.snapshot))
+        || !sameDocument(history.snapshot.state.terminalModelStepResult, { attemptId: result.attemptId, modelStepId: result.modelStepId, requestFingerprint: result.requestFingerprint, artifact: result.artifact })
+        || !checkpoint || checkpoint.status !== "terminal" || checkpoint.finishedAt !== result.finishedAt
+        || !artifact || hashBytes(artifact.content) !== artifact.contentHash
+        || !sameDocument({ artifactId: artifact.artifactId, contentHash: artifact.contentHash, mediaType: artifact.mediaType, byteLength: artifact.byteLength, visibility: artifact.visibility }, result.artifact)
+      ) throw new Error("snapshot_integrity_conflict");
+      this.assertSnapshotIntegrity(history.snapshot);
+    }
+    if (new Set(histories.map((history) => history.commitOrdinal)).size !== histories.length) throw new Error("snapshot_integrity_conflict");
+    const latestHistory = histories.reduce((latest, history) => history.commitOrdinal > latest.commitOrdinal ? history : latest);
+    const latest = rows.find(([, row]) => row.snapshotId === latestHistory.snapshot.snapshotId)?.[1];
+    if (!latest) throw new Error("snapshot_integrity_conflict");
+    if (!snapshot || latest.commitOrdinal !== latestHistory.commitOrdinal || latest.snapshotEnvelopeHash !== hashBytes(canonicalJson(snapshot)) || !sameDocument(snapshot, latestHistory.snapshot)) throw new Error("snapshot_integrity_conflict");
+    return { attemptId: latest.attemptId, modelStepId: latest.modelStepId, requestFingerprint: latest.requestFingerprint, artifact: latest.artifact };
   }
 
   private leaseConflict(runId: string, attemptId: string, leaseToken: string): "lease_not_held" | "lease_expired" | null {

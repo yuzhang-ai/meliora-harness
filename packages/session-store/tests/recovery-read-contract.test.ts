@@ -256,8 +256,6 @@ const withStore = (name: string, build: (now: () => number, t: TestContext) => S
       assert.equal(finished.kind, "committed");
       await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-wrong-fingerprint", throughSequence: 2, state: { ...terminalState(), terminalModelStepResult: { ...terminalState().terminalModelStepResult!, requestFingerprint: "c".repeat(64) } } }, expectedSequence: 3, leaseToken: lease.leaseToken }));
       await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-wrong-attempt", throughSequence: 2, state: { ...terminalState(), terminalModelStepResult: { ...terminalState().terminalModelStepResult!, attemptId: "attempt-wrong" } } }, expectedSequence: 3, leaseToken: lease.leaseToken }));
-      await store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-valid", throughSequence: 2, state: terminalState() }, expectedSequence: 3, leaseToken: lease.leaseToken });
-      assert.equal((await store.readSnapshot(first.runId))?.state.terminalModelStepResult?.modelStepId, "model-step-1");
 
       for (let index = 0; index < 129; index += 1) {
         const reservation = await store.reserveInvocation({

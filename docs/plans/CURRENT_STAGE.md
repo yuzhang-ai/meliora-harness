@@ -128,14 +128,14 @@ WP-A read-only runtime + WP-C store
 | E3 独立闭包与回归 | 你 + Codex | Verified locally | typecheck + 5 组 characterization tests |
 | Contract-first PR | 你 + Codex | Merged | PR #3 已合并至 main `3f2e24f0`；CI、全量 check 与独立审查通过 |
 | Read-only Runtime | 你 + Codex | Merged | PR #5 已合并至 main `e3b8a1a1`；真实 Host/Store/Run loop、CI 与独立安全复审通过 |
-| Web Shell | 张子恒 | Ready | Issue #1；基于合并后的 PublicRunEvent fixtures 开工 |
+| Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；Web 11/11、四档响应式与真实 Chrome 验收、全量 check、CI 和独立复审通过；尚未接入真实 Server/SSE |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；施工顺序与门禁见 [M0 真实纵向集成施工单](M0_VERTICAL_INTEGRATION.md)；WP-0 已完成，WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已本地实现并等待独立审查/CI；WP-3A Store Recovery Read Contract 已本地实现，仍需独立审查与 CI |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`；当前 WP-3B.1a private recovery primitives（多 step immutable history、Store-owned commitOrdinal 与完整 envelope hash）在隔离分支验收，尚未接入 Runtime/Server/SSE；后续按 B1b → B2 → C 推进 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command 与 Model Step checkpoint 已通过 PR #3、#5、#8、#10、#14 合并到 `main`。张子恒继续 Issue #1 的 fixture-first Web Shell；后端 WP-1 Server composition 与 WP-2 server-level fake Provider fixture 已在隔离 worktree 本地实现，下一动作是独立审查、全量 check、PR/CI，再进入 WP-3 recovery、snapshot 与 resume-point。秦峻溥冻结 PR #14，等待 WP-3 的 snapshot/resume adapter 独立任务。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract 与 fixture-first Web Shell 已合并到 `main`。当前下一动作是完成 WP-3B.1a 的独立审查、全量 check、Draft PR/CI，再进入 WP-3B.1b Runtime 原子切换；WP-3B.2 仅持久化 public resume snapshot，WP-3C 再接 recovery coordinator 与 SSE reset/restart 纵向验收。张子恒、秦峻溥暂不启动新的交叉依赖工作包，等待 B1a 合并后的明确施工单。

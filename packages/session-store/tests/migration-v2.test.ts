@@ -28,14 +28,18 @@ test("fresh databases apply the complete immutable migration manifest", (t) => {
   new SqliteSessionStore(path).close();
 
   const db = inspect(path);
-  assert.equal(db.pragma("user_version", { simple: true }), 2);
+  assert.equal(db.pragma("user_version", { simple: true }), 3);
   assert.deepEqual(db.prepare("SELECT version,name FROM schema_migrations ORDER BY version").all(), [
     { version: 1, name: "0001_initial.sql" },
     { version: 2, name: "0002_durable_commands.sql" },
+    { version: 3, name: "0003_private_recovery_primitives.sql" },
   ]);
-  for (const table of ["run_commands", "run_command_inputs", "model_steps"]) {
+  for (const table of ["run_commands", "run_command_inputs", "model_steps", "run_snapshot_history", "model_step_terminal_results"]) {
     assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").pluck().get(table), 1);
   }
+  assert.deepEqual(db.prepare("SELECT name FROM pragma_table_info('run_snapshot_history') WHERE name='commit_ordinal'").all(), [{ name: "commit_ordinal" }]);
+  assert.deepEqual(db.prepare("SELECT name FROM pragma_table_info('model_step_terminal_results') WHERE name='commit_ordinal'").all(), [{ name: "commit_ordinal" }]);
+  assert.deepEqual(db.prepare("SELECT name FROM pragma_table_info('model_step_terminal_results') WHERE name='snapshot_envelope_hash'").all(), [{ name: "snapshot_envelope_hash" }]);
   assert.equal(db.pragma("integrity_check", { simple: true }), "ok");
   assert.deepEqual(db.pragma("foreign_key_check"), []);
   db.close();
@@ -51,12 +55,12 @@ test("version one upgrades to version two without changing existing rows", (t) =
 
   new SqliteSessionStore(path).close();
   const db = inspect(path);
-  assert.equal(db.pragma("user_version", { simple: true }), 2);
+  assert.equal(db.pragma("user_version", { simple: true }), 3);
   assert.deepEqual(db.prepare("SELECT session_id,workspace_id FROM sessions").get(), {
     session_id: "preserved-session",
     workspace_id: "preserved-workspace",
   });
-  assert.equal(db.prepare("SELECT count(*) FROM schema_migrations").pluck().get(), 2);
+  assert.equal(db.prepare("SELECT count(*) FROM schema_migrations").pluck().get(), 3);
   db.close();
 });
 
@@ -79,7 +83,7 @@ test("a database newer than the adapter is rejected", (t) => {
   const path = createTempDatabase(t);
   new SqliteSessionStore(path).close();
   const db = new Database(path);
-  db.pragma("user_version = 3");
+  db.pragma("user_version = 4");
   db.close();
   assert.throws(() => new SqliteSessionStore(path), StoreIntegrityError);
 });
