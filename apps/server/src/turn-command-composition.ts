@@ -385,33 +385,6 @@ const appendWorkerFailureEvent = async (
   });
 };
 
-const appendWorkerBlockedEvent = async (
-  store: SessionStorePort,
-  command: StoredRunCommand,
-  leaseToken: string,
-  code: string,
-  message: string,
-  userActions: readonly string[],
-  ids: TurnCommandIds,
-  now: () => string,
-): Promise<void> => {
-  const sequence = await latestSequence(store, command.runId);
-  await store.appendEvents({
-    runId: command.runId,
-    attemptId: command.attemptId,
-    leaseToken,
-    expectedSequence: sequence,
-    events: [{
-      schemaVersion: "meliora.session-event.v1",
-      eventId: ids.nextEventId(),
-      kind: "run_blocked",
-      visibility: "public",
-      payload: { code, message, userActions: [...userActions] },
-      createdAt: now(),
-    }],
-  });
-};
-
 const settleStartedModelStepAsUnknown = async (
   store: SessionStorePort,
   command: StoredRunCommand,
@@ -423,18 +396,37 @@ const settleStartedModelStepAsUnknown = async (
   if (!latestCommand || latestCommand.status === "terminal") return false;
   const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
   if (latestStep?.status !== "started") return false;
-  await appendWorkerBlockedEvent(
-    store,
-    latestCommand,
-    leaseToken,
-    MODEL_STEP_OUTCOME_UNKNOWN_CODE,
-    MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
-    MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
-    ids,
-    now,
-  ).catch(() => undefined);
-  await settleCommand(store, latestCommand, leaseToken, "blocked", MODEL_STEP_OUTCOME_UNKNOWN_CODE, now)
-    .catch(() => undefined);
+  try {
+    const sequence = await latestSequence(store, latestCommand.runId);
+    await store.settleRunCommandWithTerminalEvent({
+      ...commandScope(latestCommand),
+      runId: latestCommand.runId,
+      attemptId: latestCommand.attemptId,
+      leaseToken,
+      expectedCommandStatus: latestCommand.status,
+      expectedSequence: sequence,
+      terminalStatus: "blocked",
+      terminalCode: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+      updatedAt: now(),
+      terminalEvent: {
+        schemaVersion: "meliora.session-event.v1",
+        eventId: ids.nextEventId(),
+        kind: "run_blocked",
+        visibility: "public",
+        payload: {
+          code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+          message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+          userActions: [...MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS],
+        },
+        createdAt: now(),
+      },
+    });
+  } catch {
+    // A failed or conflicting atomic settle leaves both facts untouched.  The
+    // command remains dispatched and the started checkpoint still forbids a
+    // second Provider request until a later recovery worker can settle it.
+    return true;
+  }
   return true;
 };
 
@@ -461,17 +453,7 @@ const runWorker = async (
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
-      await appendWorkerBlockedEvent(
-        options.store,
-        command,
-        leaseToken,
-        MODEL_STEP_OUTCOME_UNKNOWN_CODE,
-        MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
-        MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
-        options.ids,
-        options.now,
-      );
-      await settleCommand(options.store, command, leaseToken, "blocked", MODEL_STEP_OUTCOME_UNKNOWN_CODE, options.now);
+      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
       return;
     }
     if (current.status === "reserved") {
@@ -519,6 +501,7 @@ const runWorker = async (
       projectToolResult,
       projectAssistantText: projectServerOwnedAssistantText,
       isPublicArtifact: async (artifactId) => (await options.store.getArtifact(artifactId))?.visibility === "public",
+      deferModelStepOutcomeUnknownTerminalEvent: true,
       ownerId: options.ownerId,
       leaseTtlMs: options.leaseTtlMs,
       policyVersion: options.policyVersion,
@@ -539,6 +522,13 @@ const runWorker = async (
     const code = result.outcome.status === "completed"
       ? undefined
       : result.outcome.unresolved[0]?.code ?? result.outcome.status;
+    if (result.outcome.status === "blocked" && code === MODEL_STEP_OUTCOME_UNKNOWN_CODE) {
+      // The Run Loop deliberately deferred this one terminal event.  The Store
+      // writes it only together with Command terminal state; a failed atomic
+      // settlement leaves dispatched + started for safe recovery.
+      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
+      return;
+    }
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {

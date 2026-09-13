@@ -36,6 +36,8 @@ import type {
   RunSnapshot,
   SessionRecord,
   SessionStorePort,
+  SettleRunCommandWithTerminalEventInput,
+  SettleRunCommandWithTerminalEventResult,
   StoredEvent,
   StoredInvocationReservation,
   StoredModelStepCheckpoint,
@@ -62,6 +64,7 @@ import {
   canTransitionRunCommand,
   privateUserInputContentHash,
 } from "./run-command-contract";
+import { assertPersistableJson } from "./src/sensitive-data";
 
 type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
 
@@ -292,6 +295,92 @@ export class MemorySessionStore implements SessionStorePort {
       : { ...commandBase, status: input.nextStatus, updatedAt: input.updatedAt };
     this.commands.set(key, updated);
     return { kind: "updated", command: updated };
+  }
+
+  async settleRunCommandWithTerminalEvent(
+    input: SettleRunCommandWithTerminalEventInput,
+  ): Promise<SettleRunCommandWithTerminalEventResult> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.attemptId);
+    assertValidCommandTimestamp(input.updatedAt);
+    if (input.terminalCode !== undefined) assertValidSafeCode(input.terminalCode);
+    if (!Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "event_sequence_conflict" };
+    }
+    const expectedKind = `run_${input.terminalStatus}`;
+    const event = input.terminalEvent;
+    if (
+      event.schemaVersion !== "meliora.session-event.v1"
+      || event.kind !== expectedKind
+      || event.visibility !== "public"
+    ) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    assertValidGeneratedId(event.eventId);
+    assertValidCommandTimestamp(event.createdAt);
+    assertPersistableJson(event.payload, "terminal_event.payload");
+
+    const key = commandScopeKey(input);
+    const command = this.commands.get(key);
+    if (!command) return { kind: "not_found", code: "run_command_not_found" };
+    if (
+      command.runId !== input.runId
+      || !this.attemptForRun(input.runId, input.attemptId)
+      || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId
+    ) return { kind: "conflict", code: "run_attempt_conflict" };
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    const attempt = this.attemptForRun(input.runId, input.attemptId)!;
+    const expectedEvent: StoredEvent = {
+      ...event,
+      runId: input.runId,
+      attemptId: input.attemptId,
+      sequence: input.expectedSequence + 1,
+    };
+    const priorEvent = [...this.events.values()].flat().find((candidate) => candidate.eventId === event.eventId);
+
+    if (command.status === "terminal") {
+      if (
+        command.terminalStatus !== input.terminalStatus
+        || command.terminalCode !== input.terminalCode
+        || attempt.lastEventSequence !== input.expectedSequence + 1
+        || !priorEvent
+        || !sameDocument(priorEvent, expectedEvent)
+      ) return { kind: "conflict", code: "command_status_conflict" };
+      return { kind: "replay", command, event: priorEvent };
+    }
+    if (
+      command.status !== input.expectedCommandStatus
+      || !canTransitionRunCommand(command.status, "terminal")
+      || Date.parse(input.updatedAt) < Date.parse(command.updatedAt)
+      || attempt.lastEventSequence !== input.expectedSequence
+      || priorEvent !== undefined
+    ) {
+      return attempt.lastEventSequence !== input.expectedSequence
+        ? { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt.lastEventSequence }
+        : { kind: "conflict", code: "command_status_conflict" };
+    }
+
+    const { terminalStatus: _terminalStatus, terminalCode: _terminalCode, ...base } = command;
+    const settled: StoredRunCommand = {
+      ...base,
+      status: "terminal",
+      terminalStatus: input.terminalStatus,
+      ...(input.terminalCode === undefined ? {} : { terminalCode: input.terminalCode }),
+      updatedAt: input.updatedAt,
+    };
+    // No await occurs in this critical section: the two visible facts change together.
+    this.events.set(input.runId, [...(this.events.get(input.runId) ?? []), expectedEvent]);
+    this.attempts.set(attemptKey(input.runId, input.attemptId), {
+      ...attempt,
+      lastEventSequence: expectedEvent.sequence,
+      updatedAt: input.updatedAt,
+    });
+    this.commands.set(key, settled);
+    return { kind: "settled", command: settled, event: expectedEvent };
   }
 
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {

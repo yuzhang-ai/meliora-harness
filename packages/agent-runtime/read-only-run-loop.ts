@@ -104,6 +104,12 @@ export type ReadOnlyRunLoopDependencies = Readonly<{
   ids: ReadOnlyRunIds;
   /** Mandatory durable gate: Provider I/O is forbidden until start returns a new checkpoint. */
   modelStepCheckpoint: ReadOnlyModelStepCheckpointGate;
+  /**
+   * Server composition may reserve this one terminal projection for its
+   * Command-plus-event atomic settlement boundary. The default keeps the
+   * standalone Runtime projection behavior unchanged.
+   */
+  deferModelStepOutcomeUnknownTerminalEvent?: boolean;
   now(): string;
   hashArguments(argumentsValue: JsonObject): string;
   validateArguments?(definition: ToolDefinition, argumentsValue: JsonObject): string | null;
@@ -316,8 +322,19 @@ export class ReadOnlyRunLoop {
       if (status !== "verifying" && status !== "model_streaming" && status !== "tool_assembling" && status !== "executing_tools" && status !== "preparing") {
         throw new Error(`invalid_terminal_source_${status}`);
       }
+      const deferModelStepOutcomeUnknownTerminalProjection =
+        terminalStatus === "blocked"
+        && code === MODEL_STEP_OUTCOME_UNKNOWN_CODE
+        && this.dependencies.deferModelStepOutcomeUnknownTerminalEvent === true;
       if (terminalStatus === "completed" && status !== "verifying") await changeStatus("verifying");
-      await changeStatus(terminalStatus, code);
+      if (deferModelStepOutcomeUnknownTerminalProjection) {
+        // Server composition writes the terminal projection and its durable
+        // Command state through one Store operation. Publishing a terminal
+        // status here would make SSE close before that operation is visible.
+        status = terminalStatus;
+      } else {
+        await changeStatus(terminalStatus, code);
+      }
       const outcome: TurnOutcome = {
         schemaVersion: "meliora.turn-outcome.v1",
         outcomeId: this.dependencies.ids.nextOutcomeId(),
@@ -350,7 +367,9 @@ export class ReadOnlyRunLoop {
         }
         await publish("run_completed", { outcomeId: outcome.outcomeId, summary });
       } else if (terminalStatus === "blocked") {
-        await publish("run_blocked", { code: code ?? "run_blocked", message: summary, userActions: [...userActions] });
+        if (!deferModelStepOutcomeUnknownTerminalProjection) {
+          await publish("run_blocked", { code: code ?? "run_blocked", message: summary, userActions: [...userActions] });
+        }
       } else if (terminalStatus === "failed") {
         await publish("run_failed", { code: code ?? "run_failed", retryable, message: summary });
       } else {

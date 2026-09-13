@@ -320,6 +320,104 @@ for (const adapter of adapters) {
     }
   });
 
+  test(`${adapter.name} atomically settles one public terminal event with its Command`, async (t) => {
+    const harness = adapter.create(t);
+    try {
+      const input = commandInput("atomic-terminal");
+      assert.equal((await harness.store.reserveRunCommand(input)).kind, "owner");
+      const lease = await harness.store.acquireLease({
+        runId: input.runId,
+        attemptId: input.attemptId,
+        ownerId: "worker-atomic",
+        ttlMs: 60_000,
+        requestedAt: timestamp(),
+      });
+      assert.equal(lease.kind, "acquired");
+      if (lease.kind !== "acquired") throw new Error("expected atomic settlement lease");
+      assert.equal((await harness.store.transitionRunCommand({
+        localPrincipalId: input.localPrincipalId,
+        workspaceId: input.workspaceId,
+        idempotencyKey: input.idempotencyKey,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseToken: lease.leaseToken,
+        expectedStatus: "reserved",
+        nextStatus: "accepted",
+        updatedAt: timestamp(1_000),
+      })).kind, "updated");
+      assert.equal((await harness.store.startModelStep({
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseToken: lease.leaseToken,
+        modelStepId: "model-step-atomic-terminal",
+        requestFingerprint: hashBytes("model-request-atomic-terminal"),
+        startedAt: timestamp(2_000),
+      })).kind, "started");
+
+      const atomicInput = {
+        localPrincipalId: input.localPrincipalId,
+        workspaceId: input.workspaceId,
+        idempotencyKey: input.idempotencyKey,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseToken: lease.leaseToken,
+        expectedCommandStatus: "dispatched" as const,
+        expectedSequence: 0,
+        terminalStatus: "blocked" as const,
+        terminalCode: "model_step_outcome_unknown",
+        updatedAt: timestamp(3_000),
+        terminalEvent: {
+          schemaVersion: "meliora.session-event.v1" as const,
+          eventId: `event-${input.runId}-blocked`,
+          kind: "run_blocked",
+          visibility: "public" as const,
+          payload: { code: "model_step_outcome_unknown", message: "需要安全恢复。" },
+          createdAt: timestamp(3_000),
+        },
+      };
+      const assertUnsettled = async () => {
+        assert.equal((await harness.store.readRunCommand(input))?.status, "dispatched");
+        assert.equal((await harness.store.readEvents({ runId: input.runId, afterSequence: 0, limit: 20 })).events.length, 0);
+      };
+
+      assert.deepEqual(await harness.store.settleRunCommandWithTerminalEvent({
+        ...atomicInput,
+        expectedCommandStatus: "accepted",
+      }), { kind: "conflict", code: "command_status_conflict" });
+      await assertUnsettled();
+      assert.deepEqual(await harness.store.settleRunCommandWithTerminalEvent({
+        ...atomicInput,
+        terminalEvent: { ...atomicInput.terminalEvent, kind: "run_failed" },
+      }), { kind: "conflict", code: "command_status_conflict" });
+      await assertUnsettled();
+      assert.deepEqual(await harness.store.settleRunCommandWithTerminalEvent({
+        ...atomicInput,
+        expectedSequence: 1,
+      }), { kind: "conflict", code: "event_sequence_conflict", currentSequence: 0 });
+      await assertUnsettled();
+      assert.deepEqual(await harness.store.settleRunCommandWithTerminalEvent({
+        ...atomicInput,
+        leaseToken: "stale-lease",
+      }), { kind: "conflict", code: "lease_not_held" });
+      await assertUnsettled();
+
+      const settled = await harness.store.settleRunCommandWithTerminalEvent(atomicInput);
+      assert.equal(settled.kind, "settled");
+      assert.equal(settled.kind === "settled" ? settled.command.terminalStatus : null, "blocked");
+      assert.equal(settled.kind === "settled" ? settled.event.sequence : null, 1);
+      assert.equal((await harness.store.readEvents({ runId: input.runId, afterSequence: 0, limit: 20 })).events.length, 1);
+      const replay = await harness.store.settleRunCommandWithTerminalEvent(atomicInput);
+      assert.equal(replay.kind, "replay");
+      assert.equal((await harness.store.readEvents({ runId: input.runId, afterSequence: 0, limit: 20 })).events.length, 1);
+      assert.deepEqual(await harness.store.settleRunCommandWithTerminalEvent({
+        ...atomicInput,
+        terminalEvent: { ...atomicInput.terminalEvent, payload: { code: "drift" } },
+      }), { kind: "conflict", code: "command_status_conflict" });
+    } finally {
+      harness.close();
+    }
+  });
+
   test(`${adapter.name} checkpoints recovered Attempts without duplicating an unresolved Model Step`, async (t) => {
     const harness = adapter.create(t);
     try {

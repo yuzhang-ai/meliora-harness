@@ -13,6 +13,8 @@ import type {
   FinishModelStepInput,
   FinishModelStepResult,
   SessionStorePort,
+  SettleRunCommandWithTerminalEventInput,
+  SettleRunCommandWithTerminalEventResult,
   StartModelStepInput,
   StartModelStepResult,
 } from "../../../packages/session-store/contracts.js";
@@ -300,6 +302,32 @@ class ConflictingFinishModelStepStore extends MemorySessionStore {
   }
 }
 
+class FailingAtomicRunBlockedSettlementStore extends ThrowingFinishModelStepStore {
+  // This is the Store boundary that must keep the public terminal event and
+  // command terminal state indivisible.  Failing it must leave neither fact.
+  private remainingAtomicSettlementFailures = 1;
+  settleCalls = 0;
+
+  constructor(
+    private readonly failure: "throw" | "conflict",
+    clock: () => Date,
+  ) {
+    super({ clock });
+  }
+
+  override async settleRunCommandWithTerminalEvent(
+    input: SettleRunCommandWithTerminalEventInput,
+  ): Promise<SettleRunCommandWithTerminalEventResult> {
+    this.settleCalls += 1;
+    if (this.remainingAtomicSettlementFailures > 0 && input.terminalEvent.kind === "run_blocked") {
+      this.remainingAtomicSettlementFailures -= 1;
+      if (this.failure === "throw") throw new Error("injected_atomic_run_blocked_settlement_failure");
+      return { kind: "conflict", code: "event_sequence_conflict", currentSequence: 1 };
+    }
+    return super.settleRunCommandWithTerminalEvent(input);
+  }
+}
+
 test("Model Step checkpoint conflict fails closed without calling the Provider", async () => {
   const store = new BlockingCheckpointStore({ clock: () => new Date(fixedNow) });
   const ids = deterministicIds();
@@ -406,6 +434,78 @@ test("finishModelStep failures preserve the started checkpoint and block provide
       assert.equal(replay.body.terminalCode, "model_step_outcome_unknown");
       assert.equal(deferred.length, 0);
       assert.equal(modelCalls, 1);
+    });
+  }
+});
+
+test("atomic run_blocked settlement failures preserve dispatched command and started checkpoint until safe recovery", async (t) => {
+  for (const scenario of ["throw", "conflict"] as const) {
+    await t.test(scenario, async () => {
+      let currentNow = fixedNow;
+      const store = new FailingAtomicRunBlockedSettlementStore(scenario, () => new Date(currentNow));
+      const ids = deterministicIds();
+      const deferred: Array<() => Promise<void>> = [];
+      let modelCalls = 0;
+      const request = {
+        schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+        workspaceId,
+        idempotencyKey: `run-blocked-atomic-${scenario}`,
+        message: "检查 run_blocked 原子结算故障",
+      } as const;
+      const submitTurnCommand = createTurnCommandSubmitter({
+        store,
+        workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+        model: {
+          next: async ({ modelStepId }) => {
+            modelCalls += 1;
+            return [{
+              schemaVersion: "meliora.model-event.v1",
+              modelStepId,
+              streamIndex: 0,
+              occurredAt: fixedNow,
+              kind: "model_step_completed",
+              finishReason: "stop",
+            }];
+          },
+        },
+        ids,
+        now: () => currentNow,
+        leaseTtlMs: 1_000,
+        defer: (run) => { deferred.push(run); },
+      });
+
+      const created = await submitTurnCommand(request);
+      assert.equal(created.status, 202);
+      await Promise.resolve(deferred.shift()!());
+
+      assert.equal(modelCalls, 1);
+      assert.equal(store.settleCalls, 1);
+      assert.equal((await store.readLatestModelStep({ runId: created.body.runId }))?.status, "started");
+      const commandScope = {
+        localPrincipalId: "local-user",
+        workspaceId,
+        idempotencyKey: request.idempotencyKey,
+      };
+      assert.equal((await store.readRunCommand(commandScope))?.status, "dispatched");
+      const beforeRecovery = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 20 });
+      assert.equal(beforeRecovery.events.some((event) => event.kind === "run_blocked"), false);
+      assert.equal(beforeRecovery.events.some((event) => /^run_(completed|failed|cancelled)$/u.test(event.kind)), false);
+
+      currentNow = "2026-09-12T03:00:02.000Z";
+      const replay = await submitTurnCommand(request);
+      assert.equal(replay.status, 202);
+      assert.equal(replay.body.disposition, "replay");
+      assert.equal(replay.body.commandStatus, "dispatched");
+      assert.equal(deferred.length, 1);
+      await Promise.resolve(deferred.shift()!());
+
+      assert.equal(modelCalls, 1);
+      const recovered = await store.readRunCommand(commandScope);
+      assert.equal(recovered?.status, "terminal");
+      assert.equal(recovered?.terminalStatus, "blocked");
+      assert.equal(recovered?.terminalCode, "model_step_outcome_unknown");
+      const afterRecovery = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 20 });
+      assert.equal(afterRecovery.events.filter((event) => event.kind === "run_blocked").length, 1);
     });
   }
 });
