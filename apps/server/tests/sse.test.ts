@@ -24,19 +24,23 @@ const storedEvent = (sequence: number, kind: string, visibility: "public" | "pri
   createdAt: `2026-09-11T00:00:0${sequence}.000Z`,
 });
 
-const fakeStore = (events: readonly StoredEvent[]): SessionStorePort => ({
+const fakeStore = (
+  events: readonly StoredEvent[],
+  authorizePublicStoredEvent: SessionStorePort["authorizePublicStoredEvent"] = async () => ({ kind: "authorized" as const }),
+): SessionStorePort => ({
   readEvents: async ({ runId, afterSequence = 0, limit }: ReadEventsInput) => {
     const eligible = events.filter((event) => event.runId === runId && event.sequence > afterSequence);
     const page = eligible.slice(0, limit);
     return { events: page, nextSequence: eligible.length > page.length ? page.at(-1)?.sequence ?? null : null };
   },
+  authorizePublicStoredEvent,
 } as unknown as SessionStorePort);
 
 const startServer = async (
   store: SessionStorePort,
   resolveSessionId: () => Promise<string | null> = async () => "session-1",
 ) => {
-  const server = createMelioraServer({ store, resolveSessionId, pollIntervalMs: 10 });
+  const server = createMelioraServer({ store, resolveSessionId, resolveLocalPrincipalId: async () => "local-user", pollIntervalMs: 10 });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -121,6 +125,28 @@ test("unknown public events are quarantined so a later terminal event remains re
     const body = response.body;
     assert.match(body, /id: 3\nevent: run_completed/u);
     assert.doesNotMatch(body, /invented_public_kind|event-2/u);
+  } finally { await app.close(); }
+});
+
+test("unbound artifact events cannot emit or anchor SSE, while a later terminal remains reachable", async () => {
+  const unbound = {
+    ...storedEvent(1, "tool_result_presented"),
+    payload: {
+      invocationId: "invocation-1", status: "succeeded", summary: "safe-looking but unbound",
+      artifactRefs: [{ artifactId: "receipt-backed-alias-reused-by-attacker", visibility: "public" }],
+    },
+  } as StoredEvent;
+  const fixture = [unbound, storedEvent(2, "run_completed")];
+  const store = fakeStore(fixture, async ({ event }) =>
+    event.eventId === unbound.eventId ? { kind: "rejected" as const } : { kind: "authorized" as const });
+  const app = await startServer(store);
+  try {
+    const rejected = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": "1" });
+    assert.equal(rejected.statusCode, 409, "an unbound event must never become a resume anchor");
+    const response = await rawGet(app.url, "/api/runs/run-1/events");
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /id: 2\nevent: run_completed/u);
+    assert.doesNotMatch(response.body, /receipt-backed-alias-reused-by-attacker|id: 1/u);
   } finally { await app.close(); }
 });
 

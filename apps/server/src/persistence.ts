@@ -6,7 +6,7 @@ export const createLocalSessionStore = (databasePath: string): SqliteSessionStor
   new SqliteSessionStore(databasePath);
 
 export type LocalMelioraServerOptions =
-  Omit<MelioraServerOptions, "store" | "resolveSessionId" | "submitTurnCommand">
+  Omit<MelioraServerOptions, "store" | "resolveSessionId" | "resolveLocalPrincipalId" | "submitTurnCommand">
   & Readonly<{ turnCommands?: Omit<TurnCommandSubmitterOptions, "store"> }>;
 
 export const createLocalMelioraServer = (
@@ -20,9 +20,10 @@ export const createLocalMelioraServer = (
     : undefined;
   const server = createMelioraServer({
     ...serverOptions,
-    submitTurnCommand,
-    store,
-    resolveSessionId: (runId) => store.readRunSessionId(runId),
+      submitTurnCommand,
+      store,
+      resolveSessionId: (runId) => store.readRunSessionId(runId),
+      resolveLocalPrincipalId: () => "local-user",
   });
   return { server, store } as const;
 };

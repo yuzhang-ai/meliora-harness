@@ -143,7 +143,9 @@ Public SSE 只读取 `visibility=public` 的投影事件。Private 事件可用�
 
 WP-3B.2b.1 只增加 Store-owned staged public tool-result provenance：首次 stage 只接受 active Attempt、有效 lease 与 `executing` reservation，并在同一 adapter critical section / SQLite `BEGIN IMMEDIATE` 中生成 opaque staging alias、private physical `text/plain` derivative、Store clock `createdAt` 和 immutable provenance。provenance 固定 `(run, session, origin attempt, origin invocation, reservation, slot=tool_result, hash, media type, byte length)`；同一 origin slot 只能有一个 alias，physical artifact 也只能绑定一个 alias。调用方不能指定 alias、physical ID 或 createdAt；exact replay 即使 lease 已失效也只能在完整 readback 后复用原 manifest，任何 identity/content/hash/media/reservation drift 都 fail closed。
 
-该 staged resolve 的输入仅为 `(runId, sessionId, alias)`，它在 Store 内复核 Run/Session、origin Attempt/Invocation/Reservation、artifact visibility/media/hash/bytes 与 provenance 绑定，并只返回 safe staging manifest，不返回 bytes、physical ID、principal 或 private source ID。同一 Run 的后续 Attempt 可以使用已验证的历史 alias。旧 public ref 不回填；尚无 provenance 的旧 ref 留给后续 Server gate quarantine。B2b.1 不创建 HTTP route、SSE emission、snapshot 或 public-read authorization，也不改变 Runtime/public event 当前 Artifact ID 语义；matching durable Receipt、principal 对外授权及 alias 切换留给 B2b.2。
+该 staged resolve 的输入仅为 `(runId, sessionId, alias)`，它在 Store 内复核 Run/Session、origin Attempt/Invocation/Reservation、artifact visibility/media/hash/bytes 与 provenance 绑定，并只返回 safe staging manifest，不返回 bytes、physical ID、principal 或 private source ID。同一 Run 的后续 Attempt 可以使用已验证的历史 alias。旧 public ref 不回填；尚无 provenance 的旧 ref 留给后续 Server gate quarantine。
+
+WP-3B.2b.2 将 alias 切换到唯一允许公开的原子边界：`commitReceiptWithPublicEvents` 在一个 adapter critical section / SQLite transaction 内校验 active lease、`executing` reservation、canonical invocation 与 Receipt 的 tool/version/arguments/catalog/run/attempt 全匹配，再由 Store 自己生成 canonical `tool_result_presented` 和可选 `verification_updated`。成功公开验证只能是 `verificationArtifactIds=[]` 或恰为 `[outputArtifactId]`；failed/cancelled 的明确 Host 结果也生成安全 summary alias，但不生成 verification event。Receipt、reservation/invocation terminal status、连续 sequence event batch 和 immutable binding（reservation/receipt/run/attempt、original expected/first/last sequence、canonical events hash）必须全写或全不写。exact replay 只验证并返回既有 binding 的原 StoredEvent，不要求有效 lease/当前 sequence，不追加 sequence；legacy Receipt 缺 binding 或任一 identity/hash/sequence 漂移一律不重放 Host/Provider，也不回填。
 
 SQLite WAL 记录整页，stage 写入与既有 private artifact 位于同一 B-tree 页时，新增 WAL frame 可以合法带有相邻 private row 的字节。因此 B2b.1 不声称 raw DB/WAL 不含 private artifact；安全断言仅是 provenance row、stage 新建 derivative row 和 schema 不复制 private source identity/content，且整个 stage transaction 原子回滚。
 
@@ -166,7 +168,7 @@ Last-Event-ID: <public_event_sequence>
 - 心跳不进入业务事件日志。
 - 客户端重复收到事件时按 ID 去重。
 - 终态事件后连接可关闭。
-- Server 发射 SSE 与验证 `Last-Event-ID` 都必须调用共享的 `decodePublicStoredEvent`；只有成功 decode 且实际可发射的 public event 才能成为 client anchor。private、unknown、malformed 或敏感 public 记录只是在 Server 原始扫描中前进的 gap，绝不能作为 anchor，也不得使后续合法 public event 不可达；尤其 malformed terminal 不得提前关闭连接。该 append-only M0 切片不为 retention/同一 read view 新增 Store API，未来若引入保留策略必须另行冻结 cursor 一致性。
+- Server 发射 SSE 与验证 `Last-Event-ID` 都必须调用同一 async `decodePublicStoredEvent + authorizePublicStoredEvent` gate；只有成功 decode、command 的 `(localPrincipalId, sessionId, runId)` scope 匹配且 exact StoredEvent identity 属于 immutable Receipt binding 的 artifact-bearing public event 才能成为 client anchor。`tool_result_presented` 逐项绑定 invocation/status/output alias，`verification_updated` 逐项绑定 Receipt verification alias；任一 ref/binding 不通过即整条 event quarantine，不能删坏 ref 后部分发射。private、unknown、malformed、旧 generic raw ref，及携带 evidenceRefs 的 `plan_updated` 都只是原始扫描中的 gap，绝不能作为 anchor，也不得使后续合法 public terminal 不可达。该 append-only M0 切片不为 retention/同一 read view 新增 Store API，未来若引入保留策略必须另行冻结 cursor 一致性。
 - public snapshot/resume-point 的存储和 projector/SSE 契约尚未在此切片实现；在其冻结前，事件保留不足不得把 private `RunSnapshot` 当作 public payload 或构造 escape hatch。
 - 页面刷新只做 read，不创建新 Run。
 

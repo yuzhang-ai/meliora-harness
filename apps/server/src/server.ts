@@ -20,6 +20,8 @@ export interface MelioraServerOptions {
   store: SessionStorePort;
   /** Store deliberately has no Run lookup; composition provides this projection dependency. */
   resolveSessionId: (runId: string) => Promise<string | null> | string | null;
+  /** Local M0 principal resolver; non-loopback authentication remains out of scope. */
+  resolveLocalPrincipalId: (runId: string) => Promise<string | null> | string | null;
   submitTurnCommand?: (request: TurnCommandRequest) => Promise<TurnCommandSubmission>;
   maxJsonBodyBytes?: number;
   pollIntervalMs?: number;
@@ -188,16 +190,32 @@ const parseLastSequence = (header: string | undefined): number | null => {
   return Number.isSafeInteger(sequence) ? sequence : null;
 };
 
+const decodeAndAuthorizePublicEvent = async (
+  store: SessionStorePort,
+  localPrincipalId: string,
+  sessionId: string,
+  storedEvent: StoredEvent,
+): Promise<PublicRunEvent | null> => {
+  const decoded = decodePublicStoredEvent(storedEvent, sessionId);
+  if (decoded.kind !== "public") return null;
+  // Plan evidence has no Receipt binding in this narrow slice. Do not invent
+  // generic public-artifact authorization for it.
+  if (decoded.event.kind === "plan_updated" && decoded.event.payload.steps.some((step) => step.evidenceRefs.length > 0)) return null;
+  const authorization = await store.authorizePublicStoredEvent({ localPrincipalId, sessionId, event: storedEvent });
+  return authorization.kind === "authorized" ? decoded.event : null;
+};
+
 const validatePublicCursor = async (
   store: SessionStorePort,
   runId: string,
+  localPrincipalId: string,
   sessionId: string,
   sequence: number,
 ): Promise<boolean> => {
   if (sequence === 0) return true;
   const page = await store.readEvents({ runId, afterSequence: sequence - 1, limit: 1 });
   const event = page.events[0];
-  return event?.sequence === sequence && decodePublicStoredEvent(event, sessionId).kind === "public";
+  return event?.sequence === sequence && await decodeAndAuthorizePublicEvent(store, localPrincipalId, sessionId, event) !== null;
 };
 
 const handleRequest = async (options: MelioraServerOptions, request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -232,11 +250,12 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
     return;
   }
   const sessionId = await options.resolveSessionId(runId);
-  if (sessionId === null) {
+  const localPrincipalId = await options.resolveLocalPrincipalId(runId);
+  if (sessionId === null || localPrincipalId === null) {
     writeJsonError(response, 404, { error: "run_not_found" });
     return;
   }
-  if (!(await validatePublicCursor(options.store, runId, sessionId, lastSequence))) {
+  if (!(await validatePublicCursor(options.store, runId, localPrincipalId, sessionId, lastSequence))) {
     writeJsonError(response, 409, {
       error: "event_cursor_conflict",
       message: "Last-Event-ID is unavailable or is not a public event sequence.",
@@ -270,9 +289,8 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
   const emitEvents = async (events: readonly StoredEvent[]): Promise<void> => {
     for (const storedEvent of events) {
       cursor = storedEvent.sequence;
-      const decoded = decodePublicStoredEvent(storedEvent, sessionId);
-      if (decoded.kind !== "public") continue;
-      const event = decoded.event;
+      const event = await decodeAndAuthorizePublicEvent(options.store, localPrincipalId, sessionId, storedEvent);
+      if (event === null) continue;
       if (!(await writeWithBackpressure(response, encodeSseEvent(event)))) { stop(false); return; }
       if (isTerminalEvent(event)) { stop(true); return; }
     }

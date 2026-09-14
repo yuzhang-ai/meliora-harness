@@ -4,7 +4,8 @@ import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 
 import { MemorySessionStore } from "../memory-session-store.js";
-import type { StagePublicToolResultDerivativeInput, SessionStorePort } from "../contracts.js";
+import type { CommitReceiptWithPublicEventsInput, StagePublicToolResultDerivativeInput, SessionStorePort } from "../contracts.js";
+import type { ToolReceipt } from "../../tool-runtime/contracts.js";
 import { SqliteSessionStore } from "../src/sqlite-session-store.js";
 import { SensitiveDataError } from "../src/errors.js";
 import { hashBytes } from "../src/integrity.js";
@@ -60,6 +61,39 @@ const createReady = async (
     now: setNow,
   };
 };
+
+const receiptFor = (
+  ready: Ready,
+  outputArtifactId: string,
+  options: Readonly<{ status?: "succeeded" | "failed" | "cancelled"; summary?: string; verification?: boolean }> = {},
+): ToolReceipt => ({
+  schemaVersion: "meliora.tool-receipt.v1",
+  receiptId: "receipt-invocation",
+  invocationId: ready.input.invocationId,
+  runId: ready.input.runId,
+  attemptId: ready.input.attemptId,
+  toolName: "read_file",
+  toolVersion: "1",
+  argumentsHash: "arguments-hash",
+  catalogHash: "catalog",
+  decision: "allow",
+  startedAt: timestamp(1),
+  endedAt: timestamp(2),
+  status: options.status ?? "succeeded",
+  effectSummary: options.summary ?? "safe read complete",
+  outputArtifactId,
+  verificationArtifactIds: options.verification === true ? [outputArtifactId] : [],
+  redactions: [],
+});
+
+const atomicInput = (ready: Ready, receipt: ToolReceipt, expectedSequence = 0): CommitReceiptWithPublicEventsInput => ({
+  runId: ready.input.runId,
+  attemptId: ready.input.attemptId,
+  leaseToken: ready.input.leaseToken,
+  reservationId: ready.input.reservationId,
+  receipt,
+  expectedSequence,
+});
 
 const withStores = (name: string, action: (store: Store, ready: Ready, t: TestContext) => Promise<void>) => {
   test(`public artifact provenance parity: ${name}/memory`, async (t) => {
@@ -189,7 +223,127 @@ withStores("staged manifest remains resolvable after its invocation commits a te
     sessionId: ready.input.sessionId,
     artifactId: staged.manifest.artifactId,
   }), { kind: "found", manifest: staged.manifest });
+  assert.equal((await store.authorizePublicArtifactRef({
+    localPrincipalId: "principal", runId: ready.input.runId, sessionId: ready.input.sessionId,
+    artifactId: staged.manifest.artifactId,
+    eventBinding: { kind: "tool_result_presented", invocationId: ready.input.invocationId, status: "succeeded" },
+  })).kind, "rejected", "legacy commitReceipt has no public-event binding and cannot grant alias access");
 });
+
+withStores("atomic Receipt binding authorizes only its exact stored events and exact principal scope", async (store, ready) => {
+  const staged = await store.stagePublicToolResultDerivative(ready.input);
+  assert.equal(staged.kind, "staged");
+  if (staged.kind !== "staged") throw new Error("not_staged");
+  const receipt = receiptFor(ready, staged.manifest.artifactId, { verification: true });
+  const committed = await store.commitReceiptWithPublicEvents(atomicInput(ready, receipt));
+  assert.equal(committed.kind, "committed");
+  if (committed.kind !== "committed") throw new Error("not_committed");
+  assert.equal(committed.events.length, 2);
+  assert.equal((await store.authorizePublicArtifactRef({
+    localPrincipalId: "principal", runId: ready.input.runId, sessionId: ready.input.sessionId, artifactId: staged.manifest.artifactId,
+    eventBinding: { kind: "tool_result_presented", invocationId: ready.input.invocationId, status: "succeeded" },
+  })).kind, "authorized");
+  assert.equal((await store.authorizePublicArtifactRef({
+    localPrincipalId: "principal", runId: ready.input.runId, sessionId: ready.input.sessionId, artifactId: staged.manifest.artifactId,
+    eventBinding: { kind: "tool_result_presented", invocationId: ready.input.invocationId, status: "failed" },
+  })).kind, "rejected");
+  assert.equal((await store.authorizePublicArtifactRef({
+    localPrincipalId: "other-principal", runId: ready.input.runId, sessionId: ready.input.sessionId, artifactId: staged.manifest.artifactId,
+    eventBinding: { kind: "tool_result_presented", invocationId: ready.input.invocationId, status: "succeeded" },
+  })).kind, "rejected");
+  assert.equal((await store.authorizePublicArtifactRef({
+    localPrincipalId: "principal", runId: ready.input.runId, sessionId: "other-session", artifactId: staged.manifest.artifactId,
+    eventBinding: { kind: "tool_result_presented", invocationId: ready.input.invocationId, status: "succeeded" },
+  })).kind, "rejected");
+  for (const event of committed.events) {
+    assert.equal((await store.authorizePublicStoredEvent({ localPrincipalId: "principal", sessionId: ready.input.sessionId, event })).kind, "authorized");
+  }
+  const forged = { ...committed.events[0]!, eventId: "attacker-appended-event", sequence: 99 };
+  assert.equal((await store.authorizePublicStoredEvent({ localPrincipalId: "principal", sessionId: ready.input.sessionId, event: forged })).kind, "rejected");
+  assert.equal((await store.authorizePublicStoredEvent({ localPrincipalId: "other-principal", sessionId: ready.input.sessionId, event: committed.events[0]! })).kind, "rejected");
+  assert.equal((await store.authorizePublicStoredEvent({ localPrincipalId: "principal", sessionId: "other-session", event: committed.events[0]! })).kind, "rejected");
+  const replay = await store.commitReceiptWithPublicEvents({ ...atomicInput(ready, receipt), leaseToken: "expired-or-foreign", expectedSequence: 999 });
+  assert.equal(replay.kind, "replay");
+  if (replay.kind === "replay") assert.deepEqual(replay.events, committed.events);
+  const events = await store.readEvents({ runId: ready.input.runId, afterSequence: 0, limit: 10 });
+  assert.deepEqual(events.events, committed.events, "replay must not append another public pair");
+});
+
+withStores("sensitive Receipt summary rejects before atomic writes and preserves sequence", async (store, ready) => {
+  const staged = await store.stagePublicToolResultDerivative(ready.input);
+  assert.equal(staged.kind, "staged");
+  if (staged.kind !== "staged") throw new Error("not_staged");
+  const unsafe = receiptFor(ready, staged.manifest.artifactId, { summary: "Bearer deliberately-not-persisted" });
+  await assert.rejects(store.commitReceiptWithPublicEvents(atomicInput(ready, unsafe)), SensitiveDataError);
+  assert.equal(await store.readReceipt({ runId: ready.input.runId, attemptId: ready.input.attemptId, receiptId: unsafe.receiptId }), null);
+  assert.deepEqual((await store.readEvents({ runId: ready.input.runId, afterSequence: 0, limit: 10 })).events, []);
+  const safe = receiptFor(ready, staged.manifest.artifactId);
+  assert.equal((await store.commitReceiptWithPublicEvents(atomicInput(ready, safe))).kind, "committed");
+});
+
+test("memory atomic Receipt/event writes roll back after every injected middle write", async () => {
+  let current = timestamp(2);
+  let injected = false;
+  const store = new MemorySessionStore({
+    clock: () => new Date(current),
+    onReceiptPublicEventWrite: (stage) => { if (stage === "binding" && !injected) { injected = true; throw new Error("injected_binding_failure"); } },
+  });
+  const ready = await createReady(store, (value) => { current = value; });
+  const staged = await store.stagePublicToolResultDerivative(ready.input);
+  assert.equal(staged.kind, "staged");
+  if (staged.kind !== "staged") throw new Error("not_staged");
+  const receipt = receiptFor(ready, staged.manifest.artifactId);
+  await assert.rejects(store.commitReceiptWithPublicEvents(atomicInput(ready, receipt)), /injected_binding_failure/u);
+  assert.equal(await store.readReceipt({ runId: "run", attemptId: "attempt", receiptId: receipt.receiptId }), null);
+  assert.deepEqual((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events, []);
+  assert.equal((await store.commitReceiptWithPublicEvents(atomicInput(ready, receipt))).kind, "committed");
+});
+
+test("sqlite atomic Receipt/event transaction rolls back an injected event write", async (t) => {
+  let current = timestamp(2);
+  const store = new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(current) });
+  try {
+    const ready = await createReady(store, (value) => { current = value; });
+    const staged = await store.stagePublicToolResultDerivative(ready.input);
+    assert.equal(staged.kind, "staged");
+    if (staged.kind !== "staged") throw new Error("not_staged");
+    const receipt = receiptFor(ready, staged.manifest.artifactId);
+    const db = (store as unknown as { db: Database.Database }).db;
+    db.exec("CREATE TRIGGER reject_receipt_public_event BEFORE INSERT ON events WHEN NEW.kind='tool_result_presented' BEGIN SELECT RAISE(ABORT, 'injected_event_failure'); END");
+    await assert.rejects(store.commitReceiptWithPublicEvents(atomicInput(ready, receipt)), /injected_event_failure/u);
+    assert.equal(db.prepare("SELECT count(*) FROM receipts").pluck().get(), 0);
+    assert.equal(db.prepare("SELECT count(*) FROM events").pluck().get(), 0);
+    assert.equal(db.prepare("SELECT count(*) FROM receipt_public_event_bindings").pluck().get(), 0);
+    db.exec("DROP TRIGGER reject_receipt_public_event");
+    assert.equal((await store.commitReceiptWithPublicEvents(atomicInput(ready, receipt))).kind, "committed");
+  } finally { store.close(); }
+});
+
+for (const adapter of ["memory", "sqlite"] as const) {
+  test(`${adapter} Receipt recovery proof rejects a missing or drifted stored event batch`, async (t) => {
+    let current = timestamp(2);
+    const store: Store = adapter === "memory"
+      ? new MemorySessionStore({ clock: () => new Date(current) })
+      : new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(current) });
+    try {
+      const ready = await createReady(store, (value) => { current = value; });
+      const staged = await store.stagePublicToolResultDerivative(ready.input);
+      assert.equal(staged.kind, "staged");
+      if (staged.kind !== "staged") throw new Error("not_staged");
+      const receipt = receiptFor(ready, staged.manifest.artifactId);
+      assert.equal((await store.commitReceiptWithPublicEvents(atomicInput(ready, receipt))).kind, "committed");
+      assert.equal((await store.readReceiptPublicEventBinding({ runId: "run", attemptId: "attempt", receiptId: receipt.receiptId })).kind, "found");
+      if (adapter === "memory") {
+        const raw = store as unknown as { events: Map<string, unknown[]> };
+        raw.events.set("run", []);
+      } else {
+        const db = (store as unknown as { db: Database.Database }).db;
+        db.prepare("DELETE FROM events WHERE run_id=?").run("run");
+      }
+      assert.equal((await store.readReceiptPublicEventBinding({ runId: "run", attemptId: "attempt", receiptId: receipt.receiptId })).kind, "missing");
+    } finally { store.close?.(); }
+  });
+}
 
 for (const adapter of ["memory", "sqlite"] as const) {
   test(`${adapter} staged provenance tamper fails closed without exposing bytes or physical identity`, async (t) => {
@@ -385,8 +539,9 @@ test("sqlite v3 public artifacts are not backfilled into staged provenance", asy
   });
   initial.close();
   const downgrade = new Database(path);
+  downgrade.exec("DROP TABLE receipt_public_event_bindings");
   downgrade.exec("DROP TABLE staged_public_artifact_provenance");
-  downgrade.prepare("DELETE FROM schema_migrations WHERE version=4").run();
+  downgrade.prepare("DELETE FROM schema_migrations WHERE version>=4").run();
   downgrade.pragma("user_version = 3");
   downgrade.close();
 

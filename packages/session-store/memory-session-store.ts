@@ -7,6 +7,8 @@ import type {
   BeginInvocationExecutionResult,
   CommitReceiptInput,
   CommitReceiptResult,
+  CommitReceiptWithPublicEventsInput,
+  CommitReceiptWithPublicEventsResult,
   CommitTerminalModelStepResultAndSnapshotInput,
   CommitTerminalModelStepResultAndSnapshotResult,
   FinishModelStepInput,
@@ -31,6 +33,8 @@ import type {
   ReadInvocationInput,
   ReadInvocationByIdempotencyKeyInput,
   ReadReceiptInput,
+  ReadReceiptPublicEventBindingInput,
+  ReadReceiptPublicEventBindingResult,
   ReadReservationInput,
   RecoveryBundle,
   RecoveryBundleInput,
@@ -66,10 +70,15 @@ import type {
   ResolveStagedPublicArtifactInput,
   ResolveStagedPublicArtifactResult,
   StagedPublicArtifactManifest,
+  AuthorizePublicArtifactRefInput,
+  AuthorizePublicArtifactRefResult,
+  AuthorizePublicStoredEventInput,
+  AuthorizePublicStoredEventResult,
 } from "./contracts";
 import { randomUUID } from "node:crypto";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
+import type { JsonValue } from "../model-protocol/contracts";
 import {
   assertValidCommandTimestamp,
   assertValidGeneratedId,
@@ -96,6 +105,8 @@ type MemorySessionStoreOptions = Readonly<{
   nextPublicArtifactPhysicalNonce?: () => string;
   /** Test-only adapter hook; validates atomic rollback without changing the Port. */
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
+  /** Test-only adapter hook; validates Receipt/event all-or-nothing writes. */
+  onReceiptPublicEventWrite?: (stage: "receipt" | "event" | "binding" | "invocation" | "attempt") => void;
 }>;
 
 type StagedPublicArtifactProvenance = Readonly<{
@@ -106,6 +117,11 @@ type StagedPublicArtifactProvenance = Readonly<{
   originAttemptId: string;
   originInvocationId: string;
   reservationId: string;
+}>;
+type ReceiptPublicEventBinding = Readonly<{
+  receiptId: string;
+  expectedSequence: number;
+  events: readonly StoredEvent[];
 }>;
 
 const attemptKey = (runId: string, attemptId: string) => `${runId}\u0000${attemptId}`;
@@ -156,6 +172,7 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly reservationByRunIdempotencyKey = new Map<string, string>();
   private readonly receipts = new Map<string, ToolReceipt>();
   private readonly receiptByReservation = new Map<string, string>();
+  private readonly receiptPublicEventBindings = new Map<string, ReceiptPublicEventBinding>();
   private readonly artifacts = new Map<string, Artifact>();
   private readonly stagedPublicArtifacts = new Map<string, StagedPublicArtifactProvenance>();
   private readonly stagedPublicArtifactAliasByOrigin = new Map<string, string>();
@@ -169,6 +186,7 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly nextReservationId: () => string;
   private readonly nextPublicArtifactAliasNonce: () => string;
   private readonly nextPublicArtifactPhysicalNonce: () => string;
+  private readonly onReceiptPublicEventWrite?: MemorySessionStoreOptions["onReceiptPublicEventWrite"];
   private readonly onAtomicTerminalWrite?: MemorySessionStoreOptions["onAtomicTerminalWrite"];
 
   constructor(options: MemorySessionStoreOptions = {}) {
@@ -177,6 +195,7 @@ export class MemorySessionStore implements SessionStorePort {
     this.nextReservationId = options.nextReservationId ?? (() => `reservation-${++this.reservationSequence}`);
     this.nextPublicArtifactAliasNonce = options.nextPublicArtifactAliasNonce ?? (() => randomUUID());
     this.nextPublicArtifactPhysicalNonce = options.nextPublicArtifactPhysicalNonce ?? (() => randomUUID());
+    this.onReceiptPublicEventWrite = options.onReceiptPublicEventWrite;
     this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
   }
 
@@ -1026,8 +1045,107 @@ export class MemorySessionStore implements SessionStorePort {
     return { kind: "committed", receiptId: input.receipt.receiptId };
   }
 
+  async commitReceiptWithPublicEvents(
+    input: CommitReceiptWithPublicEventsInput,
+  ): Promise<CommitReceiptWithPublicEventsResult> {
+    assertPersistableJson(JSON.parse(JSON.stringify(input.receipt)) as JsonValue, "receipt");
+    const reservation = this.reservations.get(input.reservationId);
+    const existingReceiptId = this.receiptByReservation.get(input.reservationId);
+    if (existingReceiptId) {
+      const existing = this.receipts.get(receiptKey(input.runId, input.attemptId, existingReceiptId));
+      const binding = this.receiptPublicEventBindings.get(input.reservationId);
+      if (!existing || !binding || !sameDocument(existing, input.receipt)
+        || !this.isValidReceiptPublicEvents(existing, binding.events)) {
+        return { kind: "conflict", code: "receipt_public_event_conflict" };
+      }
+      return { kind: "replay", receiptId: existingReceiptId, events: deepCopy(binding.events) };
+    }
+    if (!reservation || reservation.runId !== input.runId || reservation.attemptId !== input.attemptId
+      || reservation.invocationId !== input.receipt.invocationId) return { kind: "conflict", code: "invocation_reservation_conflict" };
+    const invocation = this.invocations.get(invocationKey(input.runId, input.attemptId, reservation.invocationId));
+    if (!invocation || !this.receiptMatchesInvocation(input.receipt, invocation)) return { kind: "conflict", code: "receipt_conflict" };
+    if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    if (reservation.status !== "executing" || reservation.executionStartedAt === undefined || invocation.status !== "executing") return { kind: "conflict", code: "invocation_execution_conflict" };
+    const current = this.attemptForRun(input.runId, input.attemptId)?.lastEventSequence;
+    if (current !== input.expectedSequence) return { kind: "conflict", code: "event_sequence_conflict", currentSequence: current };
+    if (!input.receipt.outputArtifactId || input.receipt.verificationArtifactIds.some((id) => id !== input.receipt.outputArtifactId)
+      || (input.receipt.verificationArtifactIds.length > 0 && input.receipt.status !== "succeeded")) return { kind: "conflict", code: "receipt_public_event_conflict" };
+    const createdAt = this.clock().toISOString();
+    const events: StoredEvent[] = [{
+      schemaVersion: "meliora.session-event.v1", eventId: `event-${randomUUID()}`,
+      runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + 1,
+      kind: "tool_result_presented", visibility: "public", createdAt, causationId: input.receipt.receiptId,
+      payload: { invocationId: input.receipt.invocationId, status: input.receipt.status, summary: input.receipt.effectSummary,
+        artifactRefs: [{ artifactId: input.receipt.outputArtifactId, visibility: "public" }] },
+    }];
+    if (input.receipt.verificationArtifactIds.length > 0) events.push({
+      schemaVersion: "meliora.session-event.v1", eventId: `event-${randomUUID()}`,
+      runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + 2,
+      kind: "verification_updated", visibility: "public", createdAt, causationId: input.receipt.receiptId,
+      payload: { verificationId: `verification:${input.receipt.receiptId}`, status: "passed",
+        evidenceRefs: input.receipt.verificationArtifactIds.map((artifactId) => ({ artifactId, visibility: "public" })) },
+    });
+    if (!this.isValidReceiptPublicEvents(input.receipt, events)) return { kind: "conflict", code: "receipt_public_event_conflict" };
+    // The in-memory adapter models the SQLite transaction by restoring every
+    // affected durable map when a test hook (or an unexpected write) throws.
+    const receipts = deepCopy([...this.receipts]);
+    const receiptByReservation = deepCopy([...this.receiptByReservation]);
+    const bindings = deepCopy([...this.receiptPublicEventBindings]);
+    const invocations = deepCopy([...this.invocations]);
+    const reservations = deepCopy([...this.reservations]);
+    const runEvents = deepCopy(this.events.get(input.runId) ?? []);
+    const attempt = deepCopy(this.attemptForRun(input.runId, input.attemptId)!);
+    try {
+      this.receipts.set(receiptKey(input.runId, input.attemptId, input.receipt.receiptId), deepCopy(input.receipt));
+      this.onReceiptPublicEventWrite?.("receipt");
+      this.receiptByReservation.set(input.reservationId, input.receipt.receiptId);
+      this.events.set(input.runId, [...runEvents, ...deepCopy(events)]);
+      this.onReceiptPublicEventWrite?.("event");
+      this.receiptPublicEventBindings.set(input.reservationId, { receiptId: input.receipt.receiptId, expectedSequence: input.expectedSequence, events: deepCopy(events) });
+      this.onReceiptPublicEventWrite?.("binding");
+      this.invocations.set(invocationKey(input.runId, input.attemptId, invocation.invocationId), { ...invocation, status: input.receipt.status });
+      this.onReceiptPublicEventWrite?.("invocation");
+      this.reservations.set(input.reservationId, { ...reservation, status: input.receipt.status });
+      this.attempts.set(attemptKey(input.runId, input.attemptId), { ...attempt, lastEventSequence: input.expectedSequence + events.length });
+      this.onReceiptPublicEventWrite?.("attempt");
+    } catch (error) {
+      this.receipts.clear(); for (const [key, value] of receipts) this.receipts.set(key, value);
+      this.receiptByReservation.clear(); for (const [key, value] of receiptByReservation) this.receiptByReservation.set(key, value);
+      this.receiptPublicEventBindings.clear(); for (const [key, value] of bindings) this.receiptPublicEventBindings.set(key, value);
+      this.invocations.clear(); for (const [key, value] of invocations) this.invocations.set(key, value);
+      this.reservations.clear(); for (const [key, value] of reservations) this.reservations.set(key, value);
+      this.events.set(input.runId, runEvents);
+      this.attempts.set(attemptKey(input.runId, input.attemptId), attempt);
+      throw error;
+    }
+    return { kind: "committed", receiptId: input.receipt.receiptId, events: deepCopy(events) };
+  }
+
   async readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null> {
     return this.receipts.get(receiptKey(input.runId, input.attemptId, input.receiptId)) ?? null;
+  }
+
+  async readReceiptPublicEventBinding(
+    input: ReadReceiptPublicEventBindingInput,
+  ): Promise<ReadReceiptPublicEventBindingResult> {
+    const receipt = this.receipts.get(receiptKey(input.runId, input.attemptId, input.receiptId));
+    const found = [...this.receiptPublicEventBindings.entries()].find(([reservationId, binding]) => {
+      const reservation = this.reservations.get(reservationId);
+      return binding.receiptId === input.receiptId && reservation?.runId === input.runId
+        && reservation.attemptId === input.attemptId;
+    });
+    if (!receipt || !found || found[1].expectedSequence < 0
+      || !found[1].events.every((event, index) => event.runId === input.runId && event.attemptId === input.attemptId
+        && event.sequence === found[1].expectedSequence + index + 1)
+      || !this.isValidReceiptPublicEvents(receipt, found[1].events)) return { kind: "missing" };
+    const actual = (this.events.get(input.runId) ?? []).filter((event) =>
+      event.attemptId === input.attemptId && event.sequence > found[1].expectedSequence
+        && event.sequence <= found[1].expectedSequence + found[1].events.length,
+    );
+    if (actual.length !== found[1].events.length || !sameDocument(actual, found[1].events)) return { kind: "missing" };
+    return { kind: "found", events: deepCopy(found[1].events) };
   }
 
   async stagePublicToolResultDerivative(
@@ -1103,6 +1221,65 @@ export class MemorySessionStore implements SessionStorePort {
     if (!provenance || provenance.runId !== input.runId || provenance.sessionId !== input.sessionId
       || !this.isValidStagedPublicArtifact(provenance)) return { kind: "not_found" };
     return { kind: "found", manifest: deepCopy(provenance.manifest) };
+  }
+
+  async authorizePublicArtifactRef(
+    input: AuthorizePublicArtifactRefInput,
+  ): Promise<AuthorizePublicArtifactRefResult> {
+    const provenance = this.stagedPublicArtifacts.get(input.artifactId);
+    if (!provenance || provenance.runId !== input.runId || provenance.sessionId !== input.sessionId
+      || !this.isValidStagedPublicArtifact(provenance)) return { kind: "rejected" };
+    const commandKey = this.commandScopeByRunId.get(input.runId);
+    const command = commandKey ? this.commands.get(commandKey) : undefined;
+    if (!command || command.localPrincipalId !== input.localPrincipalId
+      || command.sessionId !== input.sessionId || command.runId !== input.runId) return { kind: "rejected" };
+    const receiptId = this.receiptByReservation.get(provenance.reservationId);
+    const receipt = receiptId
+      ? this.receipts.get(receiptKey(input.runId, provenance.originAttemptId, receiptId))
+      : undefined;
+    const invocation = this.invocations.get(invocationKey(input.runId, provenance.originAttemptId, provenance.originInvocationId));
+    if (!receipt || receipt.runId !== input.runId || receipt.attemptId !== provenance.originAttemptId
+      || receipt.invocationId !== provenance.originInvocationId
+      || receipt.outputArtifactId !== input.artifactId || !invocation
+      || !this.receiptMatchesInvocation(receipt, invocation)) return { kind: "rejected" };
+    const binding = this.receiptPublicEventBindings.get(provenance.reservationId);
+    if (!binding || binding.receiptId !== receipt.receiptId
+      || !binding.events.every((event, index) => event.runId === input.runId && event.attemptId === receipt.attemptId
+        && event.sequence === binding.expectedSequence + index + 1)
+      || !this.isValidReceiptPublicEvents(receipt, binding.events)) return { kind: "rejected" };
+    if (input.eventBinding.kind === "tool_result_presented"
+      && (input.eventBinding.invocationId !== provenance.originInvocationId
+        || input.eventBinding.status !== receipt.status)) return { kind: "rejected" };
+    if (input.eventBinding.kind === "verification_updated"
+      && !receipt.verificationArtifactIds.includes(input.artifactId)) return { kind: "rejected" };
+    return { kind: "authorized", manifest: deepCopy(provenance.manifest) };
+  }
+
+  async authorizePublicStoredEvent(
+    input: AuthorizePublicStoredEventInput,
+  ): Promise<AuthorizePublicStoredEventResult> {
+    const commandKey = this.commandScopeByRunId.get(input.event.runId);
+    const command = commandKey ? this.commands.get(commandKey) : undefined;
+    if (!command || command.localPrincipalId !== input.localPrincipalId
+      || command.sessionId !== input.sessionId) return { kind: "rejected" };
+    if (input.event.kind !== "tool_result_presented" && input.event.kind !== "verification_updated") {
+      return { kind: "authorized" };
+    }
+    const binding = [...this.receiptPublicEventBindings.entries()].find(([, candidate]) =>
+      candidate.events.some((event) => sameDocument(event, input.event)));
+    if (!binding) return { kind: "rejected" };
+    const reservation = this.reservations.get(binding[0]);
+    const receipt = reservation ? this.receipts.get(receiptKey(input.event.runId, reservation.attemptId, binding[1].receiptId)) : undefined;
+    const invocation = reservation ? this.invocations.get(invocationKey(input.event.runId, reservation.attemptId, reservation.invocationId)) : undefined;
+    if (!reservation || !receipt || !invocation || binding[1].receiptId !== receipt.receiptId
+      || reservation.runId !== input.event.runId || reservation.attemptId !== input.event.attemptId
+      || !binding[1].events.every((event, index) => event.runId === input.event.runId && event.attemptId === input.event.attemptId
+        && event.sequence === binding[1].expectedSequence + index + 1)
+      || !this.receiptMatchesInvocation(receipt, invocation)
+      || !this.isValidReceiptPublicEvents(receipt, binding[1].events)) {
+      return { kind: "rejected" };
+    }
+    return { kind: "authorized" };
   }
 
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
@@ -1223,6 +1400,29 @@ export class MemorySessionStore implements SessionStorePort {
       && hashBytes(artifact.content) === artifact.contentHash
       && provenance.manifest.visibility === "public" && provenance.manifest.projectionKind === "tool_result"
       && provenance.manifest.mediaType === artifact.mediaType;
+  }
+
+  private isValidReceiptPublicEvents(receipt: ToolReceipt, events: readonly StoredEvent[]): boolean {
+    if (!receipt.outputArtifactId || receipt.verificationArtifactIds.some((id) => id !== receipt.outputArtifactId)
+      || (receipt.verificationArtifactIds.length > 0 && receipt.status !== "succeeded")) return false;
+    if (events.length !== (receipt.verificationArtifactIds.length > 0 ? 2 : 1)) return false;
+    const tool = events[0];
+    if (!tool || tool.visibility !== "public" || tool.kind !== "tool_result_presented" || !this.receiptAliasAuthorized(receipt)) return false;
+    const payload = tool.payload as Record<string, unknown>;
+    if (payload.invocationId !== receipt.invocationId || payload.status !== receipt.status || payload.summary !== receipt.effectSummary
+      || !sameDocument(payload.artifactRefs, [{ artifactId: receipt.outputArtifactId, visibility: "public" }])) return false;
+    if (receipt.verificationArtifactIds.length === 0) return true;
+    const verification = events[1]; const verificationPayload = verification?.payload as Record<string, unknown>;
+    return !!verification && verification.visibility === "public" && verification.kind === "verification_updated"
+      && verificationPayload.status === "passed"
+      && sameDocument(verificationPayload.evidenceRefs, receipt.verificationArtifactIds.map((artifactId) => ({ artifactId, visibility: "public" })));
+  }
+
+  private receiptAliasAuthorized(receipt: ToolReceipt): boolean {
+    if (!receipt.outputArtifactId) return false;
+    const provenance = this.stagedPublicArtifacts.get(receipt.outputArtifactId);
+    return !!provenance && this.isValidStagedPublicArtifact(provenance)
+      && provenance.originInvocationId === receipt.invocationId && provenance.originAttemptId === receipt.attemptId;
   }
 
   private receiptMatchesInvocation(receipt: ToolReceipt, invocation: NormalizedToolInvocation): boolean {

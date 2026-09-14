@@ -113,7 +113,7 @@ WP-3B.2a 的共享 `decodePublicStoredEvent`（从 `packages/agent-runtime` 正�
 
 三者禁止共用一个未经处理的 payload。
 
-公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`；B2b.1 不修改该既有公开 shape 的 `artifactId` 语义，也不切换 Runtime 或 public event。只有 B2b.1 的 Store-only `StagedPublicArtifactManifest.artifactId` 是 Store 生成的 opaque staging alias，绝不是内部物理 Artifact ID；它既不返回 bytes/physical ID，也不授权 SSE、HTTP 或 UI 读取。Runtime/public event 的 alias 切换以及 matching durable Receipt 与 principal 的对外 gate 均由后续 B2b.2 单独冻结。WP-3 的 private recovery snapshot 不是 public resume snapshot；public snapshot/resume-point 会在单独的 projector/SSE 契约中冻结，不能用 private artifact ref 旁路本层边界。
+公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`。B2b.2 中的 `artifactId` 是 Store 生成的 opaque staged alias，绝不是内部物理 Artifact ID；它只能由 matching durable Receipt 的原子 Store-owned event batch 引用，且 public `tool_result_presented` 必须精确匹配 invocation/status/output alias，`verification_updated` 的 evidence alias 必须在该 Receipt 的 verificationArtifactIds。SSE 与 cursor 以 exact StoredEvent binding、Run/Session/local principal scope 为最终 gate；alias 单独存在、旧 generic raw ref、复制 alias 的另一 event 或非空 evidenceRefs 的 `plan_updated` 均不得公开或成为 anchor。该 alias 不返回 bytes/physical ID，也不新增 HTTP/UI artifact read。WP-3 的 private recovery snapshot 不是 public resume snapshot；public snapshot/resume-point 会在单独的 projector/SSE 契约中冻结，不能用 private artifact ref 旁路本层边界。
 
 ## 7. Outcome Contract
 

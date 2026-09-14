@@ -417,6 +417,13 @@ class PersistentReceiptReplayStore extends MemorySessionStore {
       invocationId: "invocation-deepseek-0-0",
     });
     if (!reservation) return { kind: "conflict" as const, code: "invocation_execution_conflict" as const };
+    const content = new TextEncoder().encode("durable replay proof");
+    const staged = await super.stagePublicToolResultDerivative({
+      runId: reservation.runId, sessionId: "session-durable-replay", attemptId: reservation.attemptId,
+      leaseToken: input[0].leaseToken, reservationId: reservation.reservationId, invocationId: reservation.invocationId,
+      content, contentHash: createHash("sha256").update(content).digest("hex"), mediaType: "text/plain",
+    });
+    if (staged.kind === "conflict") throw new Error("fixture_durable_stage_failed");
     const receipt: ToolReceipt = {
       schemaVersion: "meliora.tool-receipt.v1",
       receiptId: "durable-replay-receipt",
@@ -432,15 +439,18 @@ class PersistentReceiptReplayStore extends MemorySessionStore {
       endedAt: fixedNow,
       status: "succeeded",
       effectSummary: "durable replay proof",
-      verificationArtifactIds: ["private-artifact-id"],
+      outputArtifactId: staged.manifest.artifactId,
+      verificationArtifactIds: [staged.manifest.artifactId],
       redactions: [],
     };
-    const committed = await super.commitReceipt({
+    const events = await super.readEvents({ runId: reservation.runId, afterSequence: 0, limit: 100 });
+    const committed = await super.commitReceiptWithPublicEvents({
       runId: reservation.runId,
       attemptId: reservation.attemptId,
       leaseToken: input[0].leaseToken,
       reservationId: reservation.reservationId,
       receipt,
+      expectedSequence: events.events.at(-1)?.sequence ?? 0,
     });
     if (committed.kind !== "committed") throw new Error("fixture_durable_receipt_failed");
     return { kind: "receipt_replay" as const, receiptId: receipt.receiptId };
