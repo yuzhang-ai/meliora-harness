@@ -318,4 +318,40 @@ export const publicRunEventReplays = {
       },
     ],
   },
+  "decoder-coverage": {
+    id: "public.decoder-coverage.v1",
+    scenario: "the remaining frozen public kinds are replayed without inventing a Server projection",
+    createsRun: true,
+    events: [
+      {
+        schemaVersion,
+        eventId: "event-decoder-coverage-001",
+        sessionId: "session-public-decoder-coverage",
+        runId: "run-public-decoder-coverage",
+        sequence: 1,
+        timestamp: "2026-09-10T00:15:00.000Z",
+        visibility: "public",
+        kind: "context_compacted",
+        payload: {
+          checkpointId: "checkpoint-public-decoder-coverage",
+          summary: "已保存可继续执行的公开上下文摘要。",
+        },
+      },
+      {
+        schemaVersion,
+        eventId: "event-decoder-coverage-002",
+        sessionId: "session-public-decoder-coverage",
+        runId: "run-public-decoder-coverage",
+        sequence: 2,
+        timestamp: "2026-09-10T00:15:00.020Z",
+        visibility: "public",
+        kind: "run_blocked",
+        payload: {
+          code: "workspace_selection_required",
+          message: "尚未选择可用工作区，任务暂时无法继续。",
+          userActions: ["选择一个受控工作区后重新提交任务。"],
+        },
+      },
+    ],
+  },
 } satisfies Record<string, PublicRunEventReplay>;

@@ -131,11 +131,11 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；Web 11/11、四档响应式与真实 Chrome 验收、全量 check、CI 和独立复审通过；尚未接入真实 Server/SSE |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`；当前 WP-3B.1b 在隔离分支切换 Runtime 到 atomic terminal commit 与 execution permit，尚未进入 B2/C、public snapshot 或 SSE reset。 |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`；WP-3B.1b 与其后 WP-3B.2a 均在隔离分支施工。B2a 仅冻结 strict public stored-event decoder 与 SSE anchor 边界，不含 public snapshot、SSE reset 或 recovery coordinator。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell 与 WP-3B.1a 已合并到 `main`。当前下一动作是完成 WP-3B.1b Runtime 原子切换与独立审查；之后才按 B2 public resume snapshot、C recovery coordinator 与 SSE reset/restart 推进。B2/C 尚未完成。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell 与 WP-3B.1a 已合并到 `main`。当前隔离施工先完成 WP-3B.1b Runtime 原子切换及 WP-3B.2a strict public event decoder；之后才按独立契约推进 public resume snapshot、C recovery coordinator 与 SSE reset/restart。B2/C 尚未完成。

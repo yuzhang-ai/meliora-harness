@@ -97,7 +97,9 @@ visibility=public
 
 禁止进入公开事件：API Key、Authorization、完整环境变量、私有 reasoning、未脱敏原始日志、隐藏系统提示、超范围文件内容。
 
-M0 尚未冻结独立的 Server-owned assistant summary 或严格 decoder。因此任何 Provider assistant 原文（包括首次 Model Step、用户输入的逐字/片段/编码回显）都只能写入 private model events 与 private model-history artifact，绝不可直接成为 `assistant_text_delta` 的公开 payload。Runtime 可以发不含原文的固定安全提示；工具调用展示、Server-owned 工具结果投影和最终 Run outcome 按各自契约继续公开。未来若要公开助手内容，必须先在本层冻结来源独立、可审计的 summary/decoder 契约，不能复用 Provider raw text。
+M0 尚未冻结独立的 Server-owned assistant summary。因此任何 Provider assistant 原文（包括首次 Model Step、用户输入的逐字/片段/编码回显）都只能写入 private model events 与 private model-history artifact，绝不可直接成为 `assistant_text_delta` 的公开 payload。Runtime 可以发不含原文的固定安全提示；工具调用展示、Server-owned 工具结果投影和最终 Run outcome 按各自契约继续公开。未来若要公开助手内容，必须先在本层冻结来源独立、可审计的 summary 契约，不能复用 Provider raw text。
+
+WP-3B.2a 的共享 `decodePublicStoredEvent`（从 `packages/agent-runtime` 正式导出）是唯一把持久化 `StoredEvent` 加上 Server 已解析的 `sessionId` 还原为 `PublicRunEvent` 的运行时 decoder。它是纯函数，只产生 `public / suppressed / invalid`：private 记录被 suppressed；public 记录必须逐 kind 满足本节已冻结的 envelope、payload exact keys、必填类型、枚举和嵌套 `PublicArtifactRef { artifactId, visibility: "public" }` 形状，并对最终公开 envelope（含 event/run/session identity 与 payload）再次经过敏感值扫描；未知、畸形、或敏感的 public 记录一律 invalid。它不修复、丢字段投影或补造 payload，也不在本切片新增字符串边界、ID 格式、时间精度、数组去重或数量限制。
 
 ## 6. 结果投影
 
