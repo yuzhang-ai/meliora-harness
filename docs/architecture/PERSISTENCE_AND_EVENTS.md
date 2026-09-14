@@ -151,7 +151,7 @@ SQLite 适合单机本地 Runtime，不适合多实例 Serverless 的 `/tmp`。�
 
 ```text
 GET /api/runs/:id/events
-Last-Event-ID: <event_id>
+Last-Event-ID: <public_event_sequence>
 ```
 
 要求：
@@ -160,6 +160,7 @@ Last-Event-ID: <event_id>
 - 心跳不进入业务事件日志。
 - 客户端重复收到事件时按 ID 去重。
 - 终态事件后连接可关闭。
+- Server 发射 SSE 与验证 `Last-Event-ID` 都必须调用共享的 `decodePublicStoredEvent`；只有成功 decode 且实际可发射的 public event 才能成为 client anchor。private、unknown、malformed 或敏感 public 记录只是在 Server 原始扫描中前进的 gap，绝不能作为 anchor，也不得使后续合法 public event 不可达；尤其 malformed terminal 不得提前关闭连接。该 append-only M0 切片不为 retention/同一 read view 新增 Store API，未来若引入保留策略必须另行冻结 cursor 一致性。
 - public snapshot/resume-point 的存储和 projector/SSE 契约尚未在此切片实现；在其冻结前，事件保留不足不得把 private `RunSnapshot` 当作 public payload 或构造 escape hatch。
 - 页面刷新只做 read，不创建新 Run。
 

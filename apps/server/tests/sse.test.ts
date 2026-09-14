@@ -124,13 +124,15 @@ test("unknown public events are quarantined so a later terminal event remains re
   } finally { await app.close(); }
 });
 
-test("private and unavailable sequences cannot be public cursors", async () => {
+test("private, unknown, and malformed sequences cannot be public cursors", async () => {
   const store = fakeStore([
     storedEvent(1, "assistant_text_delta"),
     storedEvent(2, "model.reasoning_delta", "private"),
-    storedEvent(3, "run_completed"),
+    storedEvent(3, "invented_public_kind"),
+    { ...storedEvent(4, "run_completed"), payload: { outcomeId: "missing-summary" } },
+    storedEvent(5, "run_completed"),
   ]);
-  for (const cursor of ["2", "99"]) {
+  for (const cursor of ["2", "3", "4", "99"]) {
     const app = await startServer(store);
     try {
       const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": cursor });
@@ -202,15 +204,14 @@ test("projection rejects private and unknown public event kinds", () => {
   assert.throws(() => projectPublicEvent(storedEvent(1, "invented_public_kind"), "session-1"), TypeError);
 });
 
-test("projection strips payload fields outside the public contract", () => {
+test("projection rejects payload fields outside the public contract", () => {
   const event = storedEvent(1, "assistant_text_delta");
-  const projected = projectPublicEvent({ ...event, payload: { delta: "hello", rawReasoning: "secret" } }, "session-1");
-  assert.deepEqual(projected.payload, { delta: "hello" });
+  assert.throws(() => projectPublicEvent({ ...event, payload: { delta: "hello", rawReasoning: "secret" } }, "session-1"), TypeError);
 });
 
-test("projection removes private artifact references from nested public payloads", () => {
+test("projection rejects private artifact references from nested public payloads", () => {
   const event = storedEvent(1, "tool_result_presented");
-  const projected = projectPublicEvent({ ...event, payload: {
+  assert.throws(() => projectPublicEvent({ ...event, payload: {
     invocationId: "invocation-1",
     status: "succeeded",
     summary: "safe summary",
@@ -218,14 +219,29 @@ test("projection removes private artifact references from nested public payloads
       { artifactId: "artifact-public", visibility: "public" },
       { artifactId: "artifact-private", visibility: "private" },
     ],
-  } }, "session-1");
-  assert.deepEqual(projected.payload, {
-    invocationId: "invocation-1",
-    status: "succeeded",
-    summary: "safe summary",
-    artifactRefs: [{ artifactId: "artifact-public", visibility: "public" }],
-  });
-  assert.equal(JSON.stringify(projected).includes("artifact-private"), false);
+  } }, "session-1"), TypeError);
+});
+
+test("SSE scans across quarantined records and pagination without granting them anchor status", async () => {
+  const fixture = Array.from({ length: 498 }, (_, index) => storedEvent(index + 1, "assistant_text_delta"));
+  fixture.push(
+    storedEvent(499, "model.reasoning_delta", "private"),
+    storedEvent(500, "invented_public_kind"),
+    { ...storedEvent(501, "run_completed"), payload: { outcomeId: "malformed-terminal", marker: "MALFORMED_SECRET" } },
+    storedEvent(502, "run_completed"),
+  );
+  const store = fakeStore(fixture);
+  const app = await startServer(store);
+  try {
+    for (const cursor of ["499", "500", "501"]) {
+      const rejected = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": cursor });
+      assert.equal(rejected.statusCode, 409, `quarantined sequence ${cursor} must not be an anchor`);
+    }
+    const response = await rawGet(app.url, "/api/runs/run-1/events", { "Last-Event-ID": "498" });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.body, /^id: 502$/mu, "the legal terminal after the raw scan gap remains reachable");
+    assert.doesNotMatch(response.body, /id: 499|id: 500|id: 501|invented_public_kind|MALFORMED_SECRET/u);
+  } finally { await app.close(); }
 });
 
 test("SSE framing uses sequence ids and rejects kind line breaks", () => {
