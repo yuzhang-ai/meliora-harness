@@ -26,7 +26,9 @@ export type SessionStoreConflictCode =
   | "command_status_conflict"
   | "model_step_conflict"
   | "model_step_in_progress"
-  | "snapshot_sequence_conflict";
+  | "snapshot_sequence_conflict"
+  | "terminal_model_step_result_conflict"
+  | "invocation_execution_conflict";
 
 export type SessionStoreErrorCode =
   | SessionStoreConflictCode
@@ -564,6 +566,45 @@ export type WriteSnapshotInput = Readonly<{
   leaseToken: string;
 }>;
 
+/**
+ * Fixed, private-only representation of the normalized result of one model
+ * step. Raw model bytes never enter snapshots or recovery DTOs.
+ */
+export const PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE =
+  "application/vnd.meliora.model-step-result+json" as const;
+
+export type CommitTerminalModelStepResultAndSnapshotInput = Readonly<{
+  runId: string;
+  attemptId: string;
+  leaseToken: string;
+  modelStepId: string;
+  requestFingerprint: string;
+  finishedAt: string;
+  normalizedResult: Readonly<{
+    artifactId: string;
+    contentHash: string;
+    content: Uint8Array;
+    /** Safe, structured metadata only; visibility and media type are fixed. */
+    metadata?: JsonValue;
+  }>;
+  snapshot: RunSnapshot;
+  expectedSequence: number;
+}>;
+
+export type CommitTerminalModelStepResultAndSnapshotResult =
+  | Readonly<{ kind: "committed"; checkpoint: StoredModelStepCheckpoint; artifact: PrivateArtifactRef; snapshot: RunSnapshot }>
+  | Readonly<{ kind: "replay"; checkpoint: StoredModelStepCheckpoint; artifact: PrivateArtifactRef; snapshot: RunSnapshot }>
+  | Readonly<{
+      kind: "conflict";
+      code:
+        | "model_step_conflict"
+        | "terminal_model_step_result_conflict"
+        | "snapshot_sequence_conflict"
+        | "run_attempt_conflict"
+        | "lease_not_held"
+        | "lease_expired";
+    }>;
+
 export type InvocationReservationInput = Readonly<{
   invocation: NormalizedToolInvocation;
   leaseToken: string;
@@ -596,7 +637,26 @@ export type StoredInvocationReservation = Readonly<{
   idempotencyKey: string;
   status: NormalizedToolInvocation["status"];
   reservedAt: string;
+  /** Undefined means this is a legacy record whose execution boundary is unknown. */
+  executionStartedAt?: string;
 }>;
+
+/** Dormant in WP-3B.1a: Runtime must not use this execution permit until B1b. */
+export type BeginInvocationExecutionInput = Readonly<{
+  runId: string;
+  attemptId: string;
+  leaseToken: string;
+  reservationId: string;
+}>;
+
+export type BeginInvocationExecutionResult =
+  | Readonly<{ kind: "started"; executionStartedAt: string }>
+  | Readonly<{ kind: "already_executing_or_unknown"; executionStartedAt?: string }>
+  | Readonly<{ kind: "receipt_replay"; receiptId: string }>
+  | Readonly<{
+      kind: "conflict";
+      code: "run_attempt_conflict" | "lease_not_held" | "lease_expired" | "invocation_execution_conflict";
+    }>;
 
 export type ReadInvocationInput = Readonly<{
   runId: string;
@@ -748,6 +808,8 @@ export type RecoveryBundle = Readonly<{
   tailComplete: boolean;
   nextAfterSequence: number | null;
   latestModelStep: StoredModelStepCheckpoint | null;
+  /** Atomic terminal binding when one exists; raw result stays artifact-only. */
+  terminalModelStepResult: TerminalModelStepResultRef | null;
   invocations: readonly InvocationReconciliationRecord[];
 }>;
 
@@ -766,7 +828,11 @@ export interface SessionStorePort extends RecoveryReadPort {
   ): Promise<SettleRunCommandWithTerminalEventResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
+  /** @deprecated Compatibility-only; not recovery-safe for terminal result snapshots. */
   finishModelStep(input: FinishModelStepInput): Promise<FinishModelStepResult>;
+  commitTerminalModelStepResultAndSnapshot(
+    input: CommitTerminalModelStepResultAndSnapshotInput,
+  ): Promise<CommitTerminalModelStepResultAndSnapshotResult>;
   readModelStep(input: ReadModelStepInput): Promise<StoredModelStepCheckpoint | null>;
   readLatestModelStep(input: ReadLatestModelStepInput): Promise<StoredModelStepCheckpoint | null>;
   createSession(input: CreateSessionInput): Promise<SessionRecord>;
@@ -775,14 +841,18 @@ export interface SessionStorePort extends RecoveryReadPort {
   createRunAttempt(input: CreateRunAttemptInput): Promise<CreateRunAttemptResult>;
   appendEvents(input: AppendEventsInput): Promise<AppendEventsResult>;
   readEvents(input: ReadEventsInput): Promise<EventPage>;
+  /** @deprecated Compatibility-only for terminal bindings; use atomic commit above in B1b. */
   writeSnapshot(input: WriteSnapshotInput): Promise<void>;
   readSnapshot(runId: string): Promise<RunSnapshot | null>;
   reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult>;
+  /** Dormant B1a execution CAS. It grants no permit until Runtime cutover B1b. */
+  beginInvocationExecution(input: BeginInvocationExecutionInput): Promise<BeginInvocationExecutionResult>;
   readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null>;
   readReservation(input: ReadReservationInput): Promise<StoredInvocationReservation | null>;
   readInvocationByIdempotencyKey(
     input: ReadInvocationByIdempotencyKeyInput,
   ): Promise<InvocationReconciliationRecord | null>;
+  /** @deprecated Compatibility path; B1a intentionally does not require beginInvocationExecution. */
   commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult>;
   readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null>;
   putArtifact(input: PutArtifactInput): Promise<ArtifactRef>;

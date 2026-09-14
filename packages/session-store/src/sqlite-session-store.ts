@@ -5,7 +5,9 @@ import Database from "better-sqlite3";
 import type { JsonValue } from "../../model-protocol/contracts.js";
 import type { NormalizedToolInvocation, ToolReceipt } from "../../tool-runtime/contracts.js";
 import type {
-  AppendEventsInput, AppendEventsResult, Artifact, ArtifactRef, CommitReceiptInput, CommitReceiptResult,
+  AppendEventsInput, AppendEventsResult, Artifact, ArtifactRef, BeginInvocationExecutionInput,
+  BeginInvocationExecutionResult, CommitReceiptInput, CommitReceiptResult,
+  CommitTerminalModelStepResultAndSnapshotInput, CommitTerminalModelStepResultAndSnapshotResult,
   CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
   EventPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
   InvocationReservationInput, LeaseRenewal, LeaseRequest, LeaseResult, PersistedRunAttempt,
@@ -17,9 +19,9 @@ import type {
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
   SettleRunCommandWithTerminalEventResult, TransitionRunCommandInput, TransitionRunCommandResult,
-  TurnRecord, WriteSnapshotInput,
+  TurnRecord, WriteSnapshotInput, PrivateArtifactRef,
 } from "../contracts.js";
-import { assertValidRunSnapshot } from "../contracts.js";
+import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../contracts.js";
 import {
   assertValidCommandTimestamp,
   assertValidGeneratedId,
@@ -44,9 +46,15 @@ const loadMigration = (version: number, name: string): Migration => {
 const MIGRATIONS = [
   loadMigration(1, "0001_initial.sql"),
   loadMigration(2, "0002_durable_commands.sql"),
+  loadMigration(3, "0003_private_recovery_primitives.sql"),
 ] as const;
 const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
-type Options = Readonly<{ clock?: () => Date; nonce?: () => string }>;
+type Options = Readonly<{
+  clock?: () => Date;
+  nonce?: () => string;
+  /** Test-only adapter hook; transaction rollback is the production guarantee. */
+  onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
+}>;
 type LeaseConflict = "lease_not_held" | "lease_expired";
 type Row = Record<string, any>;
 
@@ -84,10 +92,12 @@ export class SqliteSessionStore implements SessionStorePort {
   private readonly db: Database.Database;
   private readonly clock: () => Date;
   private readonly nonce: () => string;
+  private readonly onAtomicTerminalWrite?: Options["onAtomicTerminalWrite"];
 
   constructor(databasePath: string, options: Options = {}) {
     this.clock = options.clock ?? (() => new Date());
     this.nonce = options.nonce ?? randomUUID;
+    this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
     this.db = new Database(prepareDatabasePath(databasePath));
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("journal_mode = WAL");
@@ -110,12 +120,29 @@ export class SqliteSessionStore implements SessionStorePort {
         if (version >= migration.version) return;
         if (version !== migration.version - 1) throw new StoreIntegrityError("migration_history_missing");
         this.db.exec(migration.sql);
+        if (migration.version === 3) this.migrateLegacyInvocationExecutionBoundary();
         this.db.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)")
           .run(migration.version, migration.name, migration.checksum, this.clock().toISOString());
         this.db.pragma(`user_version = ${migration.version}`);
       }).immediate();
     }
     this.verifyMigrationHistory();
+  }
+
+  /** V2 cannot prove an execution boundary. Never convert it into a permit. */
+  private migrateLegacyInvocationExecutionBoundary(): void {
+    const rows = this.db.prepare(`
+      SELECT i.reservation_id,i.invocation_json FROM invocations i
+      LEFT JOIN receipts r ON r.reservation_id=i.reservation_id
+      WHERE r.reservation_id IS NULL AND i.status IN ('reserved','executing')
+    `).all() as Row[];
+    for (const row of rows) {
+      const invocation = JSON.parse(row.invocation_json) as Record<string, unknown>;
+      const normalized = { ...invocation, status: "outcome_unknown" };
+      const body = json(normalized);
+      this.db.prepare("UPDATE invocations SET status='outcome_unknown',invocation_json=?,invocation_hash=?,execution_started_at=NULL WHERE reservation_id=?")
+        .run(body, hashBytes(body), row.reservation_id);
+    }
   }
 
   private verifyMigrationHistory(): number {
@@ -394,6 +421,7 @@ export class SqliteSessionStore implements SessionStorePort {
       if (invocationRows.length > 128) return { kind: "failure", code: "recovery_bundle_too_large" };
       const snapshotRow = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(input.runId) as Row | undefined;
       const snapshot = snapshotRow ? this.toSnapshot(snapshotRow) : null;
+      const terminalModelStepResult = this.assertTerminalResultSnapshotInvariant(input.runId, snapshot);
       const effectiveAfterSequence = Math.max(input.afterSequence ?? 0, snapshot?.throughSequence ?? 0);
       const eventRows = this.db.prepare("SELECT * FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(input.runId, effectiveAfterSequence, input.eventLimit + 1) as Row[];
       const tailEvents = eventRows.slice(0, input.eventLimit).map((row) => this.toEvent(row));
@@ -420,6 +448,7 @@ export class SqliteSessionStore implements SessionStorePort {
         tailComplete,
         nextAfterSequence: tailComplete ? null : tailEvents.at(-1)?.sequence ?? effectiveAfterSequence,
         latestModelStep: latestModelStepRow ? this.toModelStep(latestModelStepRow) : null,
+        terminalModelStepResult,
         invocations,
       };
       return { kind: "found", bundle };
@@ -660,14 +689,134 @@ export class SqliteSessionStore implements SessionStorePort {
     })();
   }
 
+  async commitTerminalModelStepResultAndSnapshot(
+    input: CommitTerminalModelStepResultAndSnapshotInput,
+  ): Promise<CommitTerminalModelStepResultAndSnapshotResult> {
+    this.validateModelStepIdentity(input);
+    assertValidCommandTimestamp(input.finishedAt);
+    assertPersistableBytes(input.normalizedResult.content, "terminal_model_step_result.content");
+    if (input.normalizedResult.metadata !== undefined) assertPersistableJson(input.normalizedResult.metadata, "terminal_model_step_result.metadata");
+    assertValidRunSnapshot(input.snapshot);
+    if (
+      input.normalizedResult.contentHash !== hashBytes(input.normalizedResult.content)
+      || input.snapshot.runId !== input.runId
+      || input.snapshot.attemptId !== input.attemptId
+      || input.snapshot.throughSequence > input.expectedSequence
+      || input.snapshot.state.terminalModelStepResult === undefined
+    ) return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+    const terminal = input.snapshot.state.terminalModelStepResult;
+    const artifact: ArtifactRef = {
+      artifactId: input.normalizedResult.artifactId,
+      contentHash: input.normalizedResult.contentHash,
+      mediaType: PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE,
+      byteLength: input.normalizedResult.content.byteLength,
+      visibility: "private",
+    };
+    if (!sameJson(terminal, { attemptId: input.attemptId, modelStepId: input.modelStepId, requestFingerprint: input.requestFingerprint, artifact })) {
+      return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+    }
+    try {
+      return this.db.transaction((): CommitTerminalModelStepResultAndSnapshotResult => {
+        if (!this.isActiveAttempt(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+        const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+        if (lease) return { kind: "conflict", code: lease };
+        const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?")
+          .get(input.runId, input.attemptId) as Row | undefined;
+        if (!attempt || attempt.last_event_sequence !== input.expectedSequence) return { kind: "conflict", code: "snapshot_sequence_conflict" };
+        const step = this.db.prepare("SELECT * FROM model_steps WHERE run_id=? AND model_step_id=?")
+          .get(input.runId, input.modelStepId) as Row | undefined;
+        if (!step || step.attempt_id !== input.attemptId || step.request_fingerprint !== input.requestFingerprint) return { kind: "conflict", code: "model_step_conflict" };
+        const state = canonicalJson(input.snapshot.state);
+        const stateHash = hashBytes(state);
+        const snapshotEnvelopeHash = hashBytes(canonicalJson(input.snapshot));
+        const priorResult = this.db.prepare("SELECT * FROM model_step_terminal_results WHERE run_id=? AND model_step_id=?")
+          .get(input.runId, input.modelStepId) as Row | undefined;
+        const priorSnapshot = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(input.runId) as Row | undefined;
+        const exactResult = (row: Row) => row.attempt_id === input.attemptId
+          && row.request_fingerprint === input.requestFingerprint && row.artifact_id === artifact.artifactId
+          && row.artifact_content_hash === artifact.contentHash && row.artifact_media_type === artifact.mediaType
+          && row.artifact_byte_length === artifact.byteLength && row.artifact_visibility === artifact.visibility
+          && row.snapshot_id === input.snapshot.snapshotId && row.through_sequence === input.snapshot.throughSequence
+          && row.state_hash === stateHash && row.snapshot_envelope_hash === snapshotEnvelopeHash && row.finished_at === input.finishedAt;
+        const exactSnapshot = (row: Row | undefined) => !!row && row.run_id === input.runId && row.attempt_id === input.attemptId
+          && row.snapshot_id === input.snapshot.snapshotId && row.through_sequence === input.snapshot.throughSequence
+          && row.state_json === state && row.state_hash === stateHash && row.created_at === input.snapshot.createdAt;
+        if (priorResult || step.status === "terminal") {
+          const priorHistory = priorResult
+            ? this.db.prepare("SELECT * FROM run_snapshot_history WHERE snapshot_id=?").get(priorResult.snapshot_id) as Row | undefined
+            : undefined;
+          if (!priorResult || !priorHistory || !exactResult(priorResult) || !exactSnapshot(priorHistory)
+            || priorResult.commit_ordinal !== priorHistory.commit_ordinal || priorResult.commit_ordinal <= 0
+            || step.status !== "terminal" || step.finished_at !== input.finishedAt) {
+            return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+          }
+          const storedArtifact = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(artifact.artifactId) as Row | undefined;
+          if (!storedArtifact || !sameJson(this.toArtifactRef(storedArtifact), artifact)
+            || !Buffer.from(storedArtifact.content).equals(Buffer.from(input.normalizedResult.content))
+            || storedArtifact.metadata_json !== (input.normalizedResult.metadata === undefined ? null : canonicalJson(input.normalizedResult.metadata))) {
+            return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+          }
+          this.assertTerminalResultSnapshotInvariant(input.runId, priorSnapshot ? this.toSnapshot(priorSnapshot) : null);
+          return { kind: "replay", checkpoint: this.toModelStep(step), artifact: artifact as PrivateArtifactRef, snapshot: input.snapshot };
+        }
+        if (step.status !== "started" || Date.parse(input.finishedAt) < Date.parse(step.started_at)) return { kind: "conflict", code: "model_step_conflict" };
+        const currentSnapshot = priorSnapshot ? this.toSnapshot(priorSnapshot) : null;
+        this.assertTerminalResultSnapshotInvariant(input.runId, currentSnapshot);
+        if (currentSnapshot && currentSnapshot.throughSequence > input.snapshot.throughSequence) return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+        const commitOrdinal = (this.db.prepare("SELECT COALESCE(MAX(commit_ordinal), 0) + 1 AS next_ordinal FROM run_snapshot_history WHERE run_id=?")
+          .get(input.runId) as Row).next_ordinal as number;
+        const metadata = input.normalizedResult.metadata === undefined ? null : canonicalJson(input.normalizedResult.metadata);
+        const artifactCollision = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(artifact.artifactId) as Row | undefined;
+        if (artifactCollision) return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+        this.onAtomicTerminalWrite?.("artifact");
+        this.db.prepare("INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)").run(
+          artifact.artifactId, artifact.contentHash, artifact.mediaType, Buffer.from(input.normalizedResult.content), artifact.byteLength,
+          artifact.visibility, metadata, input.finishedAt,
+        );
+        this.onAtomicTerminalWrite?.("checkpoint");
+        this.db.prepare("UPDATE model_steps SET status='terminal',failure_code=NULL,finished_at=?,updated_at=? WHERE model_step_id=? AND status='started'")
+          .run(input.finishedAt, input.finishedAt, input.modelStepId);
+        this.onAtomicTerminalWrite?.("terminal_result");
+        this.db.prepare("INSERT INTO run_snapshot_history VALUES (?,?,?,?,?,?,?,?)").run(
+          input.snapshot.snapshotId, input.runId, input.attemptId, commitOrdinal, input.snapshot.throughSequence,
+          state, stateHash, input.snapshot.createdAt,
+        );
+        this.db.prepare(`INSERT INTO model_step_terminal_results (
+          run_id,attempt_id,model_step_id,request_fingerprint,artifact_id,artifact_content_hash,artifact_media_type,
+          artifact_byte_length,artifact_visibility,snapshot_id,commit_ordinal,through_sequence,state_hash,snapshot_envelope_hash,finished_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          input.runId, input.attemptId, input.modelStepId, input.requestFingerprint, artifact.artifactId, artifact.contentHash,
+          artifact.mediaType, artifact.byteLength, artifact.visibility, input.snapshot.snapshotId, commitOrdinal, input.snapshot.throughSequence,
+          stateHash, snapshotEnvelopeHash, input.finishedAt,
+        );
+        this.onAtomicTerminalWrite?.("snapshot");
+        this.db.prepare("INSERT INTO run_snapshots VALUES (?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET attempt_id=excluded.attempt_id,snapshot_id=excluded.snapshot_id,through_sequence=excluded.through_sequence,state_json=excluded.state_json,state_hash=excluded.state_hash,created_at=excluded.created_at").run(
+          input.runId, input.attemptId, input.snapshot.snapshotId, input.snapshot.throughSequence, state, stateHash, input.snapshot.createdAt,
+        );
+        const committed = this.db.prepare("SELECT * FROM model_steps WHERE model_step_id=?").get(input.modelStepId) as Row;
+        return { kind: "committed", checkpoint: this.toModelStep(committed), artifact: artifact as PrivateArtifactRef, snapshot: input.snapshot };
+      }).immediate();
+    } catch (error) {
+      if (isUniqueConstraint(error)) return { kind: "conflict", code: "terminal_model_step_result_conflict" };
+      throw error;
+    }
+  }
+
   async readSnapshot(runId: string): Promise<RunSnapshot | null> {
     const row = this.db.prepare("SELECT * FROM run_snapshots WHERE run_id=?").get(runId) as Row | undefined;
-    return row ? this.toSnapshot(row) : null;
+    if (!row) {
+      this.assertTerminalResultSnapshotInvariant(runId, null);
+      return null;
+    }
+    return this.toSnapshot(row);
   }
 
   async reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult> {
     const invocation = input.invocation;
     assertPersistableJson(JSON.parse(JSON.stringify(invocation)) as JsonValue, "invocation");
+    // V3 reservations always start at a proven pre-execution state. Older
+    // ambiguous rows are converted during migration, never recreated here.
+    if (invocation.status !== "reserved") return { kind: "conflict", code: "invocation_reservation_conflict" };
     return this.db.transaction((): ReservationResult => {
       if (!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(invocation.runId, invocation.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
       const prior = this.db.prepare("SELECT * FROM invocations WHERE run_id=? AND idempotency_key=?").get(invocation.runId, invocation.idempotencyKey) as Row | undefined;
@@ -680,9 +829,36 @@ export class SqliteSessionStore implements SessionStorePort {
       if (lease) return { kind: "conflict", code: lease };
       if (this.db.prepare("SELECT 1 FROM invocations WHERE run_id=? AND attempt_id=? AND invocation_id=?").get(invocation.runId, invocation.attemptId, invocation.invocationId)) return { kind: "conflict", code: "invocation_reservation_conflict" };
       const reservationId = this.nonce(); const body = json(invocation);
-      this.db.prepare("INSERT INTO invocations VALUES (?,?,?,?,?,?,?,?,?)").run(invocation.invocationId, invocation.runId, invocation.attemptId, reservationId, invocation.idempotencyKey, body, hashBytes(body), invocation.status, input.reservedAt);
+      this.db.prepare(`INSERT INTO invocations (
+        invocation_id,run_id,attempt_id,reservation_id,idempotency_key,invocation_json,invocation_hash,status,reserved_at,execution_started_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,NULL)`).run(invocation.invocationId, invocation.runId, invocation.attemptId, reservationId, invocation.idempotencyKey, body, hashBytes(body), invocation.status, input.reservedAt);
       return { kind: "owner", reservationId };
     })();
+  }
+
+  async beginInvocationExecution(input: BeginInvocationExecutionInput): Promise<BeginInvocationExecutionResult> {
+    return this.db.transaction((): BeginInvocationExecutionResult => {
+      if (!this.isActiveAttempt(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      const row = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+      if (!row || row.run_id !== input.runId || row.attempt_id !== input.attemptId) return { kind: "conflict", code: "invocation_execution_conflict" };
+      const receipt = this.receiptForReservation(input.reservationId);
+      if (receipt) return { kind: "receipt_replay", receiptId: receipt.receiptId };
+      if (row.status === "executing" || row.status === "outcome_unknown") {
+        return row.status === "executing"
+          ? { kind: "already_executing_or_unknown", executionStartedAt: row.execution_started_at ?? undefined }
+          : { kind: "already_executing_or_unknown" };
+      }
+      if (row.status !== "reserved" || row.execution_started_at !== null) return { kind: "conflict", code: "invocation_execution_conflict" };
+      const executionStartedAt = this.clock().toISOString();
+      const invocation = this.toInvocation(row);
+      const body = json({ ...invocation, status: "executing" });
+      const update = this.db.prepare("UPDATE invocations SET status='executing',execution_started_at=?,invocation_json=?,invocation_hash=? WHERE reservation_id=? AND status='reserved' AND execution_started_at IS NULL")
+        .run(executionStartedAt, body, hashBytes(body), input.reservationId);
+      if (update.changes !== 1) return { kind: "already_executing_or_unknown" };
+      return { kind: "started", executionStartedAt };
+    }).immediate();
   }
 
   async readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null> {
@@ -879,6 +1055,7 @@ export class SqliteSessionStore implements SessionStorePort {
     // runtime envelope before exposing anything to recovery callers.
     assertValidRunSnapshot(snapshot);
     this.assertSnapshotIntegrity(snapshot);
+    this.assertTerminalResultSnapshotInvariant(snapshot.runId, snapshot);
     return snapshot;
   }
   private assertSnapshotIntegrity(snapshot: RunSnapshot): void {
@@ -894,13 +1071,95 @@ export class SqliteSessionStore implements SessionStorePort {
       || checkpoint.request_fingerprint !== terminal.requestFingerprint
     ) throw new StoreIntegrityError("snapshot_integrity_conflict");
   }
+  private toTerminalModelStepResultRef(row: Row): import("../contracts.js").TerminalModelStepResultRef {
+    return {
+      attemptId: row.attempt_id,
+      modelStepId: row.model_step_id,
+      requestFingerprint: row.request_fingerprint,
+      artifact: {
+        artifactId: row.artifact_id,
+        contentHash: row.artifact_content_hash,
+        mediaType: row.artifact_media_type,
+        byteLength: row.artifact_byte_length,
+        visibility: row.artifact_visibility,
+      },
+    };
+  }
+  private terminalResultMatchesSnapshot(row: Row, snapshot: RunSnapshot): boolean {
+    const terminal = snapshot.state.terminalModelStepResult;
+    return !!terminal
+      && row.snapshot_id === snapshot.snapshotId
+      && row.through_sequence === snapshot.throughSequence
+      && row.state_hash === hashBytes(canonicalJson(snapshot.state))
+      && sameJson(this.toTerminalModelStepResultRef(row), terminal);
+  }
+  /** The terminal-result row and snapshot binding are one inseparable recovery fact. */
+  private assertTerminalResultSnapshotInvariant(
+    runId: string,
+    snapshot: RunSnapshot | null,
+  ): import("../contracts.js").TerminalModelStepResultRef | null {
+    const rows = this.db.prepare("SELECT * FROM model_step_terminal_results WHERE run_id=? ORDER BY model_step_id ASC")
+      .all(runId) as Row[];
+    const histories = this.db.prepare("SELECT * FROM run_snapshot_history WHERE run_id=? ORDER BY commit_ordinal ASC")
+      .all(runId) as Row[];
+    if (rows.length !== histories.length) throw new StoreIntegrityError("snapshot_integrity_conflict");
+    if (rows.length === 0) {
+      if (snapshot?.state.terminalModelStepResult) throw new StoreIntegrityError("snapshot_integrity_conflict");
+      return null;
+    }
+    const historyById = new Map(histories.map((history) => [history.snapshot_id, history]));
+    for (const row of rows) {
+      const history = historyById.get(row.snapshot_id);
+      if (!history || history.run_id !== runId || history.attempt_id !== row.attempt_id || history.commit_ordinal !== row.commit_ordinal || history.commit_ordinal <= 0
+        || history.through_sequence !== row.through_sequence || history.state_hash !== row.state_hash) {
+        throw new StoreIntegrityError("snapshot_integrity_conflict");
+      }
+      const historicalSnapshot = this.toHistoricalSnapshot(history);
+      if (row.snapshot_envelope_hash !== hashBytes(canonicalJson(historicalSnapshot))) throw new StoreIntegrityError("snapshot_integrity_conflict");
+      if (!this.terminalResultMatchesSnapshot(row, historicalSnapshot)) throw new StoreIntegrityError("snapshot_integrity_conflict");
+      const checkpoint = this.db.prepare("SELECT * FROM model_steps WHERE model_step_id=?")
+        .get(row.model_step_id) as Row | undefined;
+      const artifact = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(row.artifact_id) as Row | undefined;
+      if (!checkpoint || checkpoint.status !== "terminal" || checkpoint.finished_at !== row.finished_at
+        || !artifact || Buffer.from(artifact.content).byteLength !== artifact.byte_length
+        || hashBytes(artifact.content) !== artifact.content_hash
+        || !sameJson(this.toArtifactRef(artifact), this.toTerminalModelStepResultRef(row).artifact)) {
+        throw new StoreIntegrityError("snapshot_integrity_conflict");
+      }
+    }
+    if (new Set(histories.map((history) => history.commit_ordinal)).size !== histories.length) throw new StoreIntegrityError("snapshot_integrity_conflict");
+    const latestHistory = histories.at(-1)!;
+    const latest = rows.find((row) => row.snapshot_id === latestHistory.snapshot_id);
+    if (!latest) throw new StoreIntegrityError("snapshot_integrity_conflict");
+    const latestSnapshot = this.toHistoricalSnapshot(latestHistory);
+    if (!snapshot || latest.commit_ordinal !== latestHistory.commit_ordinal || latest.snapshot_envelope_hash !== hashBytes(canonicalJson(snapshot)) || !sameJson(snapshot, latestSnapshot)) {
+      throw new StoreIntegrityError("snapshot_integrity_conflict");
+    }
+    return this.toTerminalModelStepResultRef(latest);
+  }
+  private toHistoricalSnapshot(row: Row): RunSnapshot {
+    if (hashBytes(row.state_json) !== row.state_hash) throw new StoreIntegrityError("snapshot_integrity_conflict");
+    const snapshot = {
+      schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: row.snapshot_id, runId: row.run_id,
+      attemptId: row.attempt_id, throughSequence: row.through_sequence, state: JSON.parse(row.state_json), createdAt: row.created_at,
+    };
+    assertValidRunSnapshot(snapshot);
+    this.assertSnapshotIntegrity(snapshot);
+    return snapshot;
+  }
   private toEvent(row: Row): StoredEvent {
     const event: StoredEvent = { schemaVersion: row.schema_version, eventId: row.event_id, runId: row.run_id, attemptId: row.attempt_id, sequence: row.sequence, kind: row.kind, visibility: row.visibility, payload: JSON.parse(row.payload_json) as JsonValue, createdAt: row.created_at, ...(row.causation_id === null ? {} : { causationId: row.causation_id }), ...(row.correlation_id === null ? {} : { correlationId: row.correlation_id }) };
     if (hashBytes(json(event)) !== row.event_hash) throw new StoreIntegrityError("event_hash_drift");
     return event;
   }
   private toInvocation(row: Row): NormalizedToolInvocation { if (hashBytes(row.invocation_json) !== row.invocation_hash) throw new StoreIntegrityError("invocation_hash_drift"); return JSON.parse(row.invocation_json) as NormalizedToolInvocation; }
-  private toReservation(row: Row): StoredInvocationReservation { return { reservationId: row.reservation_id, runId: row.run_id, attemptId: row.attempt_id, invocationId: row.invocation_id, idempotencyKey: row.idempotency_key, status: row.status, reservedAt: row.reserved_at }; }
+  private toReservation(row: Row): StoredInvocationReservation {
+    return {
+      reservationId: row.reservation_id, runId: row.run_id, attemptId: row.attempt_id,
+      invocationId: row.invocation_id, idempotencyKey: row.idempotency_key, status: row.status,
+      reservedAt: row.reserved_at, ...(row.execution_started_at === null || row.execution_started_at === undefined ? {} : { executionStartedAt: row.execution_started_at }),
+    };
+  }
   private toReceipt(row: Row): ToolReceipt { if (hashBytes(row.receipt_json) !== row.receipt_hash) throw new StoreIntegrityError("receipt_hash_drift"); return JSON.parse(row.receipt_json) as ToolReceipt; }
   private receiptForReservation(id: string): ToolReceipt | null { const row = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(id) as Row | undefined; return row ? this.toReceipt(row) : null; }
   private sameInvocation(a: NormalizedToolInvocation, b: NormalizedToolInvocation): boolean { return a.invocationId === b.invocationId && a.runId === b.runId && a.attemptId === b.attemptId && a.toolName === b.toolName && a.toolVersion === b.toolVersion && a.argumentsHash === b.argumentsHash && a.catalogHash === b.catalogHash && a.idempotencyKey === b.idempotencyKey && sameJson(a.arguments, b.arguments); }

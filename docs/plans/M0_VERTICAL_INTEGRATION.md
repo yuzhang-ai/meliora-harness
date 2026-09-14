@@ -104,6 +104,12 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 - 写入可供 Runtime 重建的 `RunSnapshot`；retained event 不足时，Server 返回 public snapshot + resume-point，而不是永久 `409`。
 - 明确无法安全继续时持久化 `run_blocked` 与具体 user action，不能留下无人接管的运行态。
 
+#### WP-3B.1a：private recovery primitives（Store-only，dormant）
+
+- 为终态 Model Step 冻结 artifact/checkpoint/terminal-result row/private Snapshot 的单事务提交、Store-owned per-Run 单调 commitOrdinal、完整 snapshot envelope hash 与严格 replay 证明；不得对既有半完成 terminal state 做修复或回填。
+- 为 Tool Invocation 冻结 Store-owned `reserved -> executing` execution CAS，并把 v2 无 Receipt 的执行边界迁为 `outcome_unknown`。
+- 不修改 Server、SSE、public snapshot、recovery coordinator 或 Runtime Loop；Runtime cutover 与 `commitReceipt` 行为收紧属于后续 B1b。
+
 验收：Provider 前崩溃、Provider 后/Tool 前崩溃、Receipt 前后崩溃、旧 lease 未过期、旧 lease 过期、cursor 不足和终态重启。
 
 ### WP-4：Web live adapter

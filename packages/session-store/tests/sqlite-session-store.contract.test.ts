@@ -78,13 +78,18 @@ test("recovery distinguishes crashes before execution, during execution and afte
     reservedAt: timestamp(),
   })).kind, "owner");
 
-  const duringExecution = { ...invocation("during-execution"), status: "executing" as const };
+  const duringExecution = invocation("during-execution");
   const duringReservation = await first.reserveInvocation({
     invocation: duringExecution,
     leaseToken: firstLease.leaseToken,
     reservedAt: timestamp(),
   });
   assert.equal(duringReservation.kind, "owner");
+  if (duringReservation.kind !== "owner") throw new Error("expected execution reservation owner");
+  assert.equal((await first.beginInvocationExecution({
+    runId: "run-1", attemptId: "attempt-1", leaseToken: firstLease.leaseToken,
+    reservationId: duringReservation.reservationId,
+  })).kind, "started");
 
   const afterReceipt = invocation("after-receipt");
   const afterReservation = await first.reserveInvocation({
@@ -134,7 +139,6 @@ test("recovery distinguishes crashes before execution, during execution and afte
   });
   assert.equal(duringReadback?.invocation.status, "executing");
   assert.equal(duringReadback?.receipt, null);
-  if (duringReservation.kind !== "owner") throw new Error("expected execution reservation owner");
   assert.deepEqual(await recovered.commitReceipt({
     runId: "run-1",
     attemptId: "attempt-2",
