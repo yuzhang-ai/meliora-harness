@@ -12,7 +12,7 @@ import type {
   OpenAiCompatibleRequestTool,
   OpenAiCompatibleTransport,
 } from "../../../packages/providers/openai-compatible-transport.js";
-import type { SessionStorePort, StoredRunCommand } from "../../../packages/session-store/contracts.js";
+import type { InvocationReconciliationRecord, SessionStorePort, StoredRunCommand } from "../../../packages/session-store/contracts.js";
 import {
   assertPersistableText,
   canonicalRunCommandRequestHash,
@@ -441,18 +441,75 @@ const settleOutcomeUnknown = async (
   return true;
 };
 
-type UnreceiptedExecutingInvocationState = "present" | "absent" | "indeterminate";
+type InvocationRecoveryState = "present" | "absent" | "settled" | "indeterminate";
 
-const unreceiptedExecutingInvocationState = async (
+const receiptMatchesTerminalInvocation = (
+  record: InvocationReconciliationRecord,
+): boolean => {
+  const receipt = record.receipt;
+  const invocation = record.invocation;
+  return receipt !== null
+    && receipt.runId === invocation.runId
+    && receipt.attemptId === invocation.attemptId
+    && receipt.invocationId === invocation.invocationId
+    && receipt.toolName === invocation.toolName
+    && receipt.toolVersion === invocation.toolVersion
+    && receipt.argumentsHash === invocation.argumentsHash
+    && receipt.catalogHash === invocation.catalogHash
+    && receipt.status === invocation.status;
+};
+
+const hasValidExecutionStartedAt = (value: string | undefined): boolean =>
+  value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value));
+
+const classifyInvocationRecoveryState = async (
   store: SessionStorePort,
   runId: string,
-): Promise<UnreceiptedExecutingInvocationState> => {
+): Promise<InvocationRecoveryState> => {
   try {
     const recovery = await store.readRecoveryBundle({ runId, eventLimit: 128 });
     if (recovery.kind !== "found") return "indeterminate";
-    return recovery.bundle.invocations.some((record) =>
-      record.invocation.status === "executing" && record.receipt === null,
-    ) ? "present" : "absent";
+    let hasUnsafeUnreceiptedInvocation = false;
+    let hasSettledInvocation = false;
+    for (const record of recovery.bundle.invocations) {
+      const { reservation, invocation, receipt } = record;
+      if (reservation.runId !== invocation.runId
+        || reservation.attemptId !== invocation.attemptId
+        || reservation.invocationId !== invocation.invocationId
+        || reservation.idempotencyKey !== invocation.idempotencyKey
+        || reservation.status !== invocation.status) return "indeterminate";
+      if (invocation.status === "reserved") {
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        continue;
+      }
+      if (invocation.status === "awaiting_approval") {
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        // Approval state is neither a completed receipt nor proof that this
+        // command may fall through to Model Step recovery.
+        hasSettledInvocation = true;
+        continue;
+      }
+      if (invocation.status === "executing") {
+        if (receipt !== null || !hasValidExecutionStartedAt(reservation.executionStartedAt)) return "indeterminate";
+        hasUnsafeUnreceiptedInvocation = true;
+        continue;
+      }
+      if (invocation.status === "outcome_unknown") {
+        // v2 migration deliberately clears this field: a legacy database
+        // cannot prove an execution boundary.
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        hasUnsafeUnreceiptedInvocation = true;
+        continue;
+      }
+      if (invocation.status === "succeeded" || invocation.status === "failed" || invocation.status === "cancelled") {
+        if (receipt === null || !receiptMatchesTerminalInvocation(record)) return "indeterminate";
+        hasSettledInvocation = true;
+        continue;
+      }
+      return "indeterminate";
+    }
+    if (hasUnsafeUnreceiptedInvocation) return "present";
+    return hasSettledInvocation ? "settled" : "absent";
   } catch {
     return "indeterminate";
   }
@@ -481,7 +538,7 @@ const runWorker = async (
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
-      const invocationState = await unreceiptedExecutingInvocationState(options.store, current.runId);
+      const invocationState = await classifyInvocationRecoveryState(options.store, current.runId);
       if (invocationState === "present") {
         await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
           code: TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE,
@@ -494,7 +551,7 @@ const runWorker = async (
       // `failure`, `conflict`, `not_found`, or a read exception cannot prove
       // the invocation is absent. Preserve dispatched state for a later
       // recovery worker rather than applying the Model Step fallback.
-      if (invocationState === "indeterminate") return;
+      if (invocationState === "indeterminate" || invocationState === "settled") return;
       await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
@@ -584,7 +641,7 @@ const runWorker = async (
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
-      if (await unreceiptedExecutingInvocationState(options.store, command.runId) !== "absent") {
+      if (await classifyInvocationRecoveryState(options.store, command.runId) !== "absent") {
         // Host may already have caused an effect but its Receipt was not
         // durable, or recovery cannot prove otherwise. Leave dispatched and
         // executing untouched until a later worker can read a complete bundle.

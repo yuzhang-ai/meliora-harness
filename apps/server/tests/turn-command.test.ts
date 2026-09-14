@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 
 import { deepseekStreamTextSingleToolFixture } from "../../../fixtures/contracts/v1/deepseek-stream-text-single-tool.js";
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
@@ -18,7 +20,7 @@ import type {
   StartModelStepInput,
   StartModelStepResult,
 } from "../../../packages/session-store/contracts.js";
-import { SqliteSessionStore } from "../../../packages/session-store/index.js";
+import { canonicalRunCommandRequestHash, hashBytes, SqliteSessionStore } from "../../../packages/session-store/index.js";
 import {
   TURN_COMMAND_REQUEST_SCHEMA_VERSION,
   type TurnCommandResponse,
@@ -380,6 +382,65 @@ class IndeterminateRecoveryAfterHostStore extends LeaseLossAfterHostStore {
       return { kind: "conflict" as const, code: "run_attempt_conflict" as const };
     }
     return super.readRecoveryBundle(input[0]);
+  }
+}
+
+type TamperedInvocationBundleShape =
+  | "outcome_unknown_with_receipt"
+  | "executing_with_receipt"
+  | "reserved_with_receipt"
+  | "reserved_with_execution_started_at"
+  | "executing_without_execution_started_at"
+  | "outcome_unknown_with_execution_started_at"
+  | "succeeded_with_matching_receipt"
+  | "succeeded_without_receipt"
+  | "failed_without_receipt"
+  | "cancelled_without_receipt"
+  | "reservation_invocation_mismatch";
+
+class SemanticallyTamperedRecoveryStore extends LeaseLossAfterHostStore {
+  constructor(
+    private readonly shape: TamperedInvocationBundleShape,
+    options: ConstructorParameters<typeof MemorySessionStore>[0],
+  ) {
+    super(options);
+  }
+
+  override async readRecoveryBundle(...input: Parameters<MemorySessionStore["readRecoveryBundle"]>) {
+    const result = await super.readRecoveryBundle(input[0]);
+    if (result.kind !== "found" || this.hostArtifactWrites !== 1 || result.bundle.invocations.length === 0) return result;
+    const first = result.bundle.invocations[0]!;
+    const receipt = {
+      schemaVersion: "meliora.tool-receipt.v1" as const, receiptId: "tampered-receipt",
+      invocationId: first.invocation.invocationId, runId: first.invocation.runId, attemptId: first.invocation.attemptId,
+      toolName: first.invocation.toolName, toolVersion: first.invocation.toolVersion,
+      argumentsHash: first.invocation.argumentsHash, catalogHash: first.invocation.catalogHash,
+      decision: "allow" as const, startedAt: fixedNow, endedAt: fixedNow, status: "succeeded" as const,
+      effectSummary: "fixture", verificationArtifactIds: [], redactions: [],
+    };
+    const terminalStatus: typeof first.invocation.status | undefined = this.shape === "succeeded_without_receipt" || this.shape === "succeeded_with_matching_receipt" ? "succeeded"
+      : this.shape === "failed_without_receipt" ? "failed"
+        : this.shape === "cancelled_without_receipt" ? "cancelled" : undefined;
+    const receiptStatus: typeof first.invocation.status | undefined = this.shape === "outcome_unknown_with_receipt" ? "outcome_unknown"
+      : this.shape === "executing_with_receipt" ? "executing"
+        : this.shape === "reserved_with_receipt" ? "reserved" : undefined;
+    const timestampStatus: typeof first.invocation.status | undefined = this.shape === "reserved_with_execution_started_at" ? "reserved"
+      : this.shape === "executing_without_execution_started_at" ? "executing"
+        : this.shape === "outcome_unknown_with_execution_started_at" ? "outcome_unknown" : undefined;
+    const alteredStatus = terminalStatus ?? receiptStatus ?? timestampStatus;
+    const invocation = alteredStatus === undefined ? first.invocation : { ...first.invocation, status: alteredStatus };
+    const reservationWithStatus = this.shape === "reservation_invocation_mismatch"
+      ? { ...first.reservation, status: "reserved" as typeof first.reservation.status }
+      : alteredStatus === undefined ? first.reservation : { ...first.reservation, status: alteredStatus };
+    const { executionStartedAt: _discardedExecutionStartedAt, ...reservationWithoutTimestamp } = reservationWithStatus;
+    const reservation = this.shape === "executing_without_execution_started_at" ? reservationWithoutTimestamp : reservationWithStatus;
+    const changed = {
+      ...first,
+      invocation,
+      reservation,
+      receipt: (terminalStatus === undefined && this.shape !== "reservation_invocation_mismatch") || this.shape === "succeeded_with_matching_receipt" ? receipt : null,
+    };
+    return { kind: "found" as const, bundle: { ...result.bundle, invocations: [changed, ...result.bundle.invocations.slice(1)] } };
   }
 }
 
@@ -837,6 +898,240 @@ test("replayed dispatched commands fail closed as outcome_unknown without retryi
   });
 });
 
+test("terminal Model Step with a legacy outcome_unknown invocation blocks once without Provider or Host", async () => {
+  let currentNow = fixedNow;
+  class ObservedLegacyOutcomeUnknownStore extends MemorySessionStore {
+    executionPermitAttempts = 0;
+
+    override async beginInvocationExecution(...input: Parameters<MemorySessionStore["beginInvocationExecution"]>) {
+      this.executionPermitAttempts += 1;
+      return super.beginInvocationExecution(input[0]);
+    }
+  }
+  const store = new ObservedLegacyOutcomeUnknownStore({ clock: () => new Date(currentNow) });
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let providerCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "legacy-outcome-unknown-recovery",
+    message: "检查恢复状态",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: { next: async () => { providerCalls += 1; return []; } },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  deferred.length = 0;
+  const lease = await store.acquireLease({
+    runId: created.body.runId,
+    attemptId: created.body.attemptId,
+    ownerId: "crashed-worker",
+    ttlMs: 1_000,
+    requestedAt: currentNow,
+  });
+  assert.equal(lease.kind, "acquired");
+  if (lease.kind !== "acquired") throw new Error("lease not acquired");
+  assert.equal((await store.transitionRunCommand({
+    localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey,
+    runId: created.body.runId, attemptId: created.body.attemptId, leaseToken: lease.leaseToken,
+    expectedStatus: "reserved", nextStatus: "accepted", updatedAt: currentNow,
+  })).kind, "updated");
+  const fingerprint = hashBytes("legacy-outcome-unknown-terminal-model-step");
+  assert.equal((await store.startModelStep({
+    runId: created.body.runId, attemptId: created.body.attemptId, leaseToken: lease.leaseToken,
+    modelStepId: "model-step-legacy-terminal", requestFingerprint: fingerprint, startedAt: currentNow,
+  })).kind, "started");
+  const historyBytes = new TextEncoder().encode("[]");
+  await store.putArtifact({
+    artifactId: "history-legacy-terminal", content: historyBytes, contentHash: hashBytes(historyBytes),
+    mediaType: "application/json", visibility: "private", createdAt: currentNow,
+  });
+  const terminalBytes = new TextEncoder().encode("{\"events\":[]}");
+  const terminalArtifact = {
+    artifactId: "terminal-legacy-result", contentHash: hashBytes(terminalBytes),
+    mediaType: "application/vnd.meliora.model-step-result+json" as const,
+    byteLength: terminalBytes.byteLength, visibility: "private" as const,
+  };
+  assert.equal((await store.commitTerminalModelStepResultAndSnapshot({
+    runId: created.body.runId, attemptId: created.body.attemptId, leaseToken: lease.leaseToken,
+    modelStepId: "model-step-legacy-terminal", requestFingerprint: fingerprint, finishedAt: currentNow,
+    normalizedResult: { artifactId: terminalArtifact.artifactId, contentHash: terminalArtifact.contentHash, content: terminalBytes },
+    expectedSequence: 0,
+    snapshot: {
+      schemaVersion: "meliora.run-snapshot.v1", snapshotId: "snapshot-legacy-terminal",
+      runId: created.body.runId, attemptId: created.body.attemptId, throughSequence: 0, createdAt: currentNow,
+      state: {
+        schemaVersion: "meliora.private-run-snapshot-state.v1", phase: "model_streaming",
+        catalogHash: "m0-read-only-workspace-tools-v1", intentRevision: 1,
+        modelHistoryArtifact: {
+          artifactId: "history-legacy-terminal", contentHash: hashBytes(historyBytes), mediaType: "application/json",
+          byteLength: historyBytes.byteLength, visibility: "private",
+        },
+        terminalModelStepResult: {
+          attemptId: created.body.attemptId, modelStepId: "model-step-legacy-terminal", requestFingerprint: fingerprint,
+          artifact: terminalArtifact,
+        },
+        pendingInvocations: [], receiptRefs: [], verificationRefs: [],
+      },
+    },
+  })).kind, "committed");
+  const reservation = await store.reserveInvocation({
+    invocation: {
+      schemaVersion: "meliora.tool-invocation.v1", invocationId: "legacy-outcome-invocation",
+      runId: created.body.runId, attemptId: created.body.attemptId, toolName: "read_file", toolVersion: "1.0.0",
+      arguments: {}, argumentsHash: hashBytes("legacy-outcome-arguments"), catalogHash: "m0-read-only-workspace-tools-v1",
+      idempotencyKey: "legacy-outcome-invocation-key", status: "reserved",
+    },
+    leaseToken: lease.leaseToken, reservedAt: currentNow,
+  });
+  assert.equal(reservation.kind, "owner");
+  if (reservation.kind !== "owner") throw new Error("reservation not created");
+  const raw = store as unknown as {
+    invocations: Map<string, { status: string }>;
+    reservations: Map<string, { status: string }>;
+  };
+  const invocationKey = `${created.body.runId}\u0000${created.body.attemptId}\u0000legacy-outcome-invocation`;
+  raw.invocations.set(invocationKey, { ...raw.invocations.get(invocationKey)!, status: "outcome_unknown" });
+  raw.reservations.set(reservation.reservationId, { ...raw.reservations.get(reservation.reservationId)!, status: "outcome_unknown" });
+  assert.equal((await store.readRecoveryBundle({ runId: created.body.runId, eventLimit: 20 })).kind, "found");
+
+  currentNow = "2026-09-12T03:00:02.000Z";
+  const replay = await submitTurnCommand(request);
+  assert.equal(replay.status, 202);
+  assert.equal(deferred.length, 1);
+  await Promise.resolve(deferred.shift()!());
+  const duplicateReplay = await submitTurnCommand(request);
+  assert.equal(duplicateReplay.status, 200);
+  assert.equal(deferred.length, 0);
+  assert.equal(providerCalls, 0, "terminal checkpoint recovery must not call Provider");
+  assert.equal(store.executionPermitAttempts, 0, "outcome_unknown must not request a Host execution permit");
+  const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+  assert.equal(command?.status, "terminal");
+  assert.equal(command?.terminalStatus, "blocked");
+  assert.equal(command?.terminalCode, "tool_invocation_outcome_unknown");
+  const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 20 });
+  assert.equal(events.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(events.events.some((event) => event.kind === "run_failed"), false);
+});
+
+test("v2 SQLite legacy outcome_unknown survives migration and restart before one tool-unknown recovery settlement", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "meliora-v2-server-recovery-"));
+  const databasePath = join(parent, "legacy.sqlite");
+  let currentNow = fixedNow;
+  let store: SqliteSessionStore | undefined;
+  let stage = "v2_database_setup";
+  try {
+    const one = readFileSync(new URL("../../../packages/session-store/migrations/0001_initial.sql", import.meta.url), "utf8");
+    const two = readFileSync(new URL("../../../packages/session-store/migrations/0002_durable_commands.sql", import.meta.url), "utf8");
+    const legacy = new Database(databasePath);
+    legacy.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)");
+    legacy.exec(one); legacy.exec(two); legacy.pragma("user_version = 2");
+    legacy.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)").run(1, "0001_initial.sql", hashBytes(one), fixedNow);
+    legacy.prepare("INSERT INTO schema_migrations VALUES (?,?,?,?)").run(2, "0002_durable_commands.sql", hashBytes(two), fixedNow);
+    const ids = { sessionId: "legacy-session", turnId: "legacy-turn", runId: "legacy-run", attemptId: "legacy-attempt" };
+    const message = "恢复 legacy outcome unknown";
+    legacy.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run(ids.sessionId, workspaceId, fixedNow, fixedNow);
+    legacy.prepare("INSERT INTO turns VALUES (?,?,?,?,?)").run(ids.turnId, ids.sessionId, 1, fixedNow, fixedNow);
+    legacy.prepare("INSERT INTO runs VALUES (?,?,?,?,?,?,?)").run(ids.runId, ids.turnId, ids.sessionId, ids.attemptId, 1, fixedNow, fixedNow);
+    legacy.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(ids.attemptId, ids.runId, ids.sessionId, ids.turnId, 1, "created", 0, "m0-read-only-workspace-tools-v1", 1, "null", fixedNow, fixedNow);
+    legacy.prepare("INSERT INTO run_commands VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "local-user", workspaceId, "v2-outcome-unknown-replay", canonicalRunCommandRequestHash({ workspaceId, message }),
+      ids.sessionId, ids.turnId, ids.runId, ids.attemptId, "dispatched", null, null, fixedNow, fixedNow, fixedNow, fixedNow, null,
+    );
+    legacy.prepare("INSERT INTO run_command_inputs VALUES (?,?,?,?,?,?,?,?,?)").run(
+      ids.runId, ids.sessionId, ids.turnId, "meliora.private-user-input.v1", "user", "private", message, hashBytes(message), fixedNow,
+    );
+    const modelStepFingerprint = hashBytes("v2-terminal-model-step");
+    legacy.prepare("INSERT INTO model_steps VALUES (?,?,?,?,?,?,?,?,?)").run(
+      "legacy-terminal-model-step", ids.runId, ids.attemptId, modelStepFingerprint, "terminal", null, fixedNow, fixedNow, fixedNow,
+    );
+    const legacyInvocation = {
+      schemaVersion: "meliora.tool-invocation.v1", invocationId: "legacy-outcome-invocation", runId: ids.runId, attemptId: ids.attemptId,
+      toolName: "read_file", toolVersion: "1.0.0", arguments: {}, argumentsHash: hashBytes("v2-arguments"),
+      catalogHash: "m0-read-only-workspace-tools-v1", idempotencyKey: "v2-outcome-unknown-invocation", status: "executing",
+    };
+    const invocationJson = JSON.stringify(legacyInvocation);
+    legacy.prepare("INSERT INTO invocations VALUES (?,?,?,?,?,?,?,?,?)").run(
+      legacyInvocation.invocationId, ids.runId, ids.attemptId, "legacy-outcome-reservation", legacyInvocation.idempotencyKey,
+      invocationJson, hashBytes(invocationJson), "executing", fixedNow,
+    );
+    legacy.close();
+
+    class ObservedSqliteStore extends SqliteSessionStore {
+      executionPermitAttempts = 0;
+      override async beginInvocationExecution(...input: Parameters<SqliteSessionStore["beginInvocationExecution"]>) {
+        this.executionPermitAttempts += 1;
+        return super.beginInvocationExecution(input[0]);
+      }
+    }
+    stage = "v3_migration_and_reopen";
+    store = new ObservedSqliteStore(databasePath, { clock: () => new Date(currentNow), nonce: () => "v2-recovery-nonce" });
+    stage = "migrated_bundle_read";
+    const migrated = await store.readRecoveryBundle({ runId: ids.runId, eventLimit: 20 });
+    assert.equal(migrated.kind, "found");
+    if (migrated.kind !== "found") throw new Error("expected migrated recovery bundle");
+    assert.equal(migrated.bundle.latestModelStep?.status, "terminal");
+    assert.equal(migrated.bundle.invocations[0]?.invocation.status, "outcome_unknown");
+    assert.equal(migrated.bundle.invocations[0]?.receipt, null);
+
+    const deferred: Array<() => Promise<void>> = [];
+    let providerCalls = 0;
+    const submitTurnCommand = createTurnCommandSubmitter({
+      store,
+      workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+      model: { next: async () => { providerCalls += 1; return []; } },
+      ids: deterministicIds(),
+      now: () => currentNow,
+      leaseTtlMs: 1_000,
+      defer: (run) => { deferred.push(run); },
+    });
+    const request = { schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION, workspaceId, idempotencyKey: "v2-outcome-unknown-replay", message } as const;
+    stage = "concurrent_replay_submit";
+    const firstReplay = await submitTurnCommand(request);
+    const secondReplay = await submitTurnCommand(request);
+    assert.equal(firstReplay.status, 202); assert.equal(secondReplay.status, 202);
+    assert.equal(deferred.length, 2);
+    stage = "concurrent_replay_workers";
+    await Promise.all(deferred.splice(0).map((run) => run()));
+    stage = "terminal_replay";
+    const terminalReplay = await submitTurnCommand(request);
+    assert.equal(terminalReplay.status, 200);
+    assert.equal(providerCalls, 0);
+    assert.equal((store as ObservedSqliteStore).executionPermitAttempts, 0);
+    const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+    assert.equal(command?.status, "terminal");
+    assert.equal(command?.terminalStatus, "blocked");
+    assert.equal(command?.terminalCode, "tool_invocation_outcome_unknown");
+    stage = "post_settlement_bundle_read";
+    const after = await store.readRecoveryBundle({ runId: ids.runId, eventLimit: 20 });
+    assert.equal(after.kind, "found");
+    if (after.kind === "found") {
+      assert.equal(after.bundle.invocations[0]?.invocation.status, "outcome_unknown");
+      assert.equal(after.bundle.invocations[0]?.receipt, null);
+    }
+    const events = await store.readEvents({ runId: ids.runId, afterSequence: 0, limit: 20 });
+    assert.equal(events.events.filter((event) => event.kind === "run_blocked").length, 1);
+    assert.equal(events.events.some((event) => event.kind === "run_failed"), false);
+  } catch (error) {
+    throw new Error(`v2_recovery_fixture_failed_at_${stage}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    store?.close();
+    // Windows AV/indexing can retain SQLite's just-closed handle briefly. The
+    // fixture is isolated under the system temp directory, so cleanup must not
+    // turn a verified recovery assertion into an unrelated lock failure.
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+  }
+});
+
 test("lease loss after Host execution settles the unreceipted invocation only after recovery", async () => {
   let currentNow = fixedNow;
   const store = new LeaseLossAfterHostStore({ clock: () => new Date(currentNow) });
@@ -913,6 +1208,55 @@ for (const recoveryFailure of ["throw", "too_large", "not_found", "conflict", "i
       `indeterminate-recovery-${recoveryFailure}`,
       (clock) => new IndeterminateRecoveryAfterHostStore(recoveryFailure, { clock }),
     );
+  });
+}
+
+for (const shape of [
+  "outcome_unknown_with_receipt",
+  "executing_with_receipt",
+  "reserved_with_receipt",
+  "reserved_with_execution_started_at",
+  "executing_without_execution_started_at",
+  "outcome_unknown_with_execution_started_at",
+  "succeeded_with_matching_receipt",
+  "succeeded_without_receipt",
+  "failed_without_receipt",
+  "cancelled_without_receipt",
+  "reservation_invocation_mismatch",
+] as const) {
+  test(`recovery record ${shape} does not fall through to a terminal fallback`, async () => {
+    let currentNow = fixedNow;
+    const store = new SemanticallyTamperedRecoveryStore(shape, { clock: () => new Date(currentNow) });
+    const deferred: Array<() => Promise<void>> = [];
+    let providerCalls = 0;
+    const request = {
+      schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+      workspaceId,
+      idempotencyKey: `contradictory-recovery-${shape}`,
+      message: "读取入口文件",
+    } as const;
+    const submitTurnCommand = createTurnCommandSubmitter({
+      store,
+      workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+      model: { next: async ({ modelStepId }) => {
+        providerCalls += 1;
+        return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+      } },
+      ids: deterministicIds(),
+      now: () => currentNow,
+      leaseTtlMs: 1_000,
+      defer: (run) => { deferred.push(run); },
+    });
+    const created = await submitTurnCommand(request);
+    assert.equal(created.status, 202);
+    if (created.status !== 202) throw new Error("expected_created_command");
+    await Promise.resolve(deferred.shift()!());
+    assert.equal(providerCalls, 1, "the initial worker alone may call Provider");
+    assert.equal(store.hostArtifactWrites, 1, "the initial worker alone may reach Host");
+    const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+    assert.equal(command?.status, "dispatched");
+    const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 20 });
+    assert.equal(events.events.some((event) => /^run_(blocked|failed|completed|cancelled)$/u.test(event.kind)), false);
   });
 }
 
