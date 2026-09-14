@@ -961,6 +961,15 @@ export class SqliteSessionStore implements SessionStorePort {
 
         const publicAlias = `public-artifact-${this.nonce()}`;
         const physicalArtifactId = `staged-public-physical-${this.nonce()}`;
+        const provenanceCollision = this.db.prepare(`
+          SELECT 1 FROM staged_public_artifact_provenance
+          WHERE public_alias IN (?,?) OR physical_artifact_id IN (?,?)
+        `).get(publicAlias, physicalArtifactId, publicAlias, physicalArtifactId);
+        const artifactCollision = this.db.prepare("SELECT 1 FROM artifacts WHERE artifact_id IN (?,?)")
+          .get(publicAlias, physicalArtifactId);
+        if (provenanceCollision || artifactCollision) {
+          return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+        }
         const createdAt = this.clock().toISOString();
         this.db.prepare("INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)").run(
           physicalArtifactId, input.contentHash, "text/plain", Buffer.from(input.content), input.content.byteLength,

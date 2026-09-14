@@ -67,6 +67,7 @@ import type {
   ResolveStagedPublicArtifactResult,
   StagedPublicArtifactManifest,
 } from "./contracts";
+import { randomUUID } from "node:crypto";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
 import {
@@ -90,6 +91,9 @@ type MemorySessionStoreOptions = Readonly<{
   clock?: () => Date;
   nextLeaseToken?: () => string;
   nextReservationId?: () => string;
+  /** Test-only hooks. Public aliases and private physical IDs have separate nonce sources. */
+  nextPublicArtifactAliasNonce?: () => string;
+  nextPublicArtifactPhysicalNonce?: () => string;
   /** Test-only adapter hook; validates atomic rollback without changing the Port. */
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
 }>;
@@ -159,17 +163,20 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly leases = new Map<string, Lease>();
   private leaseSequence = 0;
   private reservationSequence = 0;
-  private publicArtifactSequence = 0;
 
   private readonly clock: () => Date;
   private readonly nextLeaseToken: () => string;
   private readonly nextReservationId: () => string;
+  private readonly nextPublicArtifactAliasNonce: () => string;
+  private readonly nextPublicArtifactPhysicalNonce: () => string;
   private readonly onAtomicTerminalWrite?: MemorySessionStoreOptions["onAtomicTerminalWrite"];
 
   constructor(options: MemorySessionStoreOptions = {}) {
     this.clock = options.clock ?? (() => new Date());
     this.nextLeaseToken = options.nextLeaseToken ?? (() => `lease-${++this.leaseSequence}`);
     this.nextReservationId = options.nextReservationId ?? (() => `reservation-${++this.reservationSequence}`);
+    this.nextPublicArtifactAliasNonce = options.nextPublicArtifactAliasNonce ?? (() => randomUUID());
+    this.nextPublicArtifactPhysicalNonce = options.nextPublicArtifactPhysicalNonce ?? (() => randomUUID());
     this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
   }
 
@@ -1062,10 +1069,9 @@ export class MemorySessionStore implements SessionStorePort {
       return { kind: "conflict", code: "invocation_execution_conflict" };
     }
 
-    const ordinal = ++this.publicArtifactSequence;
-    const alias = `public-artifact-${ordinal}`;
-    const physicalArtifactId = `staged-public-physical-${ordinal}`;
-    if (this.stagedPublicArtifacts.has(alias) || this.artifacts.has(physicalArtifactId)) {
+    const alias = `public-artifact-${this.nextPublicArtifactAliasNonce()}`;
+    const physicalArtifactId = `staged-public-physical-${this.nextPublicArtifactPhysicalNonce()}`;
+    if (this.stagedPublicArtifacts.has(alias) || this.artifacts.has(alias) || this.artifacts.has(physicalArtifactId)) {
       return { kind: "conflict", code: "public_artifact_provenance_conflict" };
     }
     const createdAt = this.clock().toISOString();

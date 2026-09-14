@@ -82,6 +82,12 @@ withStores("stage is opaque, exact-replays after lease expiry, and resolve is sc
     "artifactId", "byteLength", "contentHash", "createdAt", "mediaType", "projectionKind", "visibility",
   ]);
   assert.equal(await store.getArtifact(first.manifest.artifactId), null, "public alias must not be a physical artifact ID");
+  const aliasNonce = first.manifest.artifactId.slice("public-artifact-".length);
+  assert.equal(
+    await store.getArtifact(`staged-public-physical-${aliasNonce}`),
+    null,
+    "a manifest must not reveal a mechanically-derived private physical artifact ID",
+  );
   assert.deepEqual(await store.resolveStagedPublicArtifact({ runId: "run", sessionId: "session", artifactId: first.manifest.artifactId }), {
     kind: "found", manifest: first.manifest,
   });
@@ -270,6 +276,102 @@ test("sqlite fixed alias collision rolls back the second physical artifact", asy
     ]);
     assert.equal(db.prepare("SELECT count(*) FROM staged_public_artifact_provenance").pluck().get(), 1);
   } finally { store.close(); }
+});
+
+test("memory fixed alias collision fails closed before creating a second physical artifact", async () => {
+  let current = timestamp(2);
+  const aliasNonces = ["same-alias", "same-alias"];
+  const physicalNonces = ["physical-one", "physical-two"];
+  const store = new MemorySessionStore({
+    clock: () => new Date(current),
+    nextPublicArtifactAliasNonce: () => aliasNonces.shift() ?? "unexpected-alias",
+    nextPublicArtifactPhysicalNonce: () => physicalNonces.shift() ?? "unexpected-physical",
+  });
+  const first = await createReady(store, (value) => { current = value; });
+  const second = await createReady(store, (value) => { current = value; }, {
+    sessionId: "session-other", turnId: "turn-other", runId: "run-other", attemptId: "attempt-other", invocationId: "invocation-other",
+  });
+  assert.equal((await store.stagePublicToolResultDerivative(first.input)).kind, "staged");
+  assert.deepEqual(await store.stagePublicToolResultDerivative(second.input), {
+    kind: "conflict", code: "public_artifact_provenance_conflict",
+  });
+  const raw = store as unknown as { artifacts: Map<string, unknown> };
+  assert.deepEqual([...raw.artifacts.keys()].filter((id) => id.startsWith("staged-public-physical-")).sort(), [
+    "staged-public-physical-physical-one",
+  ]);
+});
+
+test("memory generic artifact alias collision fails closed without a staged orphan", async () => {
+  let current = timestamp(2);
+  const store = new MemorySessionStore({
+    clock: () => new Date(current),
+    nextPublicArtifactAliasNonce: () => "reserved-alias",
+    nextPublicArtifactPhysicalNonce: () => "unused-physical",
+  });
+  const ready = await createReady(store, (value) => { current = value; });
+  const alias = "public-artifact-reserved-alias";
+  const content = new TextEncoder().encode("existing generic artifact");
+  await store.putArtifact({
+    artifactId: alias, content, contentHash: hashBytes(content), mediaType: "text/plain", visibility: "private", createdAt: timestamp(),
+  });
+
+  assert.deepEqual(await store.stagePublicToolResultDerivative(ready.input), {
+    kind: "conflict", code: "public_artifact_provenance_conflict",
+  });
+  const raw = store as unknown as { artifacts: Map<string, unknown>; stagedPublicArtifacts: Map<string, unknown> };
+  assert.equal(raw.artifacts.has("staged-public-physical-unused-physical"), false);
+  assert.equal(raw.stagedPublicArtifacts.size, 0);
+});
+
+test("sqlite generic artifact alias collision fails closed without a staged orphan", async (t) => {
+  let current = timestamp(2);
+  const nonces = ["lease", "reservation", "reserved-alias", "unused-physical"];
+  const store = new SqliteSessionStore(createTempDatabase(t), {
+    clock: () => new Date(current),
+    nonce: () => nonces.shift() ?? "unexpected-nonce",
+  });
+  try {
+    const ready = await createReady(store, (value) => { current = value; });
+    const alias = "public-artifact-reserved-alias";
+    const content = new TextEncoder().encode("existing generic artifact");
+    await store.putArtifact({
+      artifactId: alias, content, contentHash: hashBytes(content), mediaType: "text/plain", visibility: "private", createdAt: timestamp(),
+    });
+
+    assert.deepEqual(await store.stagePublicToolResultDerivative(ready.input), {
+      kind: "conflict", code: "public_artifact_provenance_conflict",
+    });
+    const db = (store as unknown as { db: Database.Database }).db;
+    assert.equal(db.prepare("SELECT count(*) FROM artifacts WHERE artifact_id=?").pluck().get("staged-public-physical-unused-physical"), 0);
+    assert.equal(db.prepare("SELECT count(*) FROM staged_public_artifact_provenance").pluck().get(), 0);
+  } finally { store.close(); }
+});
+
+test("memory manifest cannot derive its private physical artifact ID", async () => {
+  let current = timestamp(2);
+  const store = new MemorySessionStore({
+    clock: () => new Date(current),
+    nextPublicArtifactAliasNonce: () => "manifest-only-alias-nonce",
+    nextPublicArtifactPhysicalNonce: () => "private-only-physical-nonce",
+  });
+  const ready = await createReady(store, (value) => { current = value; });
+  const staged = await store.stagePublicToolResultDerivative(ready.input);
+  assert.equal(staged.kind, "staged");
+  if (staged.kind !== "staged") throw new Error("not_staged");
+
+  const derivedPhysicalId = `staged-public-physical-${staged.manifest.artifactId.slice("public-artifact-".length)}`;
+  assert.equal(derivedPhysicalId, "staged-public-physical-manifest-only-alias-nonce");
+  assert.equal(await store.getArtifact(derivedPhysicalId), null);
+  assert.equal(staged.manifest.artifactId.includes("private-only-physical-nonce"), false);
+  assert.equal((await store.getArtifact("staged-public-physical-private-only-physical-nonce"))?.artifactId,
+    "staged-public-physical-private-only-physical-nonce");
+
+  const replay = await store.stagePublicToolResultDerivative(ready.input);
+  assert.equal(replay.kind, "replay");
+  if (replay.kind === "replay") assert.deepEqual(replay.manifest, staged.manifest);
+
+  const raw = store as unknown as { artifacts: Map<string, unknown> };
+  assert.equal(raw.artifacts.has("staged-public-physical-private-only-physical-nonce"), true);
 });
 
 test("sqlite v3 public artifacts are not backfilled into staged provenance", async (t) => {
