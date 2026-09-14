@@ -14,6 +14,7 @@ import {
 } from "../../packages/agent-runtime/read-only-run-loop";
 import type { CanonicalModelEvent } from "../../packages/model-protocol/contracts";
 import { MemorySessionStore } from "../../packages/session-store/memory-session-store";
+import { canonicalRunCommandRequestHash } from "../../packages/session-store/run-command-contract";
 import {
   createReadOnlyWorkspaceTools,
   type PrivateToolArtifactWriter,
@@ -123,9 +124,20 @@ try {
         messages: input.messages,
         catalogHash: input.catalog.catalogHash,
       })));
-      return { kind: "started", requestFingerprint };
+      const result = await store.startModelStep({
+        runId: input.runId, attemptId: input.attemptId, leaseToken: input.leaseToken,
+        modelStepId: input.modelStepId, requestFingerprint, startedAt: input.startedAt,
+      });
+      return result.kind === "started"
+        ? { kind: "started", requestFingerprint }
+        : result.kind === "replay"
+          ? { kind: "replay", requestFingerprint: result.checkpoint.requestFingerprint, status: result.checkpoint.status === "terminal" ? "terminal" : "failed" }
+          : { kind: "conflict", code: result.code };
     },
-    finish: async () => ({ kind: "committed" }),
+    finish: async (input) => {
+      const result = await store.finishModelStep(input);
+      return result.kind === "conflict" ? { kind: "conflict", code: result.code } : { kind: result.kind };
+    },
   };
   const loop = new ReadOnlyRunLoop({
     store,
@@ -174,6 +186,21 @@ try {
     principalId: "integration-user",
   });
 
+  const command = await store.reserveRunCommand({
+    localPrincipalId: "integration-principal", workspaceId, idempotencyKey: "integration-key",
+    sessionId: "session-read-only-integration", turnId: "turn-read-only-integration", runId: "run-read-only-integration", attemptId: "attempt-read-only-integration",
+    catalogHash: catalog.catalogHash, intentRevision: 1, userMessage: "读取真实工作区入口文件", reservedAt: fixedNow,
+    canonicalRequestHash: canonicalRunCommandRequestHash({ workspaceId, message: "读取真实工作区入口文件" }),
+  });
+  assert.equal(command.kind, "owner");
+  const lease = await store.acquireLease({ runId: "run-read-only-integration", attemptId: "attempt-read-only-integration", ownerId: "integration-worker", ttlMs: 60_000, requestedAt: fixedNow });
+  assert.equal(lease.kind, "acquired");
+  if (lease.kind !== "acquired") throw new Error("lease");
+  assert.equal((await store.transitionRunCommand({
+    localPrincipalId: "integration-principal", workspaceId, idempotencyKey: "integration-key",
+    runId: "run-read-only-integration", attemptId: "attempt-read-only-integration", leaseToken: lease.leaseToken,
+    expectedStatus: "reserved", nextStatus: "accepted", updatedAt: fixedNow,
+  })).kind, "updated");
   const result = await loop.run({
     sessionId: "session-read-only-integration",
     workspaceId,
@@ -182,7 +209,7 @@ try {
     attemptId: "attempt-read-only-integration",
     intentRevision: 1,
     catalog,
-    userMessage: "读取真实工作区入口文件",
+    userMessage: "读取真实工作区入口文件", precreated: { leaseToken: lease.leaseToken },
   });
 
   assert.equal(modelCalls, 2, "model -> tool -> provider follow-up must complete");
@@ -200,6 +227,26 @@ try {
   assert.equal(receipt.status, "succeeded");
   assert.equal(receipt.outputArtifactId, publicArtifactId, "receipt must reference only server-owned public evidence");
   assert.deepEqual(receipt.verificationArtifactIds, [publicArtifactId]);
+
+  const latestSnapshot = await store.readSnapshot("run-read-only-integration");
+  assert.ok(latestSnapshot, "the second atomic Model Step must advance the current recovery snapshot");
+  assert.deepEqual(latestSnapshot.state.receiptRefs, [result.outcome.receiptRefs[0]!]);
+  assert.deepEqual(latestSnapshot.state.verificationRefs, [{
+    artifactId: privateArtifactId,
+    contentHash: contentHash(new TextEncoder().encode(sourceContent)),
+    mediaType: "text/plain",
+    byteLength: new TextEncoder().encode(sourceContent).byteLength,
+    visibility: "private",
+  }]);
+  const latestHistory = await store.getArtifact(latestSnapshot.state.modelHistoryArtifact.artifactId);
+  assert.ok(latestHistory);
+  const latestHistoryPayload = JSON.parse(new TextDecoder().decode(latestHistory.content)) as { messages: Array<{ role: string; content: string }> };
+  assert.deepEqual(latestHistoryPayload.messages.map((message) => ({ role: message.role, content: message.content })), [
+    { role: "user", content: "读取真实工作区入口文件" },
+    { role: "assistant", content: "我先读取入口文件。" },
+    { role: "tool", content: safeProjection },
+    { role: "assistant", content: "入口文件已读取并完成可验证核验。" },
+  ]);
 
   const privateArtifact = await store.getArtifact(privateArtifactId);
   assert.ok(privateArtifact);

@@ -98,6 +98,9 @@ assert.deepEqual(await store.appendEvents({ ...{
 const reserved = await store.reserveInvocation({ invocation, leaseToken: initialLease.leaseToken, reservedAt: timestamp() });
 assert.equal(reserved.kind, "owner");
 if (reserved.kind !== "owner") throw new Error("expected reservation owner");
+assert.equal((await store.beginInvocationExecution({
+  runId: "run-1", attemptId: "attempt-1", leaseToken: initialLease.leaseToken, reservationId: reserved.reservationId,
+})).kind, "started");
 assert.deepEqual(await store.commitReceipt({
   runId: "run-1", attemptId: "attempt-1", leaseToken: initialLease.leaseToken, reservationId: reserved.reservationId, receipt,
 }), { kind: "committed", receiptId: "receipt-1" });
@@ -226,7 +229,7 @@ assert.deepEqual(await store.appendEvents({
 }), { kind: "conflict", code: "lease_expired" });
 assert.deepEqual(await store.commitReceipt({
   runId: "run-1", attemptId: "attempt-1", leaseToken: initialLease.leaseToken, reservationId: reserved.reservationId, receipt,
-}), { kind: "conflict", code: "lease_expired" });
+}), { kind: "replay", receiptId: receipt.receiptId });
 now += 1_000;
 assert.deepEqual(await store.acquireLease({
   runId: "run-1",
@@ -240,7 +243,7 @@ console.log(JSON.stringify({
   gate: "session-store-contract",
   status: "PASS",
   expectedSequenceCas: true,
-  leaseExpiryRejectsAppendAndCommit: true,
+  leaseExpiryRejectsNewWritesButAllowsExactReceiptReplay: true,
   reservationReplayRecoversInvocationAndReceipt: true,
   recoveryReads: true,
   activeLeaseBlocksRecoveryAndExpiredLeaseTransfersAtomically: true,

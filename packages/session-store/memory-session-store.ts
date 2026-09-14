@@ -532,6 +532,7 @@ export class MemorySessionStore implements SessionStorePort {
     assertValidGeneratedId(input.modelStepId);
     assertValidModelStepFingerprint(input.requestFingerprint);
     assertValidCommandTimestamp(input.outcome.finishedAt);
+    if (input.outcome.status === "terminal") return { kind: "conflict", code: "terminal_model_step_commit_required" };
     if (input.outcome.status === "failed") assertValidSafeCode(input.outcome.failureCode);
     if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) {
       return { kind: "conflict", code: "run_attempt_conflict" };
@@ -549,14 +550,12 @@ export class MemorySessionStore implements SessionStorePort {
       failureCode: _failureCode,
       ...checkpointBase
     } = existing;
-    const desired: StoredModelStepCheckpoint = input.outcome.status === "terminal"
-      ? { ...checkpointBase, status: "terminal", finishedAt: input.outcome.finishedAt }
-      : {
-          ...checkpointBase,
-          status: "failed",
-          finishedAt: input.outcome.finishedAt,
-          failureCode: input.outcome.failureCode,
-        };
+    const desired: StoredModelStepCheckpoint = {
+      ...checkpointBase,
+      status: "failed",
+      finishedAt: input.outcome.finishedAt,
+      failureCode: input.outcome.failureCode,
+    };
     if (existing.status !== "started") {
       return sameDocument(existing, desired)
         ? { kind: "replay", checkpoint: existing }
@@ -753,6 +752,7 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
+    if (input.snapshot.state.terminalModelStepResult !== undefined) throw new Error("terminal_model_step_commit_required");
     this.assertSnapshotIntegrity(input.snapshot);
     if (!Number.isInteger(input.snapshot.throughSequence) || input.snapshot.throughSequence < 0) {
       throw new Error("snapshot_sequence_conflict");
@@ -958,13 +958,11 @@ export class MemorySessionStore implements SessionStorePort {
   }
 
   async commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult> {
-    if (!this.attemptForRun(input.runId, input.attemptId)) {
-      return { kind: "conflict", code: "run_attempt_conflict" };
-    }
-    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
-    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
     const reservation = this.reservations.get(input.reservationId);
     if (!reservation || reservation.runId !== input.runId || reservation.attemptId !== input.attemptId || reservation.invocationId !== input.receipt.invocationId) {
+      if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
       return { kind: "conflict", code: "invocation_reservation_conflict" };
     }
     if (input.receipt.runId !== input.runId || input.receipt.attemptId !== input.attemptId) {
@@ -980,6 +978,14 @@ export class MemorySessionStore implements SessionStorePort {
       return sameDocument(existing, input.receipt)
         ? { kind: "replay", receiptId: existing.receiptId }
         : { kind: "conflict", code: "receipt_conflict" };
+    }
+    if (!this.attemptForRun(input.runId, input.attemptId) || this.runs.get(input.runId)?.activeAttemptId !== input.attemptId) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    if (reservation.status !== "executing" || reservation.executionStartedAt === undefined || invocation.status !== "executing") {
+      return { kind: "conflict", code: "invocation_execution_conflict" };
     }
     const key = receiptKey(input.runId, input.attemptId, input.receipt.receiptId);
     const receiptWithSameId = this.receipts.get(key);

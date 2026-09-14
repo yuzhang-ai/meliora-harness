@@ -10,8 +10,8 @@ import type { PublicRunEvent } from "../../../packages/agent-runtime/public-even
 import type { ReadOnlyRunModelPort } from "../../../packages/agent-runtime/read-only-run-loop.js";
 import { MemorySessionStore } from "../../../packages/session-store/memory-session-store.js";
 import type {
-  FinishModelStepInput,
-  FinishModelStepResult,
+  CommitTerminalModelStepResultAndSnapshotInput,
+  CommitTerminalModelStepResultAndSnapshotResult,
   SessionStorePort,
   SettleRunCommandWithTerminalEventInput,
   SettleRunCommandWithTerminalEventResult,
@@ -290,19 +290,42 @@ class BlockingCheckpointStore extends MemorySessionStore {
   }
 }
 
-class ThrowingFinishModelStepStore extends MemorySessionStore {
-  override async finishModelStep(_input: FinishModelStepInput): Promise<FinishModelStepResult> {
-    throw new Error("injected_finish_model_step_failure");
+class ThrowingAtomicTerminalCommitStore extends MemorySessionStore {
+  override async commitTerminalModelStepResultAndSnapshot(_input: CommitTerminalModelStepResultAndSnapshotInput): Promise<CommitTerminalModelStepResultAndSnapshotResult> {
+    throw new Error("injected_atomic_terminal_commit_failure");
   }
 }
 
-class ConflictingFinishModelStepStore extends MemorySessionStore {
-  override async finishModelStep(_input: FinishModelStepInput): Promise<FinishModelStepResult> {
-    return { kind: "conflict", code: "model_step_conflict" };
+class ConflictingAtomicTerminalCommitStore extends MemorySessionStore {
+  override async commitTerminalModelStepResultAndSnapshot(_input: CommitTerminalModelStepResultAndSnapshotInput): Promise<CommitTerminalModelStepResultAndSnapshotResult> {
+    return { kind: "conflict", code: "terminal_model_step_result_conflict" };
   }
 }
 
-class FailingAtomicRunBlockedSettlementStore extends ThrowingFinishModelStepStore {
+class UncertainReceiptCommitStore extends MemorySessionStore {
+  receiptAttempts = 0;
+  toolArtifactWrites = 0;
+
+  constructor(
+    private readonly failure: "throw" | "conflict",
+    options: ConstructorParameters<typeof MemorySessionStore>[0],
+  ) {
+    super(options);
+  }
+
+  override async putArtifact(...input: Parameters<MemorySessionStore["putArtifact"]>) {
+    if (input[0].visibility === "private" && input[0].mediaType === "text/plain") this.toolArtifactWrites += 1;
+    return super.putArtifact(input[0]);
+  }
+
+  override async commitReceipt(..._input: Parameters<MemorySessionStore["commitReceipt"]>) {
+    this.receiptAttempts += 1;
+    if (this.failure === "throw") throw new Error("injected_commit_receipt_failure");
+    return { kind: "conflict" as const, code: "invocation_execution_conflict" as const };
+  }
+}
+
+class FailingAtomicRunBlockedSettlementStore extends ThrowingAtomicTerminalCommitStore {
   // This is the Store boundary that must keep the public terminal event and
   // command terminal state indivisible.  Failing it must leave neither fact.
   private remainingAtomicSettlementFailures = 1;
@@ -366,10 +389,10 @@ test("Model Step checkpoint conflict fails closed without calling the Provider",
   }
 });
 
-test("finishModelStep failures preserve the started checkpoint and block provider retry", async (t) => {
+test("atomic terminal commit failures preserve the started checkpoint and block provider retry", async (t) => {
   for (const scenario of [
-    { name: "throw", store: () => new ThrowingFinishModelStepStore({ clock: () => new Date(fixedNow) }) },
-    { name: "conflict", store: () => new ConflictingFinishModelStepStore({ clock: () => new Date(fixedNow) }) },
+    { name: "throw", store: () => new ThrowingAtomicTerminalCommitStore({ clock: () => new Date(fixedNow) }) },
+    { name: "conflict", store: () => new ConflictingAtomicTerminalCommitStore({ clock: () => new Date(fixedNow) }) },
   ] as const) {
     await t.test(scenario.name, async () => {
       const store = scenario.store();
@@ -379,8 +402,8 @@ test("finishModelStep failures preserve the started checkpoint and block provide
       const request = {
         schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
         workspaceId,
-        idempotencyKey: `finish-model-step-${scenario.name}`,
-        message: "检查 finish checkpoint 故障",
+        idempotencyKey: `atomic-terminal-commit-${scenario.name}`,
+        message: "检查原子 terminal commit 故障",
       } as const;
       const submitTurnCommand = createTurnCommandSubmitter({
         store,
@@ -434,6 +457,65 @@ test("finishModelStep failures preserve the started checkpoint and block provide
       assert.equal(replay.body.terminalCode, "model_step_outcome_unknown");
       assert.equal(deferred.length, 0);
       assert.equal(modelCalls, 1);
+    });
+  }
+});
+
+test("uncertain receipt commits block atomically without replaying Provider or Host", async (t) => {
+  for (const failure of ["throw", "conflict"] as const) {
+    await t.test(failure, async () => {
+      const store = new UncertainReceiptCommitStore(failure, { clock: () => new Date(fixedNow) });
+      const ids = deterministicIds();
+      const deferred: Array<() => Promise<void>> = [];
+      let modelCalls = 0;
+      const request = {
+        schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+        workspaceId,
+        idempotencyKey: `receipt-uncertain-${failure}`,
+        message: "读取入口文件",
+      } as const;
+      const submitTurnCommand = createTurnCommandSubmitter({
+        store,
+        workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+        model: {
+          next: async ({ modelStepId }) => {
+            modelCalls += 1;
+            return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+          },
+        },
+        ids,
+        now: () => fixedNow,
+        defer: (run) => { deferred.push(run); },
+      });
+      const created = await submitTurnCommand(request);
+      assert.equal(created.status, 202);
+      await Promise.resolve(deferred.shift()!());
+
+      assert.equal(modelCalls, 1);
+      assert.equal(store.toolArtifactWrites, 1, "the successful Host call happens once before its receipt uncertainty");
+      assert.equal(store.receiptAttempts, 1);
+      const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+      assert.equal(command?.status, "terminal");
+      assert.equal(command?.status === "terminal" ? command.terminalStatus : null, "blocked");
+      assert.equal(command?.status === "terminal" ? command.terminalCode : null, "tool_invocation_outcome_unknown");
+      const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+      assert.equal(events.events.filter((event) => event.kind === "run_blocked").length, 1);
+      assert.equal(events.events.some((event) => event.kind === "run_failed"), false);
+      const bundle = await store.readRecoveryBundle({ runId: created.body.runId, eventLimit: 20 });
+      assert.equal(bundle.kind, "found");
+      if (bundle.kind === "found") {
+        assert.equal(bundle.bundle.invocations[0]?.invocation.status, "executing");
+        assert.equal(bundle.bundle.invocations[0]?.receipt, null);
+      }
+
+      const replay = await submitTurnCommand(request);
+      assert.equal(replay.status, 200);
+      assert.equal(replay.body.disposition, "replay");
+      assert.equal(replay.body.commandStatus, "terminal");
+      assert.equal(deferred.length, 0);
+      assert.equal(modelCalls, 1);
+      assert.equal(store.toolArtifactWrites, 1);
+      assert.equal(store.receiptAttempts, 1);
     });
   }
 });

@@ -294,14 +294,14 @@ for (const adapter of adapters) {
       assert.deepEqual(await harness.store.finishModelStep({
         ...finishInput,
         outcome: { status: "terminal", finishedAt: timestamp(2_000) },
-      }), { kind: "conflict", code: "model_step_conflict" });
-      assert.equal((await harness.store.finishModelStep(finishInput)).kind, "committed");
-      assert.equal((await harness.store.finishModelStep(finishInput)).kind, "replay");
+      }), { kind: "conflict", code: "terminal_model_step_commit_required" });
+      assert.deepEqual(await harness.store.finishModelStep(finishInput), { kind: "conflict", code: "terminal_model_step_commit_required" });
+      assert.deepEqual(await harness.store.finishModelStep(finishInput), { kind: "conflict", code: "terminal_model_step_commit_required" });
       assert.deepEqual(await harness.store.finishModelStep({
         ...finishInput,
         outcome: { status: "terminal", finishedAt: timestamp(5_000) },
-      }), { kind: "conflict", code: "model_step_conflict" });
-      assert.equal((await harness.store.readLatestModelStep({ runId: input.runId }))?.status, "terminal");
+      }), { kind: "conflict", code: "terminal_model_step_commit_required" });
+      assert.equal((await harness.store.readLatestModelStep({ runId: input.runId }))?.status, "started");
 
       const terminal = await harness.store.transitionRunCommand({
         localPrincipalId: input.localPrincipalId,

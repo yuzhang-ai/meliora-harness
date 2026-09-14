@@ -48,6 +48,7 @@ const CATALOG_VERSION = "m0-read-only-workspace-tools-v1";
 const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
 const MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE = "模型步骤结果未知，已停止自动重发 Provider 请求。";
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE = "tool_invocation_outcome_unknown";
 
 export type TurnCommandIds = ReadOnlyRunIds & Readonly<{
   nextSessionId(): string;
@@ -385,17 +386,25 @@ const appendWorkerFailureEvent = async (
   });
 };
 
-const settleStartedModelStepAsUnknown = async (
+const settleOutcomeUnknown = async (
   store: SessionStorePort,
   command: StoredRunCommand,
   leaseToken: string,
   ids: TurnCommandIds,
   now: () => string,
+  input: Readonly<{
+    code: string;
+    message: string;
+    userActions: readonly string[];
+    requireStartedModelStep: boolean;
+  }>,
 ): Promise<boolean> => {
   const latestCommand = await store.readRunCommand(commandScope(command));
   if (!latestCommand || latestCommand.status === "terminal") return false;
-  const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
-  if (latestStep?.status !== "started") return false;
+  if (input.requireStartedModelStep) {
+    const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
+    if (latestStep?.status !== "started") return false;
+  }
   try {
     const sequence = await latestSequence(store, latestCommand.runId);
     await store.settleRunCommandWithTerminalEvent({
@@ -406,7 +415,7 @@ const settleStartedModelStepAsUnknown = async (
       expectedCommandStatus: latestCommand.status,
       expectedSequence: sequence,
       terminalStatus: "blocked",
-      terminalCode: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+      terminalCode: input.code,
       updatedAt: now(),
       terminalEvent: {
         schemaVersion: "meliora.session-event.v1",
@@ -414,9 +423,9 @@ const settleStartedModelStepAsUnknown = async (
         kind: "run_blocked",
         visibility: "public",
         payload: {
-          code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
-          message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
-          userActions: [...MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS],
+          code: input.code,
+          message: input.message,
+          userActions: [...input.userActions],
         },
         createdAt: now(),
       },
@@ -453,7 +462,12 @@ const runWorker = async (
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
-      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
+      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+        userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+        requireStartedModelStep: true,
+      });
       return;
     }
     if (current.status === "reserved") {
@@ -522,17 +536,27 @@ const runWorker = async (
     const code = result.outcome.status === "completed"
       ? undefined
       : result.outcome.unresolved[0]?.code ?? result.outcome.status;
-    if (result.outcome.status === "blocked" && code === MODEL_STEP_OUTCOME_UNKNOWN_CODE) {
-      // The Run Loop deliberately deferred this one terminal event.  The Store
-      // writes it only together with Command terminal state; a failed atomic
-      // settlement leaves dispatched + started for safe recovery.
-      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
+    if (result.outcome.status === "blocked" && (code === MODEL_STEP_OUTCOME_UNKNOWN_CODE || code === TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE)) {
+      // The Run Loop deliberately deferred these ambiguous-outcome terminal
+      // events. Store writes the public terminal event and Command terminal
+      // state together; failed settlement leaves both facts absent.
+      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code,
+        message: result.outcome.summary,
+        userActions: result.outcome.userActions,
+        requireStartedModelStep: code === MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+      });
       return;
     }
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
-      if (await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now)
+      if (await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+        userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+        requireStartedModelStep: true,
+      })
         .catch(() => false)) {
         return;
       }

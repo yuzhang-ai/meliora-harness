@@ -37,6 +37,7 @@ test("reservation is idempotent across crash and receipt commit is durable", asy
   const recovered = new SqliteSessionStore(path, { clock: () => new Date(now) });
   const replay = await recovered.reserveInvocation({ invocation: call, leaseToken: "stale", reservedAt: timestamp() });
   assert.equal(replay.kind, "replay"); assert.equal(replay.kind === "replay" ? replay.receipt : undefined, null);
+  assert.equal((await recovered.beginInvocationExecution({ runId: "run-1", attemptId: "attempt-1", leaseToken: lease.leaseToken, reservationId: "reservation-1" })).kind, "started");
   const committed = await recovered.commitReceipt({ runId: "run-1", attemptId: "attempt-1", leaseToken: lease.leaseToken, reservationId: "reservation-1", receipt: receipt() });
   assert.deepEqual(committed, { kind: "committed", receiptId: "receipt-invocation-1" });
   assert.deepEqual(await recovered.commitReceipt({ runId: "run-1", attemptId: "attempt-1", leaseToken: lease.leaseToken, reservationId: "reservation-1", receipt: receipt() }), { kind: "replay", receiptId: "receipt-invocation-1" });
@@ -51,6 +52,9 @@ test("reservation is idempotent across crash and receipt commit is durable", asy
   });
   assert.equal(secondReservation.kind, "owner");
   if (secondReservation.kind !== "owner") throw new Error("expected second reservation owner");
+  assert.equal((await recovered.beginInvocationExecution({
+    runId: "run-1", attemptId: "attempt-1", leaseToken: lease.leaseToken, reservationId: secondReservation.reservationId,
+  })).kind, "started");
   assert.deepEqual(await recovered.commitReceipt({
     runId: "run-1",
     attemptId: "attempt-1",
@@ -99,6 +103,9 @@ test("recovery distinguishes crashes before execution, during execution and afte
   });
   assert.equal(afterReservation.kind, "owner");
   if (afterReservation.kind !== "owner") throw new Error("expected receipt reservation owner");
+  assert.equal((await first.beginInvocationExecution({
+    runId: "run-1", attemptId: "attempt-1", leaseToken: firstLease.leaseToken, reservationId: afterReservation.reservationId,
+  })).kind, "started");
   assert.equal((await first.commitReceipt({
     runId: "run-1",
     attemptId: "attempt-1",

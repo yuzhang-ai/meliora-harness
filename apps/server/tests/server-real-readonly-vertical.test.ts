@@ -125,6 +125,19 @@ const readJson = async (request: IncomingMessage): Promise<Readonly<Record<strin
 const frame = (chunk: Readonly<Record<string, unknown>>): string =>
   `data: ${JSON.stringify(chunk)}\n\n`;
 
+/**
+ * Wait for a real asynchronous observation, not a timing guess. `setImmediate`
+ * yields to the fixture provider's request-body reader without adding a fixed
+ * sleep; the deadline makes a lost observation fail deterministically.
+ */
+const waitFor = async (description: string, condition: () => boolean, timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed_out_waiting_for_${description}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+};
+
 const toolContentFromBody = (body: Readonly<Record<string, unknown>>): string => {
   const messages = body.messages;
   if (!Array.isArray(messages)) return "";
@@ -482,13 +495,15 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     const privateArtifact = await store.getArtifact(privateArtifactId);
     assert.equal(privateArtifact?.visibility, "private", "deterministic fixture IDs must identify the raw tool artifact");
     assert.equal(publicArtifactIds.has(privateArtifactId), false, "public event references must exclude the raw tool artifact");
+    const snapshot = await store.readSnapshot(created.runId);
+    assert.ok(snapshot, "the private recovery snapshot must retain verified private evidence");
+    assert.ok(snapshot?.state.verificationRefs.some((ref) => ref.artifactId === privateArtifactId && ref.visibility === "private"));
     const publicSurface = JSON.stringify({
       createBody,
       sseBody: firstBody,
       events,
       publicStoredEvents,
       publicArtifactContents,
-      snapshot: await store.readSnapshot(created.runId),
       visibleAssistantText,
     });
     for (const forbiddenValue of [
@@ -670,6 +685,7 @@ test(`Server blocks ambiguous Provider ${providerScenario.name} without retry pe
     assert.equal(command?.status, "terminal");
     assert.equal(command?.status === "terminal" ? command.terminalStatus : null, "blocked");
     assert.equal(command?.status === "terminal" ? command.terminalCode : null, "model_step_outcome_unknown");
+    await waitFor("first_provider_capture", () => provider.captured.length === 1);
     assert.equal(provider.captured.length, 1);
 
     const replayResponse = await postTurn(app.url, "触发 Provider 模糊失败", idempotencyKey);

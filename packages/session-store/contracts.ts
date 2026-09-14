@@ -254,7 +254,7 @@ export type FinishModelStepResult =
   | Readonly<{ kind: "replay"; checkpoint: StoredModelStepCheckpoint }>
   | Readonly<{
       kind: "conflict";
-      code: "model_step_conflict" | "run_attempt_conflict" | "lease_not_held" | "lease_expired";
+      code: "model_step_conflict" | "terminal_model_step_commit_required" | "run_attempt_conflict" | "lease_not_held" | "lease_expired";
     }>;
 
 export type ReadModelStepInput = Readonly<{
@@ -703,6 +703,7 @@ export type CommitReceiptResult =
         | "lease_expired"
         | "run_attempt_conflict"
         | "invocation_reservation_conflict"
+        | "invocation_execution_conflict"
         | "receipt_conflict";
     }>;
 
@@ -828,7 +829,7 @@ export interface SessionStorePort extends RecoveryReadPort {
   ): Promise<SettleRunCommandWithTerminalEventResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
-  /** @deprecated Compatibility-only; not recovery-safe for terminal result snapshots. */
+  /** B1b: only deterministic failed outcomes may use this; terminal requires atomic commit. */
   finishModelStep(input: FinishModelStepInput): Promise<FinishModelStepResult>;
   commitTerminalModelStepResultAndSnapshot(
     input: CommitTerminalModelStepResultAndSnapshotInput,
@@ -841,18 +842,18 @@ export interface SessionStorePort extends RecoveryReadPort {
   createRunAttempt(input: CreateRunAttemptInput): Promise<CreateRunAttemptResult>;
   appendEvents(input: AppendEventsInput): Promise<AppendEventsResult>;
   readEvents(input: ReadEventsInput): Promise<EventPage>;
-  /** @deprecated Compatibility-only for terminal bindings; use atomic commit above in B1b. */
+  /** Legacy non-terminal checkpoint helper; terminal bindings require atomic commit. */
   writeSnapshot(input: WriteSnapshotInput): Promise<void>;
   readSnapshot(runId: string): Promise<RunSnapshot | null>;
   reserveInvocation(input: InvocationReservationInput): Promise<ReservationResult>;
-  /** Dormant B1a execution CAS. It grants no permit until Runtime cutover B1b. */
+  /** B1b execution permit: only `started` authorizes Host execution. */
   beginInvocationExecution(input: BeginInvocationExecutionInput): Promise<BeginInvocationExecutionResult>;
   readInvocation(input: ReadInvocationInput): Promise<NormalizedToolInvocation | null>;
   readReservation(input: ReadReservationInput): Promise<StoredInvocationReservation | null>;
   readInvocationByIdempotencyKey(
     input: ReadInvocationByIdempotencyKeyInput,
   ): Promise<InvocationReconciliationRecord | null>;
-  /** @deprecated Compatibility path; B1a intentionally does not require beginInvocationExecution. */
+  /** New Receipts require a durable `executing` reservation; exact Receipts replay. */
   commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult>;
   readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null>;
   putArtifact(input: PutArtifactInput): Promise<ArtifactRef>;
