@@ -215,7 +215,9 @@ try {
   assert.equal(modelCalls, 2, "model -> tool -> provider follow-up must complete");
   assert.equal(result.outcome.status, "completed");
   assert.equal(result.outcome.receiptRefs.length, 1);
-  assert.deepEqual(result.outcome.evidenceRefs, [publicArtifactId]);
+  assert.equal(result.outcome.evidenceRefs.length, 1);
+  const publicAlias = result.outcome.evidenceRefs[0]!;
+  assert.match(publicAlias, /^public-artifact-/u);
   assert.deepEqual(result.outcome.verificationRefs, ["verification-real-workspace-read"]);
 
   const receipt = await store.readReceipt({
@@ -225,8 +227,8 @@ try {
   });
   assert.ok(receipt, "the outcome must only be accepted after a durable receipt exists");
   assert.equal(receipt.status, "succeeded");
-  assert.equal(receipt.outputArtifactId, publicArtifactId, "receipt must reference only server-owned public evidence");
-  assert.deepEqual(receipt.verificationArtifactIds, [publicArtifactId]);
+  assert.equal(receipt.outputArtifactId, publicAlias, "receipt must reference only server-owned public evidence alias");
+  assert.deepEqual(receipt.verificationArtifactIds, [publicAlias]);
 
   const latestSnapshot = await store.readSnapshot("run-read-only-integration");
   assert.ok(latestSnapshot, "the second atomic Model Step must advance the current recovery snapshot");
@@ -251,11 +253,7 @@ try {
   const privateArtifact = await store.getArtifact(privateArtifactId);
   assert.ok(privateArtifact);
   assert.equal(privateArtifact.visibility, "private");
-  const publicArtifact = await store.getArtifact(publicArtifactId);
-  assert.ok(publicArtifact);
-  assert.equal(publicArtifact.visibility, "public");
-  const publicArtifactContent = new TextDecoder().decode(publicArtifact.content);
-  assert.equal(publicArtifactContent, safeProjection);
+  assert.equal(await store.getArtifact(publicAlias), null, "a public alias must never expose a physical artifact row");
 
   const storedEvents = await store.readEvents({ runId: "run-read-only-integration", limit: 100 });
   const publicStoredEvents = storedEvents.events.filter((event) => event.visibility === "public");
@@ -270,7 +268,7 @@ try {
     publicEvents: result.publicEvents,
     publicStoredEvents,
     receipt,
-    publicArtifactContent,
+    publicAlias,
   });
   for (const forbiddenValue of [sourceContent, workspaceMarker, privateSecret, privateArtifactId]) {
     assert.equal(publicSurface.includes(forbiddenValue), false, "private workspace evidence must not leak into public contracts");

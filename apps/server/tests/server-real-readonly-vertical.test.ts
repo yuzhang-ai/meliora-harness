@@ -299,6 +299,7 @@ const startApp = async (
     store,
     submitTurnCommand,
     resolveSessionId: (runId) => store.readRunSessionId(runId),
+    resolveLocalPrincipalId: () => "local-user",
     pollIntervalMs: 10,
   });
   let port: number | undefined;
@@ -585,11 +586,19 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
         event.payload.evidenceRefs.forEach((ref) => publicArtifactIds.add(ref.artifactId));
       }
     }
-    const publicArtifactContents: string[] = [];
+    const canonicalToolEvent = events.find((event) => event.kind === "tool_result_presented");
+    assert.ok(canonicalToolEvent && canonicalToolEvent.kind === "tool_result_presented");
     for (const artifactId of publicArtifactIds) {
-      const artifact = await store.getArtifact(artifactId);
-      assert.equal(artifact?.visibility, "public", "public event references must never resolve to private artifacts");
-      if (artifact?.visibility === "public") publicArtifactContents.push(new TextDecoder().decode(artifact.content));
+      const eventBinding = {
+        kind: "tool_result_presented" as const,
+        invocationId: canonicalToolEvent.payload.invocationId,
+        status: canonicalToolEvent.payload.status,
+      };
+      const authorized = await store.authorizePublicArtifactRef({
+        localPrincipalId: "local-user", runId: created.runId, sessionId: created.sessionId, artifactId, eventBinding,
+      });
+      assert.equal(authorized.kind, "authorized", "public event references must be Receipt-bound aliases");
+      assert.equal(await store.getArtifact(artifactId), null, "public aliases must not expose physical artifact bytes");
     }
     const privateArtifactId = "artifact-1";
     const privateArtifact = await store.getArtifact(privateArtifactId);
@@ -603,7 +612,6 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
       sseBody: firstBody,
       events,
       publicStoredEvents,
-      publicArtifactContents,
       visibleAssistantText,
     });
     for (const forbiddenValue of [

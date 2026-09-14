@@ -707,6 +707,34 @@ export type CommitReceiptResult =
         | "receipt_conflict";
     }>;
 
+/**
+ * Receipt-backed public tool facts are a single durable observable boundary.
+ * Adapters must write the Receipt, its public events and immutable binding in
+ * one transaction, or write none of them.
+ */
+export type CommitReceiptWithPublicEventsInput = CommitReceiptInput & Readonly<{
+  expectedSequence: number;
+}>;
+
+export type CommitReceiptWithPublicEventsResult =
+  | Readonly<{ kind: "committed"; receiptId: string; events: readonly StoredEvent[] }>
+  | Readonly<{ kind: "replay"; receiptId: string; events: readonly StoredEvent[] }>
+  | Readonly<{ kind: "conflict"; code:
+    | "lease_not_held" | "lease_expired" | "run_attempt_conflict"
+    | "invocation_reservation_conflict" | "invocation_execution_conflict"
+    | "receipt_conflict" | "event_sequence_conflict" | "receipt_public_event_conflict";
+    currentSequence?: number }>;
+
+/** Internal recovery proof for the immutable Receipt-to-public-event boundary. */
+export type ReadReceiptPublicEventBindingInput = Readonly<{
+  runId: string;
+  attemptId: string;
+  receiptId: string;
+}>;
+export type ReadReceiptPublicEventBindingResult =
+  | Readonly<{ kind: "found"; events: readonly StoredEvent[] }>
+  | Readonly<{ kind: "missing" }>;
+
 export type ReadReceiptInput = Readonly<{
   runId: string;
   attemptId: string;
@@ -738,8 +766,9 @@ export type PutArtifactInput = Readonly<{
 }>;
 
 /**
- * Opaque Store-only staging alias. B2b.1 does not change the current
- * PublicArtifactRef artifactId semantics or authorize an event/SSE/HTTP use.
+ * Opaque Store-only staging alias. It becomes eligible for a public event
+ * only through the atomic Receipt/event binding; it is never an HTTP artifact
+ * identifier in this M0 slice.
  * The Store keeps the derivative's physical identity private.
  */
 export type StagedPublicArtifactManifest = Readonly<{
@@ -782,6 +811,37 @@ export type ResolveStagedPublicArtifactInput = Readonly<{
 export type ResolveStagedPublicArtifactResult =
   | Readonly<{ kind: "found"; manifest: StagedPublicArtifactManifest }>
   | Readonly<{ kind: "not_found" }>;
+
+/**
+ * The only Store authorization proof for an alias carried by a public event.
+ * It deliberately returns a manifest, never the private physical artifact or
+ * its bytes.  A matching durable Receipt is required: staging alone is not a
+ * public-read grant.
+ */
+export type AuthorizePublicArtifactRefInput = Readonly<{
+  localPrincipalId: string;
+  runId: string;
+  sessionId: string;
+  artifactId: string;
+  /** Every alias authorization is tied to its canonical public event kind. */
+  eventBinding:
+    | Readonly<{ kind: "tool_result_presented"; invocationId: string; status: ToolReceipt["status"] }>
+    | Readonly<{ kind: "verification_updated" }>;
+}>;
+
+export type AuthorizePublicArtifactRefResult =
+  | Readonly<{ kind: "authorized"; manifest: StagedPublicArtifactManifest }>
+  | Readonly<{ kind: "rejected" }>;
+
+/** Server/SSE gate. Artifact-bearing events must exactly match a Receipt binding. */
+export type AuthorizePublicStoredEventInput = Readonly<{
+  localPrincipalId: string;
+  sessionId: string;
+  event: StoredEvent;
+}>;
+export type AuthorizePublicStoredEventResult =
+  | Readonly<{ kind: "authorized" }>
+  | Readonly<{ kind: "rejected" }>;
 
 export type LeaseRequest = Readonly<{
   runId: string;
@@ -901,14 +961,26 @@ export interface SessionStorePort extends RecoveryReadPort {
   ): Promise<InvocationReconciliationRecord | null>;
   /** New Receipts require a durable `executing` reservation; exact Receipts replay. */
   commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult>;
+  commitReceiptWithPublicEvents(
+    input: CommitReceiptWithPublicEventsInput,
+  ): Promise<CommitReceiptWithPublicEventsResult>;
+  readReceiptPublicEventBinding(
+    input: ReadReceiptPublicEventBindingInput,
+  ): Promise<ReadReceiptPublicEventBindingResult>;
   readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null>;
-  /** B2b.1 Store staging only; B2b.2 owns event/SSE/HTTP/public-read authorization. */
+  /** Staging remains private until authorizePublicArtifactRef proves Receipt provenance. */
   stagePublicToolResultDerivative(
     input: StagePublicToolResultDerivativeInput,
   ): Promise<StagePublicToolResultDerivativeResult>;
   resolveStagedPublicArtifact(
     input: ResolveStagedPublicArtifactInput,
   ): Promise<ResolveStagedPublicArtifactResult>;
+  authorizePublicArtifactRef(
+    input: AuthorizePublicArtifactRefInput,
+  ): Promise<AuthorizePublicArtifactRefResult>;
+  authorizePublicStoredEvent(
+    input: AuthorizePublicStoredEventInput,
+  ): Promise<AuthorizePublicStoredEventResult>;
   putArtifact(input: PutArtifactInput): Promise<ArtifactRef>;
   getArtifact(id: string): Promise<Artifact | null>;
   acquireLease(input: LeaseRequest): Promise<LeaseResult>;

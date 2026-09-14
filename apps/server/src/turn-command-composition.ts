@@ -51,6 +51,12 @@ const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂�
 const TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE = "tool_invocation_outcome_unknown";
 const TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE = "工具执行结果未知，已停止自动重放。";
 const TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS = ["先通过 Host readback 或恢复协调器确认工具结果。"] as const;
+const TOOL_RECEIPT_RECOVERY_REQUIRED_CODE = "tool_receipt_recovery_required";
+const TOOL_RECEIPT_RECOVERY_REQUIRED_MESSAGE = "工具回执已持久化，但执行器在后续收口前中断，已停止自动续跑。";
+const TOOL_RECEIPT_RECOVERY_REQUIRED_ACTIONS = ["请通过恢复协调器核验 Receipt 绑定事件与后续模型步骤后再继续。"] as const;
+const RECEIPT_PUBLIC_EVENT_BINDING_INVALID_CODE = "receipt_public_event_binding_invalid";
+const RECEIPT_PUBLIC_EVENT_BINDING_INVALID_MESSAGE = "发现既有工具回执缺少或损坏公开事件绑定，已停止自动续跑。";
+const RECEIPT_PUBLIC_EVENT_BINDING_INVALID_ACTIONS = ["请通过恢复协调器核验或迁移该 Receipt 的公开投影。"] as const;
 
 export type TurnCommandIds = ReadOnlyRunIds & Readonly<{
   nextSessionId(): string;
@@ -230,8 +236,6 @@ export const projectServerOwnedAssistantText = (input: Readonly<{ content: strin
 
 const createServerOwnedToolProjector = (
   store: SessionStorePort,
-  ids: TurnCommandIds,
-  now: () => string,
 ) => async (input: Readonly<{
   definition: ToolDefinition;
   execution: ReadOnlyWorkspaceToolExecution;
@@ -248,26 +252,13 @@ const createServerOwnedToolProjector = (
   const privateArtifact = input.execution.outputArtifactId
     ? await store.getArtifact(input.execution.outputArtifactId)
     : null;
-  const content = new TextEncoder().encode(summary);
-  const publicArtifact = await store.putArtifact({
-    artifactId: ids.nextArtifactId(),
-    contentHash: hashBytes(content),
-    mediaType: "text/plain",
-    content,
-    visibility: "public",
-    metadata: {
-      source: "server-owned-read-only-projector",
-      toolName: input.definition.name,
-      privateEvidenceRetained: privateArtifact?.visibility === "private",
-    },
-    createdAt: now(),
-  });
-  const publicArtifacts = [publicArtifact.artifactId];
   return {
     modelContent: safeModelToolContent(privateArtifact, summary),
     publicSummary: summary,
-    publicArtifactIds: publicArtifacts,
-    publicVerificationArtifactIds: input.execution.verification?.status === "passed" ? publicArtifacts : [],
+    // Runtime stages the safe summary under the executing reservation, then
+    // commits its alias atomically with the Receipt and public events.
+    publicArtifactIds: [],
+    publicVerificationArtifactIds: [],
   };
 };
 
@@ -441,7 +432,7 @@ const settleOutcomeUnknown = async (
   return true;
 };
 
-type InvocationRecoveryState = "present" | "absent" | "settled" | "indeterminate";
+type InvocationRecoveryState = "present" | "absent" | "settled" | "settled_unbound" | "indeterminate";
 
 const receiptMatchesTerminalInvocation = (
   record: InvocationReconciliationRecord,
@@ -469,8 +460,9 @@ const classifyInvocationRecoveryState = async (
   try {
     const recovery = await store.readRecoveryBundle({ runId, eventLimit: 128 });
     if (recovery.kind !== "found") return "indeterminate";
-    let hasUnsafeUnreceiptedInvocation = false;
-    let hasSettledInvocation = false;
+  let hasUnsafeUnreceiptedInvocation = false;
+  let hasSettledInvocation = false;
+  let hasSettledUnboundInvocation = false;
     for (const record of recovery.bundle.invocations) {
       const { reservation, invocation, receipt } = record;
       if (reservation.runId !== invocation.runId
@@ -484,10 +476,9 @@ const classifyInvocationRecoveryState = async (
       }
       if (invocation.status === "awaiting_approval") {
         if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
-        // Approval state is neither a completed receipt nor proof that this
-        // command may fall through to Model Step recovery.
-        hasSettledInvocation = true;
-        continue;
+        // L0 does not implement approval recovery. It is neither a Receipt
+        // nor authority to produce a Receipt-recovery terminal.
+        return "indeterminate";
       }
       if (invocation.status === "executing") {
         if (receipt !== null || !hasValidExecutionStartedAt(reservation.executionStartedAt)) return "indeterminate";
@@ -503,12 +494,21 @@ const classifyInvocationRecoveryState = async (
       }
       if (invocation.status === "succeeded" || invocation.status === "failed" || invocation.status === "cancelled") {
         if (receipt === null || !receiptMatchesTerminalInvocation(record)) return "indeterminate";
-        hasSettledInvocation = true;
+        const durableReceipt = await store.readReceipt({
+          runId: receipt.runId, attemptId: receipt.attemptId, receiptId: receipt.receiptId,
+        });
+        if (durableReceipt === null || JSON.stringify(durableReceipt) !== JSON.stringify(receipt)) return "indeterminate";
+        const binding = await store.readReceiptPublicEventBinding({
+          runId: receipt.runId, attemptId: receipt.attemptId, receiptId: receipt.receiptId,
+        });
+        if (binding.kind !== "found") hasSettledUnboundInvocation = true;
+        else hasSettledInvocation = true;
         continue;
       }
       return "indeterminate";
     }
     if (hasUnsafeUnreceiptedInvocation) return "present";
+    if (hasSettledUnboundInvocation) return "settled_unbound";
     return hasSettledInvocation ? "settled" : "absent";
   } catch {
     return "indeterminate";
@@ -551,7 +551,29 @@ const runWorker = async (
       // `failure`, `conflict`, `not_found`, or a read exception cannot prove
       // the invocation is absent. Preserve dispatched state for a later
       // recovery worker rather than applying the Model Step fallback.
-      if (invocationState === "indeterminate" || invocationState === "settled") return;
+      if (invocationState === "settled") {
+        // A durable Receipt proves the Host result, but not whether a later
+        // model step/Command terminal write completed. Do not silently leave
+        // this Command dispatched and do not replay Host/Provider: atomically
+        // make the recovery boundary visible instead.
+        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+          code: TOOL_RECEIPT_RECOVERY_REQUIRED_CODE,
+          message: TOOL_RECEIPT_RECOVERY_REQUIRED_MESSAGE,
+          userActions: TOOL_RECEIPT_RECOVERY_REQUIRED_ACTIONS,
+          requireStartedModelStep: false,
+        });
+        return;
+      }
+      if (invocationState === "settled_unbound") {
+        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+          code: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_CODE,
+          message: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_MESSAGE,
+          userActions: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_ACTIONS,
+          requireStartedModelStep: false,
+        });
+        return;
+      }
+      if (invocationState === "indeterminate") return;
       await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
@@ -590,7 +612,7 @@ const runWorker = async (
       artifacts: createPrivateArtifactWriter(options.store, options.ids, options.now),
       nextVerificationId: options.ids.nextVerificationId,
     });
-    const projectToolResult = createServerOwnedToolProjector(options.store, options.ids, options.now);
+      const projectToolResult = createServerOwnedToolProjector(options.store);
     const loop = new ReadOnlyRunLoop({
       store: options.store,
       model: options.model,

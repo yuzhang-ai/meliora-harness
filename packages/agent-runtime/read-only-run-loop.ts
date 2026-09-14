@@ -10,6 +10,7 @@ import type {
   PrivateRunSnapshotState,
   RunSnapshot,
   SessionStorePort,
+  StoredEvent,
 } from "../session-store/contracts";
 import { PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../session-store/contracts";
 import { canonicalJson, hashBytes } from "../session-store/integrity";
@@ -27,6 +28,7 @@ import {
   type PublicRunEvent,
 } from "./public-events";
 import { canTransitionRun, type RunStatus } from "./run-state";
+import { decodePublicStoredEvent } from "./public-event-decoder";
 
 /**
  * M0 fixture-oriented orchestration boundary.  Provider transport, schema
@@ -807,15 +809,30 @@ export class ReadOnlyRunLoop {
             publicVerificationArtifactIds: [],
           };
         }
-        const publicArtifactIds: string[] = [];
-        for (const artifactId of [...new Set([
-          ...projection.publicArtifactIds,
-          ...projection.publicVerificationArtifactIds,
-        ])]) {
-          if (await withLeaseHeartbeat(() => this.dependencies.isPublicArtifact(artifactId))) publicArtifactIds.push(artifactId);
+        let publicArtifactIds: string[] = [];
+        let publicVerificationArtifactIds: string[] = [];
+        if (replayReceipt) {
+          publicArtifactIds = replayReceipt.outputArtifactId ? [replayReceipt.outputArtifactId] : [];
+          publicVerificationArtifactIds = [...replayReceipt.verificationArtifactIds];
+        } else {
+          const content = new TextEncoder().encode(projection.publicSummary);
+          let staged: Awaited<ReturnType<SessionStorePort["stagePublicToolResultDerivative"]>>;
+          try {
+            staged = await withLeaseHeartbeat(() => this.dependencies.store.stagePublicToolResultDerivative({
+              runId: input.runId, sessionId: input.sessionId, attemptId: input.attemptId, leaseToken,
+              reservationId: reservation.reservationId, invocationId: invocation.invocationId,
+              content, contentHash: hashBytes(content), mediaType: "text/plain",
+            }));
+          } catch (error) {
+            if (isLeaseLostError(error)) throw error;
+            return terminalToolInvocationOutcomeUnknown();
+          }
+          if (staged.kind === "conflict") return terminalToolInvocationOutcomeUnknown();
+          publicArtifactIds = [staged.manifest.artifactId];
+          publicVerificationArtifactIds = execution.status === "succeeded" && execution.verification?.status === "passed"
+            ? [...publicArtifactIds] : [];
         }
-        const publicVerificationArtifactIds = projection.publicVerificationArtifactIds.filter((id) => publicArtifactIds.includes(id));
-        if (execution.verification?.status === "passed") {
+        if (!replayReceipt && execution.verification?.status === "passed") {
           try {
             await readArtifactRefs(execution.verification.evidenceArtifactIds);
             verificationEvidenceArtifactIds.push(...execution.verification.evidenceArtifactIds);
@@ -843,27 +860,35 @@ export class ReadOnlyRunLoop {
           verificationArtifactIds: publicVerificationArtifactIds,
           redactions: [],
         };
-        let committed: Readonly<{ kind: "committed" | "replay"; receiptId: string }> | Readonly<{ kind: "conflict"; code: string }>;
+        let committed: Readonly<{ kind: "committed" | "replay"; receiptId: string; events: readonly StoredEvent[] }> | Readonly<{ kind: "conflict"; code: string }>;
         try {
-          committed = replayReceipt
-            ? { kind: "replay" as const, receiptId: replayReceipt.receiptId }
-            : await (async () => {
-                await renewLeaseOrThrow();
-                return this.dependencies.store.commitReceipt({ runId: input.runId, attemptId: input.attemptId, leaseToken, reservationId: reservation.reservationId, receipt: newReceipt });
-              })();
+          committed = await (async () => {
+            if (!replayReceipt) await renewLeaseOrThrow();
+            return this.dependencies.store.commitReceiptWithPublicEvents({
+              runId: input.runId, attemptId: input.attemptId, leaseToken, reservationId: reservation.reservationId,
+              receipt: replayReceipt ?? newReceipt, expectedSequence: sequence,
+            });
+          })();
         } catch (error) {
           if (isLeaseLostError(error)) throw error;
           return terminalToolInvocationOutcomeUnknown();
         }
-        if (committed.kind === "conflict") return terminalToolInvocationOutcomeUnknown();
+        if (committed.kind === "conflict") {
+          if (replayReceipt) return terminal(
+            "blocked", "工具回执已存在，但公开事件绑定无法完整验证。",
+            "public_artifact_binding_missing", false,
+            ["请通过恢复协调器核验既有 Receipt 与公开投影。"],
+          );
+          return terminalToolInvocationOutcomeUnknown();
+        }
         receipts.push(replayReceipt ?? newReceipt);
+        for (const event of committed.events) {
+          const decoded = decodePublicStoredEvent(event, input.sessionId);
+          if (decoded.kind !== "public") return terminalToolInvocationOutcomeUnknown();
+          publicEvents.push(decoded.event);
+        }
+        if (committed.events.length > 0) sequence = committed.events.at(-1)!.sequence;
         publicEvidenceIds.push(...publicVerificationArtifactIds);
-        await publish("tool_result_presented", {
-          invocationId: invocation.invocationId,
-          status: execution.status,
-          summary: projection.publicSummary,
-          artifactRefs: asPublicArtifacts(publicArtifactIds),
-        });
         if ((execution.outputArtifactId !== undefined || projection.modelContent !== projection.publicSummary) && projection.modelContent.length > 0) {
           hasPrivateToolResultObservation = true;
         }
@@ -873,11 +898,6 @@ export class ReadOnlyRunLoop {
           return terminal("blocked", "只读工具完成，但验证尚未通过。", "verification_missing", false, ["请执行或补充验证。"]);
         }
         verificationIds.push(execution.verification.verificationId);
-        await publish("verification_updated", {
-          verificationId: execution.verification.verificationId,
-          status: execution.verification.status,
-          evidenceRefs: asPublicArtifacts(publicVerificationArtifactIds),
-        });
         messages.push({ role: "tool", invocationId: invocation.invocationId, content: projection.modelContent });
       }
     }

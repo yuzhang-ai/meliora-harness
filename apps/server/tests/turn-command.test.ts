@@ -67,6 +67,7 @@ const startServer = async (
     store,
     submitTurnCommand,
     resolveSessionId,
+    resolveLocalPrincipalId: () => "local-user",
     pollIntervalMs: 10,
     ...(maxJsonBodyBytes === undefined ? {} : { maxJsonBodyBytes }),
   });
@@ -320,10 +321,47 @@ class UncertainReceiptCommitStore extends MemorySessionStore {
     return super.putArtifact(input[0]);
   }
 
-  override async commitReceipt(..._input: Parameters<MemorySessionStore["commitReceipt"]>) {
+  override async commitReceiptWithPublicEvents(..._input: Parameters<MemorySessionStore["commitReceiptWithPublicEvents"]>) {
     this.receiptAttempts += 1;
     if (this.failure === "throw") throw new Error("injected_commit_receipt_failure");
     return { kind: "conflict" as const, code: "invocation_execution_conflict" as const };
+  }
+}
+
+/** Simulates process loss after the Receipt/event transaction but before the Command settles. */
+class CrashAfterReceiptBoundStore extends MemorySessionStore {
+  hostArtifactWrites = 0;
+  private throwAfterReceipt = true;
+  private rejectFirstBlockedSettle = true;
+
+  constructor(
+    options: ConstructorParameters<typeof MemorySessionStore>[0],
+    private readonly eraseBinding = false,
+  ) { super(options); }
+
+  override async putArtifact(...input: Parameters<MemorySessionStore["putArtifact"]>) {
+    if (input[0].visibility === "private" && input[0].mediaType === "text/plain") this.hostArtifactWrites += 1;
+    return super.putArtifact(input[0]);
+  }
+
+  override async commitReceiptWithPublicEvents(...input: Parameters<MemorySessionStore["commitReceiptWithPublicEvents"]>) {
+    const result = await super.commitReceiptWithPublicEvents(input[0]);
+    if (result.kind === "committed" && this.throwAfterReceipt) {
+      if (this.eraseBinding) {
+        (this as unknown as { receiptPublicEventBindings: Map<string, unknown> }).receiptPublicEventBindings.clear();
+      }
+      this.throwAfterReceipt = false;
+      throw new Error("injected_crash_after_receipt_public_binding");
+    }
+    return result;
+  }
+
+  override async settleRunCommandWithTerminalEvent(...input: Parameters<MemorySessionStore["settleRunCommandWithTerminalEvent"]>) {
+    if (this.rejectFirstBlockedSettle) {
+      this.rejectFirstBlockedSettle = false;
+      throw new Error("injected_crash_before_command_terminal");
+    }
+    return super.settleRunCommandWithTerminalEvent(input[0]);
   }
 }
 
@@ -396,6 +434,7 @@ type TamperedInvocationBundleShape =
   | "succeeded_without_receipt"
   | "failed_without_receipt"
   | "cancelled_without_receipt"
+  | "awaiting_approval_without_receipt"
   | "reservation_invocation_mismatch";
 
 class SemanticallyTamperedRecoveryStore extends LeaseLossAfterHostStore {
@@ -426,7 +465,8 @@ class SemanticallyTamperedRecoveryStore extends LeaseLossAfterHostStore {
         : this.shape === "reserved_with_receipt" ? "reserved" : undefined;
     const timestampStatus: typeof first.invocation.status | undefined = this.shape === "reserved_with_execution_started_at" ? "reserved"
       : this.shape === "executing_without_execution_started_at" ? "executing"
-        : this.shape === "outcome_unknown_with_execution_started_at" ? "outcome_unknown" : undefined;
+        : this.shape === "outcome_unknown_with_execution_started_at" ? "outcome_unknown"
+          : this.shape === "awaiting_approval_without_receipt" ? "awaiting_approval" : undefined;
     const alteredStatus = terminalStatus ?? receiptStatus ?? timestampStatus;
     const invocation = alteredStatus === undefined ? first.invocation : { ...first.invocation, status: alteredStatus };
     const reservationWithStatus = this.shape === "reservation_invocation_mismatch"
@@ -438,7 +478,7 @@ class SemanticallyTamperedRecoveryStore extends LeaseLossAfterHostStore {
       ...first,
       invocation,
       reservation,
-      receipt: (terminalStatus === undefined && this.shape !== "reservation_invocation_mismatch") || this.shape === "succeeded_with_matching_receipt" ? receipt : null,
+      receipt: (terminalStatus === undefined && this.shape !== "reservation_invocation_mismatch" && this.shape !== "awaiting_approval_without_receipt") || this.shape === "succeeded_with_matching_receipt" ? receipt : null,
     };
     return { kind: "found" as const, bundle: { ...result.bundle, invocations: [changed, ...result.bundle.invocations.slice(1)] } };
   }
@@ -694,6 +734,101 @@ test("uncertain receipt commits block atomically without replaying Provider or H
       assert.equal(store.receiptAttempts, 1);
     });
   }
+});
+
+test("bound Receipt crash recovery closes the dispatched Command once without replaying Provider or Host", async () => {
+  let currentNow = fixedNow;
+  const store = new CrashAfterReceiptBoundStore({ clock: () => new Date(currentNow) });
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "receipt-binding-crash-recovery",
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: { next: async ({ modelStepId }) => {
+      modelCalls += 1;
+      return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+    } },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1);
+  assert.equal(store.hostArtifactWrites, 1);
+  const scope = { localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey };
+  assert.equal((await store.readRunCommand(scope))?.status, "dispatched");
+  const before = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(before.events.filter((event) => event.kind === "tool_result_presented").length, 1);
+  assert.equal(before.events.filter((event) => event.kind === "run_blocked").length, 0);
+
+  currentNow = "2026-09-12T03:00:02.000Z";
+  const replay = await submitTurnCommand(request);
+  assert.equal(replay.status, 202);
+  assert.equal(replay.body.commandStatus, "dispatched");
+  await Promise.resolve(deferred.shift()!());
+  const command = await store.readRunCommand(scope);
+  assert.equal(command?.status, "terminal");
+  assert.equal(command?.status === "terminal" ? command.terminalStatus : null, "blocked");
+  assert.equal(command?.status === "terminal" ? command.terminalCode : null, "tool_receipt_recovery_required");
+  const after = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(after.events.filter((event) => event.kind === "tool_result_presented").length, 1);
+  assert.equal(after.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(modelCalls, 1);
+  assert.equal(store.hostArtifactWrites, 1);
+  const terminalReplay = await submitTurnCommand(request);
+  assert.equal(terminalReplay.status, 200);
+  assert.equal(terminalReplay.body.commandStatus, "terminal");
+  assert.equal(deferred.length, 0, "a terminal recovery must not append a second public block");
+});
+
+test("legacy Receipt without a public-event binding closes once as an integrity block", async () => {
+  let currentNow = fixedNow;
+  const store = new CrashAfterReceiptBoundStore({ clock: () => new Date(currentNow) }, true);
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "legacy-receipt-without-public-binding",
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store, workspaceRoots: new Map([[workspaceId, process.cwd()]]), ids: deterministicIds(),
+    model: { next: async ({ modelStepId }) => {
+      modelCalls += 1;
+      return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+    } },
+    now: () => currentNow, leaseTtlMs: 1_000, defer: (run) => { deferred.push(run); },
+  });
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  await Promise.resolve(deferred.shift()!());
+  const scope = { localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey };
+  assert.equal((await store.readRunCommand(scope))?.status, "dispatched");
+  currentNow = "2026-09-12T03:00:02.000Z";
+  assert.equal((await submitTurnCommand(request)).status, 202);
+  await Promise.resolve(deferred.shift()!());
+  const command = await store.readRunCommand(scope);
+  assert.equal(command?.status, "terminal");
+  assert.equal(command?.status === "terminal" ? command.terminalCode : null, "receipt_public_event_binding_invalid");
+  const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(events.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(modelCalls, 1, "legacy receipt recovery must not replay Provider");
+  assert.equal(store.hostArtifactWrites, 1, "legacy receipt recovery must not replay Host");
+  assert.equal((await submitTurnCommand(request)).status, 200);
+  assert.equal(deferred.length, 0);
 });
 
 test("atomic run_blocked settlement failures preserve dispatched command and started checkpoint until safe recovery", async (t) => {
@@ -1222,6 +1357,7 @@ for (const shape of [
   "succeeded_without_receipt",
   "failed_without_receipt",
   "cancelled_without_receipt",
+  "awaiting_approval_without_receipt",
   "reservation_invocation_mismatch",
 ] as const) {
   test(`recovery record ${shape} does not fall through to a terminal fallback`, async () => {

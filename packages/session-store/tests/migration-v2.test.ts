@@ -28,12 +28,13 @@ test("fresh databases apply the complete immutable migration manifest", (t) => {
   new SqliteSessionStore(path).close();
 
   const db = inspect(path);
-  assert.equal(db.pragma("user_version", { simple: true }), 4);
+  assert.equal(db.pragma("user_version", { simple: true }), 5);
   assert.deepEqual(db.prepare("SELECT version,name FROM schema_migrations ORDER BY version").all(), [
     { version: 1, name: "0001_initial.sql" },
     { version: 2, name: "0002_durable_commands.sql" },
     { version: 3, name: "0003_private_recovery_primitives.sql" },
     { version: 4, name: "0004_public_artifact_provenance.sql" },
+    { version: 5, name: "0005_receipt_public_events.sql" },
   ]);
   for (const table of ["run_commands", "run_command_inputs", "model_steps", "run_snapshot_history", "model_step_terminal_results"]) {
     assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").pluck().get(table), 1);
@@ -56,12 +57,12 @@ test("version one upgrades to version two without changing existing rows", (t) =
 
   new SqliteSessionStore(path).close();
   const db = inspect(path);
-  assert.equal(db.pragma("user_version", { simple: true }), 4);
+  assert.equal(db.pragma("user_version", { simple: true }), 5);
   assert.deepEqual(db.prepare("SELECT session_id,workspace_id FROM sessions").get(), {
     session_id: "preserved-session",
     workspace_id: "preserved-workspace",
   });
-  assert.equal(db.prepare("SELECT count(*) FROM schema_migrations").pluck().get(), 4);
+  assert.equal(db.prepare("SELECT count(*) FROM schema_migrations").pluck().get(), 5);
   db.close();
 });
 
@@ -85,7 +86,7 @@ test("a database newer than the adapter is rejected", (t) => {
   const path = createTempDatabase(t);
   new SqliteSessionStore(path).close();
   const db = new Database(path);
-  db.pragma("user_version = 5");
+  db.pragma("user_version = 6");
   db.close();
   assert.throws(() => new SqliteSessionStore(path), StoreIntegrityError);
 });

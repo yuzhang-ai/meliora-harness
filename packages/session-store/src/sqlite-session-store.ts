@@ -7,12 +7,14 @@ import type { NormalizedToolInvocation, ToolReceipt } from "../../tool-runtime/c
 import type {
   AppendEventsInput, AppendEventsResult, Artifact, ArtifactRef, BeginInvocationExecutionInput,
   BeginInvocationExecutionResult, CommitReceiptInput, CommitReceiptResult,
+  CommitReceiptWithPublicEventsInput, CommitReceiptWithPublicEventsResult,
   CommitTerminalModelStepResultAndSnapshotInput, CommitTerminalModelStepResultAndSnapshotResult,
   CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
   EventPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
   InvocationReservationInput, LeaseRenewal, LeaseRequest, LeaseResult, PersistedRunAttempt,
   PersistedRunRecord, PutArtifactInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
-  ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReservationInput,
+  ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReceiptPublicEventBindingInput,
+  ReadReceiptPublicEventBindingResult, ReadReservationInput,
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
   RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
@@ -22,6 +24,8 @@ import type {
   TurnRecord, WriteSnapshotInput, PrivateArtifactRef,
   StagePublicToolResultDerivativeInput, StagePublicToolResultDerivativeResult,
   ResolveStagedPublicArtifactInput, ResolveStagedPublicArtifactResult, StagedPublicArtifactManifest,
+  AuthorizePublicArtifactRefInput, AuthorizePublicArtifactRefResult,
+  AuthorizePublicStoredEventInput, AuthorizePublicStoredEventResult,
 } from "../contracts.js";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../contracts.js";
 import {
@@ -50,6 +54,7 @@ const MIGRATIONS = [
   loadMigration(2, "0002_durable_commands.sql"),
   loadMigration(3, "0003_private_recovery_primitives.sql"),
   loadMigration(4, "0004_public_artifact_provenance.sql"),
+  loadMigration(5, "0005_receipt_public_events.sql"),
 ] as const;
 const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
 type Options = Readonly<{
@@ -910,9 +915,121 @@ export class SqliteSessionStore implements SessionStorePort {
     })();
   }
 
+  async commitReceiptWithPublicEvents(
+    input: CommitReceiptWithPublicEventsInput,
+  ): Promise<CommitReceiptWithPublicEventsResult> {
+    assertPersistableJson(JSON.parse(JSON.stringify(input.receipt)) as JsonValue, "receipt");
+    try {
+      return this.db.transaction((): CommitReceiptWithPublicEventsResult => {
+        const invocationRow = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+        const prior = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+        if (prior) {
+          const binding = this.db.prepare("SELECT * FROM receipt_public_event_bindings WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+          if (!binding || prior.run_id !== input.runId || prior.attempt_id !== input.attemptId
+            || prior.receipt_id !== input.receipt.receiptId || prior.reservation_id !== input.reservationId
+            || binding.receipt_id !== prior.receipt_id || binding.run_id !== input.runId || binding.attempt_id !== input.attemptId
+            || !sameJson(this.toReceipt(prior), input.receipt)) return { kind: "conflict", code: "receipt_public_event_conflict" };
+          const events = JSON.parse(binding.events_json) as StoredEvent[];
+          if (hashBytes(binding.events_json) !== binding.events_hash
+            || !Number.isSafeInteger(binding.expected_sequence) || !Number.isSafeInteger(binding.first_sequence)
+            || !Number.isSafeInteger(binding.last_sequence)
+            || binding.first_sequence !== binding.expected_sequence + 1
+            || binding.last_sequence !== binding.expected_sequence + events.length
+            || !events.every((event, index) => event.runId === input.runId && event.attemptId === input.attemptId
+              && event.sequence === binding.expected_sequence + index + 1)
+            || !this.isValidReceiptPublicEvents(this.toReceipt(prior), events)) {
+            return { kind: "conflict", code: "receipt_public_event_conflict" };
+          }
+          const actual = this.db.prepare("SELECT * FROM events WHERE run_id=? AND attempt_id=? AND sequence>=? AND sequence<=? ORDER BY sequence")
+            .all(input.runId, input.attemptId, binding.first_sequence, binding.last_sequence) as Row[];
+          if (actual.length !== events.length || !sameJson(actual.map((row) => this.toEvent(row)), events)) return { kind: "conflict", code: "receipt_public_event_conflict" };
+          return { kind: "replay", receiptId: prior.receipt_id, events };
+        }
+        if (!invocationRow || invocationRow.run_id !== input.runId || invocationRow.attempt_id !== input.attemptId
+          || invocationRow.invocation_id !== input.receipt.invocationId) return { kind: "conflict", code: "invocation_reservation_conflict" };
+        const invocation = this.toInvocation(invocationRow);
+        if (!this.receiptMatches(input.receipt, invocation)) return { kind: "conflict", code: "receipt_conflict" };
+        if (!this.isActiveAttempt(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+        const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+        if (lease) return { kind: "conflict", code: lease };
+        if (invocationRow.status !== "executing" || invocationRow.execution_started_at === null) return { kind: "conflict", code: "invocation_execution_conflict" };
+        const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
+        if (!attempt || attempt.last_event_sequence !== input.expectedSequence) return { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt?.last_event_sequence };
+        if (!input.receipt.outputArtifactId
+          || input.receipt.verificationArtifactIds.some((id) => id !== input.receipt.outputArtifactId)
+          || (input.receipt.verificationArtifactIds.length > 0 && input.receipt.status !== "succeeded")) return { kind: "conflict", code: "receipt_public_event_conflict" };
+        const createdAt = this.clock().toISOString();
+        const events: StoredEvent[] = [{
+          schemaVersion: "meliora.session-event.v1", eventId: `event-${this.nonce()}`,
+          runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + 1,
+          kind: "tool_result_presented", visibility: "public", createdAt, causationId: input.receipt.receiptId,
+          payload: { invocationId: input.receipt.invocationId, status: input.receipt.status, summary: input.receipt.effectSummary,
+            artifactRefs: [{ artifactId: input.receipt.outputArtifactId, visibility: "public" }] },
+        }];
+        if (input.receipt.verificationArtifactIds.length > 0) events.push({
+          schemaVersion: "meliora.session-event.v1", eventId: `event-${this.nonce()}`,
+          runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + 2,
+          kind: "verification_updated", visibility: "public", createdAt, causationId: input.receipt.receiptId,
+          payload: { verificationId: `verification:${input.receipt.receiptId}`, status: "passed",
+            evidenceRefs: input.receipt.verificationArtifactIds.map((artifactId) => ({ artifactId, visibility: "public" })) },
+        });
+        if (!this.isValidReceiptPublicEvents(input.receipt, events)) return { kind: "conflict", code: "receipt_public_event_conflict" };
+        const receiptJson = json(input.receipt);
+        this.db.prepare("INSERT INTO receipts VALUES (?,?,?,?,?,?,?)").run(input.receipt.receiptId, input.runId, input.attemptId, input.reservationId, receiptJson, hashBytes(receiptJson), input.receipt.endedAt);
+        for (const event of events) {
+          const payload = canonicalJson(event.payload);
+          this.db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(event.eventId, event.runId, event.attemptId, event.sequence, event.schemaVersion, event.kind, event.visibility, payload, hashBytes(json(event)), event.createdAt, event.causationId ?? null, event.correlationId ?? null);
+        }
+        const eventsJson = json(events);
+        this.db.prepare(`
+          INSERT INTO receipt_public_event_bindings (
+            reservation_id,receipt_id,run_id,attempt_id,expected_sequence,first_sequence,last_sequence,events_json,events_hash,created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          input.reservationId, input.receipt.receiptId, input.runId, input.attemptId,
+          input.expectedSequence, input.expectedSequence + 1, input.expectedSequence + events.length,
+          eventsJson, hashBytes(eventsJson), input.receipt.endedAt,
+        );
+        const updatedInvocation = json({ ...invocation, status: input.receipt.status });
+        this.db.prepare("UPDATE invocations SET status=?,invocation_json=?,invocation_hash=? WHERE reservation_id=?").run(input.receipt.status, updatedInvocation, hashBytes(updatedInvocation), input.reservationId);
+        this.db.prepare("UPDATE run_attempts SET last_event_sequence=?,updated_at=? WHERE run_id=? AND attempt_id=?").run(input.expectedSequence + events.length, this.clock().toISOString(), input.runId, input.attemptId);
+        return { kind: "committed", receiptId: input.receipt.receiptId, events };
+      })();
+    } catch (error) {
+      if (isUniqueConstraint(error)) return { kind: "conflict", code: "receipt_public_event_conflict" };
+      throw error;
+    }
+  }
+
   async readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null> {
     const row = this.db.prepare("SELECT * FROM receipts WHERE run_id=? AND attempt_id=? AND receipt_id=?").get(input.runId, input.attemptId, input.receiptId) as Row | undefined;
     return row ? this.toReceipt(row) : null;
+  }
+
+  async readReceiptPublicEventBinding(
+    input: ReadReceiptPublicEventBindingInput,
+  ): Promise<ReadReceiptPublicEventBindingResult> {
+    try {
+      return this.db.transaction((): ReadReceiptPublicEventBindingResult => {
+        const receiptRow = this.db.prepare("SELECT * FROM receipts WHERE run_id=? AND attempt_id=? AND receipt_id=?")
+          .get(input.runId, input.attemptId, input.receiptId) as Row | undefined;
+        const binding = this.db.prepare("SELECT * FROM receipt_public_event_bindings WHERE receipt_id=? AND run_id=? AND attempt_id=?")
+          .get(input.receiptId, input.runId, input.attemptId) as Row | undefined;
+        if (!receiptRow || !binding || binding.receipt_id !== receiptRow.receipt_id
+          || binding.run_id !== input.runId || binding.attempt_id !== input.attemptId
+          || hashBytes(binding.events_json) !== binding.events_hash) return { kind: "missing" };
+        const events = JSON.parse(binding.events_json) as StoredEvent[];
+        if (!Number.isSafeInteger(binding.expected_sequence) || binding.first_sequence !== binding.expected_sequence + 1
+          || binding.last_sequence !== binding.expected_sequence + events.length
+          || !events.every((event, index) => event.runId === input.runId && event.attemptId === input.attemptId
+            && event.sequence === binding.expected_sequence + index + 1)
+          || !this.isValidReceiptPublicEvents(this.toReceipt(receiptRow), events)) return { kind: "missing" };
+        const stored = this.db.prepare("SELECT * FROM events WHERE run_id=? AND attempt_id=? AND sequence>=? AND sequence<=? ORDER BY sequence")
+          .all(input.runId, input.attemptId, binding.first_sequence, binding.last_sequence) as Row[];
+        if (stored.length !== events.length || !sameJson(stored.map((row) => this.toEvent(row)), events)) return { kind: "missing" };
+        return { kind: "found", events };
+      })();
+    } catch { return { kind: "missing" }; }
   }
 
   async stagePublicToolResultDerivative(
@@ -1011,6 +1128,83 @@ export class SqliteSessionStore implements SessionStorePort {
     } catch {
       return { kind: "not_found" };
     }
+  }
+
+  async authorizePublicArtifactRef(
+    input: AuthorizePublicArtifactRefInput,
+  ): Promise<AuthorizePublicArtifactRefResult> {
+    try {
+      return this.db.transaction((): AuthorizePublicArtifactRefResult => {
+        const row = this.db.prepare(`
+          SELECT p.*, c.local_principal_id, c.session_id AS command_session_id,
+                 i.invocation_json, i.invocation_hash, r.receipt_json, r.receipt_hash
+          FROM staged_public_artifact_provenance p
+          JOIN run_commands c ON c.run_id=p.run_id
+          JOIN invocations i ON i.reservation_id=p.reservation_id
+          JOIN receipts r ON r.reservation_id=p.reservation_id
+          WHERE p.public_alias=? AND p.run_id=? AND p.session_id=?
+        `).get(input.artifactId, input.runId, input.sessionId) as Row | undefined;
+        const manifest = row ? this.readStagedPublicArtifactManifest(row) : null;
+        if (!row || !manifest || row.local_principal_id !== input.localPrincipalId
+          || row.command_session_id !== input.sessionId) return { kind: "rejected" };
+        const invocation = this.toInvocation(row);
+        const receipt = this.toReceipt(row);
+        if (!this.receiptMatches(receipt, invocation) || receipt.outputArtifactId !== input.artifactId) {
+          return { kind: "rejected" };
+        }
+        const binding = this.db.prepare("SELECT * FROM receipt_public_event_bindings WHERE reservation_id=?")
+          .get(row.reservation_id) as Row | undefined;
+        if (!binding || binding.receipt_id !== receipt.receiptId || binding.run_id !== input.runId
+          || binding.attempt_id !== receipt.attemptId || hashBytes(binding.events_json) !== binding.events_hash) return { kind: "rejected" };
+        const boundEvents = JSON.parse(binding.events_json) as StoredEvent[];
+        if (!Number.isSafeInteger(binding.expected_sequence) || binding.first_sequence !== binding.expected_sequence + 1
+          || binding.last_sequence !== binding.expected_sequence + boundEvents.length
+          || !boundEvents.every((event, index) => event.runId === input.runId && event.attemptId === receipt.attemptId
+            && event.sequence === binding.expected_sequence + index + 1)
+          || !this.isValidReceiptPublicEvents(receipt, boundEvents)) return { kind: "rejected" };
+        if (input.eventBinding.kind === "tool_result_presented"
+          && (input.eventBinding.invocationId !== row.origin_invocation_id
+            || input.eventBinding.status !== receipt.status)) return { kind: "rejected" };
+        if (input.eventBinding.kind === "verification_updated"
+          && !receipt.verificationArtifactIds.includes(input.artifactId)) return { kind: "rejected" };
+        return { kind: "authorized", manifest };
+      })();
+    } catch {
+      return { kind: "rejected" };
+    }
+  }
+
+  async authorizePublicStoredEvent(
+    input: AuthorizePublicStoredEventInput,
+  ): Promise<AuthorizePublicStoredEventResult> {
+    try {
+      return this.db.transaction((): AuthorizePublicStoredEventResult => {
+        const command = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(input.event.runId) as Row | undefined;
+        if (!command || command.local_principal_id !== input.localPrincipalId || command.session_id !== input.sessionId) return { kind: "rejected" };
+        if (input.event.kind !== "tool_result_presented" && input.event.kind !== "verification_updated") return { kind: "authorized" };
+        const bindings = this.db.prepare("SELECT * FROM receipt_public_event_bindings WHERE run_id=? AND attempt_id=?")
+          .all(input.event.runId, input.event.attemptId) as Row[];
+        const binding = bindings.find((candidate) => {
+          if (hashBytes(candidate.events_json) !== candidate.events_hash) return false;
+          try { return (JSON.parse(candidate.events_json) as StoredEvent[]).some((event) => sameJson(event, input.event)); }
+          catch { return false; }
+        });
+        if (!binding) return { kind: "rejected" };
+        const receiptRow = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(binding.reservation_id) as Row | undefined;
+        const invocationRow = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(binding.reservation_id) as Row | undefined;
+        if (!receiptRow || !invocationRow || binding.receipt_id !== receiptRow.receipt_id
+          || binding.run_id !== input.event.runId || binding.attempt_id !== input.event.attemptId
+          || receiptRow.run_id !== input.event.runId || receiptRow.attempt_id !== input.event.attemptId) return { kind: "rejected" };
+        const receipt = this.toReceipt(receiptRow); const invocation = this.toInvocation(invocationRow);
+        const events = JSON.parse(binding.events_json) as StoredEvent[];
+        if (!Number.isSafeInteger(binding.expected_sequence) || binding.first_sequence !== binding.expected_sequence + 1
+          || binding.last_sequence !== binding.expected_sequence + events.length
+          || !events.every((event, index) => event.runId === input.event.runId && event.attemptId === input.event.attemptId
+            && event.sequence === binding.expected_sequence + index + 1)
+          || !this.receiptMatches(receipt, invocation) || !this.isValidReceiptPublicEvents(receipt, events)) return { kind: "rejected" };
+        return { kind: "authorized" };
+      })();
+    } catch { return { kind: "rejected" }; }
   }
 
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
@@ -1272,6 +1466,24 @@ export class SqliteSessionStore implements SessionStorePort {
   private receiptForReservation(id: string): ToolReceipt | null { const row = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(id) as Row | undefined; return row ? this.toReceipt(row) : null; }
   private sameInvocation(a: NormalizedToolInvocation, b: NormalizedToolInvocation): boolean { return a.invocationId === b.invocationId && a.runId === b.runId && a.attemptId === b.attemptId && a.toolName === b.toolName && a.toolVersion === b.toolVersion && a.argumentsHash === b.argumentsHash && a.catalogHash === b.catalogHash && a.idempotencyKey === b.idempotencyKey && sameJson(a.arguments, b.arguments); }
   private receiptMatches(receipt: ToolReceipt, invocation: NormalizedToolInvocation): boolean { return receipt.invocationId === invocation.invocationId && receipt.runId === invocation.runId && receipt.attemptId === invocation.attemptId && receipt.toolName === invocation.toolName && receipt.toolVersion === invocation.toolVersion && receipt.argumentsHash === invocation.argumentsHash && receipt.catalogHash === invocation.catalogHash; }
+  private isValidReceiptPublicEvents(receipt: ToolReceipt, events: readonly StoredEvent[]): boolean {
+    if (!receipt.outputArtifactId || receipt.verificationArtifactIds.some((id) => id !== receipt.outputArtifactId)
+      || (receipt.verificationArtifactIds.length > 0 && receipt.status !== "succeeded")
+      || events.length !== (receipt.verificationArtifactIds.length > 0 ? 2 : 1)) return false;
+    const staged = this.db.prepare("SELECT * FROM staged_public_artifact_provenance WHERE public_alias=?").get(receipt.outputArtifactId) as Row | undefined;
+    if (!staged) return false;
+    const manifest = staged ? this.readStagedPublicArtifactManifest(staged) : null;
+    if (!manifest || staged.origin_attempt_id !== receipt.attemptId || staged.origin_invocation_id !== receipt.invocationId) return false;
+    const tool = events[0]; const payload = tool?.payload as Record<string, unknown>;
+    if (!tool || tool.visibility !== "public" || tool.kind !== "tool_result_presented"
+      || payload.invocationId !== receipt.invocationId || payload.status !== receipt.status || payload.summary !== receipt.effectSummary
+      || !sameJson(payload.artifactRefs, [{ artifactId: receipt.outputArtifactId, visibility: "public" }])) return false;
+    if (receipt.verificationArtifactIds.length === 0) return true;
+    const verification = events[1]; const verificationPayload = verification?.payload as Record<string, unknown>;
+    return !!verification && verification.visibility === "public" && verification.kind === "verification_updated"
+      && verificationPayload.status === "passed"
+      && sameJson(verificationPayload.evidenceRefs, receipt.verificationArtifactIds.map((artifactId) => ({ artifactId, visibility: "public" })));
+  }
   private toArtifactRef(row: Row): ArtifactRef { return { artifactId: row.artifact_id, contentHash: row.content_hash, mediaType: row.media_type, byteLength: row.byte_length, visibility: row.visibility }; }
   private readStagedPublicArtifactManifest(row: Row): StagedPublicArtifactManifest | null {
     const run = this.db.prepare("SELECT session_id FROM runs WHERE run_id=?").get(row.run_id) as Row | undefined;
