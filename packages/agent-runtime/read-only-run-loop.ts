@@ -124,11 +124,7 @@ export type ReadOnlyRunLoopDependencies = Readonly<{
     invocation: NormalizedToolInvocation;
     execution: ReadOnlyToolExecution;
   }>): ReadOnlyToolProjection | Promise<ReadOnlyToolProjection>;
-  /**
-   * Server-owned public projection for assistant text before any private tool
-   * observation has entered the current model-call context. Once a private tool
-   * observation is present, the loop publishes only a fixed redaction notice.
-   */
+  /** Reserved for a future strict Server-owned summary decoder; M0 never calls it for Provider text. */
   projectAssistantText(input: Readonly<{ content: string }>): string | Promise<string>;
   isPublicArtifact(artifactId: string): Promise<boolean>;
   ownerId: string;
@@ -184,6 +180,7 @@ const MODEL_STEP_OUTCOME_UNKNOWN_SUMMARY = "模型步骤结果未知，已停止
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
 const DETERMINISTIC_PROVIDER_FAILURE_CODES = new Set(["provider_authentication_failed", "provider_rate_limited"]);
 const PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION = "模型已基于私有工具结果生成回复，内容已隐藏。";
+const PROVIDER_ASSISTANT_TEXT_REDACTION = "模型响应已私有持久化，公开摘要尚未启用。";
 const defaultSummary = (definition: ToolDefinition): string => `正在执行只读工具 ${definition.name}。`;
 const isLeaseLostError = (error: unknown): boolean => error instanceof Error && error.message === "run_lease_lost";
 const isAmbiguousProviderFailure = (event: Extract<CanonicalModelEvent, { kind: "model_step_failed" }>): boolean =>
@@ -225,14 +222,20 @@ export class ReadOnlyRunLoop {
 
     const renewLeaseOrThrow = async (): Promise<void> => {
       if (leaseLost || leaseToken.length === 0) throw new Error("run_lease_lost");
-      const renewed = await this.dependencies.store.renewLease({
-        runId: input.runId,
-        attemptId: input.attemptId,
-        leaseToken,
-        ttlMs: this.dependencies.leaseTtlMs,
-        renewedAt: this.dependencies.now(),
-      });
-      if (!renewed) {
+      try {
+        const renewed = await this.dependencies.store.renewLease({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          ttlMs: this.dependencies.leaseTtlMs,
+          renewedAt: this.dependencies.now(),
+        });
+        if (renewed) return;
+      } catch {
+        // A renewal transport/adapter error is indistinguishable from a lost
+        // lease. Never leak its details or continue a side-effecting path.
+      }
+      {
         leaseLost = true;
         throw new Error("run_lease_lost");
       }
@@ -643,24 +646,14 @@ export class ReadOnlyRunLoop {
         return terminalModelStepOutcomeUnknown();
       }
       if (assistantDeltas.length > 0) {
-        let publicAssistantContent: string;
-        if (hasPrivateToolResultObservation) {
-          publicAssistantContent = PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION;
-        } else {
-          try {
-            publicAssistantContent = await withLeaseHeartbeat(() => Promise.resolve(
-              this.dependencies.projectAssistantText({ content: assistantContent }),
-            ));
-          } catch (error) {
-            if (isLeaseLostError(error)) throw error;
-            publicAssistantContent = "模型输出包含无法安全公开的内容，已隐藏。";
-          }
-        }
-        if (publicAssistantContent === assistantContent) {
-          for (const delta of assistantDeltas) await publish("assistant_text_delta", { delta });
-        } else if (publicAssistantContent.length > 0) {
-          await publish("assistant_text_delta", { delta: publicAssistantContent });
-        }
+        // M0 has neither a strict assistant-output decoder nor a Server-owned
+        // summary. Provider text can echo private user input before the first
+        // tool, so no Provider-originated byte may cross into Public SSE.
+        await publish("assistant_text_delta", {
+          delta: hasPrivateToolResultObservation
+            ? PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION
+            : PROVIDER_ASSISTANT_TEXT_REDACTION,
+        });
       }
       if (assistantContent.length > 0 || completedCalls.length > 0) {
         messages.push({

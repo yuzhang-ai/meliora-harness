@@ -49,6 +49,8 @@ const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
 const MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE = "模型步骤结果未知，已停止自动重发 Provider 请求。";
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
 const TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE = "tool_invocation_outcome_unknown";
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE = "工具执行结果未知，已停止自动重放。";
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS = ["先通过 Host readback 或恢复协调器确认工具结果。"] as const;
 
 export type TurnCommandIds = ReadOnlyRunIds & Readonly<{
   nextSessionId(): string;
@@ -439,6 +441,23 @@ const settleOutcomeUnknown = async (
   return true;
 };
 
+type UnreceiptedExecutingInvocationState = "present" | "absent" | "indeterminate";
+
+const unreceiptedExecutingInvocationState = async (
+  store: SessionStorePort,
+  runId: string,
+): Promise<UnreceiptedExecutingInvocationState> => {
+  try {
+    const recovery = await store.readRecoveryBundle({ runId, eventLimit: 128 });
+    if (recovery.kind !== "found") return "indeterminate";
+    return recovery.bundle.invocations.some((record) =>
+      record.invocation.status === "executing" && record.receipt === null,
+    ) ? "present" : "absent";
+  } catch {
+    return "indeterminate";
+  }
+};
+
 const runWorker = async (
   options: Required<Omit<TurnCommandSubmitterOptions, "defer" | "ids">> & Readonly<{
     ids: TurnCommandIds;
@@ -462,6 +481,20 @@ const runWorker = async (
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
+      const invocationState = await unreceiptedExecutingInvocationState(options.store, current.runId);
+      if (invocationState === "present") {
+        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+          code: TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE,
+          message: TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE,
+          userActions: TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS,
+          requireStartedModelStep: false,
+        });
+        return;
+      }
+      // `failure`, `conflict`, `not_found`, or a read exception cannot prove
+      // the invocation is absent. Preserve dispatched state for a later
+      // recovery worker rather than applying the Model Step fallback.
+      if (invocationState === "indeterminate") return;
       await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
@@ -551,6 +584,12 @@ const runWorker = async (
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
+      if (await unreceiptedExecutingInvocationState(options.store, command.runId) !== "absent") {
+        // Host may already have caused an effect but its Receipt was not
+        // durable, or recovery cannot prove otherwise. Leave dispatched and
+        // executing untouched until a later worker can read a complete bundle.
+        return;
+      }
       if (await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,

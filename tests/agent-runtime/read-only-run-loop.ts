@@ -91,6 +91,9 @@ function createLoop(
     modelDelayMs?: number;
     store?: MemorySessionStore;
     throwFromHost?: boolean;
+    onHostStart?: () => void;
+    expectedUserMessage?: string;
+    expectedFirstAssistantContent?: string;
   }> = {},
 ) {
   const now = options.now ?? (() => fixedNow);
@@ -107,11 +110,11 @@ function createLoop(
         modelCalls += 1;
         assert.equal(checkpointStarts, modelCalls, "each Provider call must follow a new durable Model Step checkpoint");
         if (options.modelDelayMs) await new Promise((resolve) => setTimeout(resolve, options.modelDelayMs));
-        if (modelCalls === 1) assert.deepEqual(messages, [{ role: "user", content: "检查入口文件" }]);
+        if (modelCalls === 1) assert.deepEqual(messages, [{ role: "user", content: options.expectedUserMessage ?? "检查入口文件" }]);
         if (modelCalls === 2) {
           assert.deepEqual(messages.at(-2), {
             role: "assistant",
-            content: "我先读取入口文件。",
+            content: options.expectedFirstAssistantContent ?? "我先读取入口文件。",
             toolCalls: [{
               invocationId: "invocation-deepseek-0-0",
               toolName: "read_file",
@@ -129,6 +132,7 @@ function createLoop(
     tools: {
       execute: async (invocation) => {
         hostCalls += 1;
+        options.onHostStart?.();
         assert.equal(invocation.toolName, "read_file");
         assert.deepEqual(invocation.arguments, { path: "packages/agent-runtime/run-state.ts" });
         if (options.throwFromHost) throw new Error("injected_host_failure");
@@ -223,7 +227,7 @@ const successResult = await runWithCommand(success, {
 assert.equal(successResult.outcome.status, "completed");
 assert.equal(success.modelCalls(), 2);
 assert.equal(success.hostCalls(), 1, "only a started invocation execution permit may reach Host");
-assert.equal(success.assistantProjectionCalls(), 1, "post-tool assistant text must not rely on the public projector to avoid leaking private observations");
+assert.equal(success.assistantProjectionCalls(), 0, "M0 must never project Provider assistant text into the public surface");
 assert.equal(successResult.outcome.receiptRefs.length, 1);
 assert.equal((await success.store.readReceipt({
   runId: "run-success",
@@ -240,7 +244,7 @@ const successAssistantText = successResult.publicEvents
   .filter((event): event is Extract<(typeof successResult.publicEvents)[number], { kind: "assistant_text_delta" }> => event.kind === "assistant_text_delta")
   .map((event) => event.payload.delta)
   .join("");
-assert.match(successAssistantText, /我先读取入口文件。/u, "pre-tool safe assistant text should still be public");
+assert.match(successAssistantText, /模型响应已私有持久化，公开摘要尚未启用。/u, "pre-tool Provider text must be replaced by the fixed M0 notice");
 assert.match(successAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u, "post-tool assistant text should be fixed redaction");
 assert.equal(JSON.stringify(successResult).includes("API_KEY=secret"), false, "executor text must cross a server-owned projector");
 assert.equal(JSON.stringify(successResult).includes("private-artifact-id"), false, "private artifacts must not become public refs");
@@ -279,6 +283,24 @@ assert.deepEqual(successHistory.messages, [
   { role: "tool", invocationId: "invocation-deepseek-0-0", content: "入口文件存在，读取成功。" },
   { role: "assistant", content: "入口文件已读取并核验。" },
 ]);
+
+sequence = 0;
+const privateUserMarker = "M0_PRIVATE_USER_ECHO_MARKER";
+const exactPreToolEchoEvents = deepseekStreamTextSingleToolFixture.expectedEvents.map((event) =>
+  event.kind === "assistant_text_delta" ? { ...event, delta: privateUserMarker } : event,
+);
+const exactPreToolEcho = createLoop([exactPreToolEchoEvents, finalStop("ignored")], "succeeded", {
+  expectedUserMessage: privateUserMarker,
+  expectedFirstAssistantContent: privateUserMarker,
+});
+const exactPreToolEchoResult = await runWithCommand(exactPreToolEcho, {
+  sessionId: "session-pre-tool-echo", workspaceId: "workspace-pre-tool-echo", turnId: "turn-pre-tool-echo", runId: "run-pre-tool-echo", attemptId: "attempt-pre-tool-echo",
+  intentRevision: 1, catalog, userMessage: privateUserMarker,
+});
+assert.equal(exactPreToolEchoResult.outcome.status, "completed");
+assert.equal(JSON.stringify(exactPreToolEchoResult.publicEvents).includes(privateUserMarker), false, "pre-tool Provider echo must not reach the public Runtime result");
+const exactPreToolPrivateEvents = await exactPreToolEcho.store.readEvents({ runId: "run-pre-tool-echo", limit: 100 });
+assert.equal(exactPreToolPrivateEvents.events.some((event) => event.visibility === "private" && JSON.stringify(event.payload).includes(privateUserMarker)), true, "private canonical Provider events retain the original echo for the next model step");
 
 sequence = 0;
 const failure = createLoop([deepseekStreamTextSingleToolFixture.expectedEvents], "failed");
@@ -320,6 +342,36 @@ await assert.rejects(() => runWithCommand(invalidLease, {
   sessionId: "session-invalid-lease", workspaceId: "workspace-invalid-lease", turnId: "turn-invalid-lease", runId: "run-invalid-lease", attemptId: "attempt-invalid-lease",
   intentRevision: 1, catalog, userMessage: "检查入口文件",
 }), /lease_ttl_invalid/u);
+
+class ThrowingRenewalAfterHostStore extends MemorySessionStore {
+  hostStarted = false;
+  private remainingFailure = 1;
+
+  override async renewLease(...input: Parameters<MemorySessionStore["renewLease"]>) {
+    if (this.hostStarted && this.remainingFailure > 0) {
+      this.remainingFailure -= 1;
+      throw new Error("adapter_renewal_detail_must_not_escape");
+    }
+    return super.renewLease(input[0]);
+  }
+}
+
+const renewalExceptionStore = new ThrowingRenewalAfterHostStore({ clock: () => new Date(fixedNow) });
+const renewalException = createLoop([deepseekStreamTextSingleToolFixture.expectedEvents], "succeeded", {
+  store: renewalExceptionStore,
+  onHostStart: () => { renewalExceptionStore.hostStarted = true; },
+});
+await assert.rejects(() => runWithCommand(renewalException, {
+  sessionId: "session-renew-throw", workspaceId: "workspace-renew-throw", turnId: "turn-renew-throw", runId: "run-renew-throw", attemptId: "attempt-renew-throw",
+  intentRevision: 1, catalog, userMessage: "检查入口文件",
+}), /run_lease_lost/u);
+assert.equal(renewalException.hostCalls(), 1, "a renewal exception after Host must not replay Host");
+const renewalExceptionBundle = await renewalExceptionStore.readRecoveryBundle({ runId: "run-renew-throw", eventLimit: 20 });
+assert.equal(renewalExceptionBundle.kind, "found");
+if (renewalExceptionBundle.kind === "found") {
+  assert.equal(renewalExceptionBundle.bundle.invocations[0]?.invocation.status, "executing");
+  assert.equal(renewalExceptionBundle.bundle.invocations[0]?.receipt, null);
+}
 
 class ThrowingAtomicTerminalCommitStore extends MemorySessionStore {
   override async commitTerminalModelStepResultAndSnapshot(

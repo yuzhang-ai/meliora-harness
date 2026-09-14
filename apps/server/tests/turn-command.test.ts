@@ -325,6 +325,121 @@ class UncertainReceiptCommitStore extends MemorySessionStore {
   }
 }
 
+class LeaseLossAfterHostStore extends MemorySessionStore {
+  hostArtifactWrites = 0;
+  lastLeaseToken = "";
+  private failNextRenewal = true;
+  private executionStarted = false;
+
+  constructor(
+    options: ConstructorParameters<typeof MemorySessionStore>[0],
+    private readonly renewalFailure: "return_false" | "throw" = "return_false",
+  ) {
+    super(options);
+  }
+
+  override async putArtifact(...input: Parameters<MemorySessionStore["putArtifact"]>) {
+    if (input[0].visibility === "private" && input[0].mediaType === "text/plain") this.hostArtifactWrites += 1;
+    return super.putArtifact(input[0]);
+  }
+
+  override async beginInvocationExecution(...input: Parameters<MemorySessionStore["beginInvocationExecution"]>) {
+    const result = await super.beginInvocationExecution(input[0]);
+    if (result.kind === "started") this.executionStarted = true;
+    return result;
+  }
+
+  override async renewLease(...input: Parameters<MemorySessionStore["renewLease"]>) {
+    this.lastLeaseToken = input[0].leaseToken;
+    if (this.failNextRenewal && this.executionStarted && this.hostArtifactWrites === 1) {
+      this.failNextRenewal = false;
+      if (this.renewalFailure === "throw") throw new Error("adapter_renewal_detail_must_not_escape");
+      return false;
+    }
+    return super.renewLease(input[0]);
+  }
+}
+
+class IndeterminateRecoveryAfterHostStore extends LeaseLossAfterHostStore {
+  private remainingRecoveryFault = 1;
+
+  constructor(
+    private readonly recoveryFailure: "throw" | "too_large" | "not_found" | "conflict" | "incomplete",
+    options: ConstructorParameters<typeof MemorySessionStore>[0],
+  ) {
+    super(options);
+  }
+
+  override async readRecoveryBundle(...input: Parameters<MemorySessionStore["readRecoveryBundle"]>) {
+    if (this.hostArtifactWrites === 1 && this.remainingRecoveryFault > 0) {
+      this.remainingRecoveryFault -= 1;
+      if (this.recoveryFailure === "throw") throw new Error("injected_recovery_adapter_failure");
+      if (this.recoveryFailure === "too_large") return { kind: "failure" as const, code: "recovery_bundle_too_large" as const };
+      if (this.recoveryFailure === "incomplete") return { kind: "failure" as const, code: "recovery_bundle_incomplete" as const };
+      if (this.recoveryFailure === "not_found") return { kind: "not_found" as const, code: "run_not_found" as const };
+      return { kind: "conflict" as const, code: "run_attempt_conflict" as const };
+    }
+    return super.readRecoveryBundle(input[0]);
+  }
+}
+
+const exerciseUnreceiptedHostRecovery = async (
+  idempotencyKey: string,
+  createStore: (clock: () => Date) => LeaseLossAfterHostStore,
+): Promise<void> => {
+  let currentNow = fixedNow;
+  const store = createStore(() => new Date(currentNow));
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey,
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: {
+      next: async ({ modelStepId }) => {
+        modelCalls += 1;
+        return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+      },
+    },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1, "the first worker called Provider exactly once");
+  assert.equal(store.hostArtifactWrites, 1, "the first worker reached Host exactly once");
+  const scope = { localPrincipalId: "local-user", workspaceId, idempotencyKey };
+  assert.equal((await store.readRunCommand(scope))?.status, "dispatched");
+  const firstEvents = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(firstEvents.events.some((event) => /^run_(blocked|failed|completed|cancelled)$/u.test(event.kind)), false);
+
+  currentNow = "2026-09-12T03:00:02.000Z";
+  const replay = await submitTurnCommand(request);
+  if (replay.status !== 202) throw new Error("expected_replayed_command");
+  assert.equal(replay.body.disposition, "replay");
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1, "recovery must not replay Provider");
+  assert.equal(store.hostArtifactWrites, 1, "recovery must not replay Host");
+  const recovered = await store.readRunCommand(scope);
+  assert.equal(recovered?.status, "terminal");
+  assert.equal(recovered?.terminalStatus, "blocked");
+  assert.equal(recovered?.terminalCode, "tool_invocation_outcome_unknown");
+  const recoveredEvents = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(recoveredEvents.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(recoveredEvents.events.some((event) => event.kind === "run_failed"), false);
+};
+
 class FailingAtomicRunBlockedSettlementStore extends ThrowingAtomicTerminalCommitStore {
   // This is the Store boundary that must keep the public terminal event and
   // command terminal state indivisible.  Failing it must leave neither fact.
@@ -720,6 +835,198 @@ test("replayed dispatched commands fail closed as outcome_unknown without retryi
     message: "模型步骤结果未知，已停止自动重发 Provider 请求。",
     userActions: ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"],
   });
+});
+
+test("lease loss after Host execution settles the unreceipted invocation only after recovery", async () => {
+  let currentNow = fixedNow;
+  const store = new LeaseLossAfterHostStore({ clock: () => new Date(currentNow) });
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "lease-loss-after-host",
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: {
+      next: async ({ modelStepId }) => {
+        modelCalls += 1;
+        return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+      },
+    },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  assert.equal(deferred.length, 1);
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1);
+  assert.equal(store.hostArtifactWrites, 1, "Host was reached exactly once before the lease loss");
+  const scope = { localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey };
+  assert.equal((await store.readRunCommand(scope))?.status, "dispatched");
+  const beforeRecovery = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(beforeRecovery.events.some((event) => /^run_(blocked|failed|completed|cancelled)$/u.test(event.kind)), false);
+  const beforeBundle = await store.readRecoveryBundle({ runId: created.body.runId, eventLimit: 20 });
+  assert.equal(beforeBundle.kind, "found");
+  if (beforeBundle.kind === "found") {
+    assert.equal(beforeBundle.bundle.invocations[0]?.invocation.status, "executing");
+    assert.equal(beforeBundle.bundle.invocations[0]?.receipt, null);
+  }
+
+  currentNow = "2026-09-12T03:00:02.000Z";
+  const replay = await submitTurnCommand(request);
+  assert.equal(replay.status, 202);
+  assert.equal(replay.body.disposition, "replay");
+  assert.equal(replay.body.commandStatus, "dispatched");
+  assert.equal(deferred.length, 1);
+  await Promise.resolve(deferred.shift()!());
+
+  assert.equal(modelCalls, 1, "recovery must not call Provider again");
+  assert.equal(store.hostArtifactWrites, 1, "recovery must not execute Host again");
+  const recovered = await store.readRunCommand(scope);
+  assert.equal(recovered?.status, "terminal");
+  assert.equal(recovered?.terminalStatus, "blocked");
+  assert.equal(recovered?.terminalCode, "tool_invocation_outcome_unknown");
+  const afterRecovery = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(afterRecovery.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(afterRecovery.events.some((event) => event.kind === "run_failed"), false);
+});
+
+test("renewal exception after Host is lease-loss and settles only after recovery", async () => {
+  await exerciseUnreceiptedHostRecovery(
+    "lease-throw-after-host",
+    (clock) => new LeaseLossAfterHostStore({ clock }, "throw"),
+  );
+});
+
+for (const recoveryFailure of ["throw", "too_large", "not_found", "conflict", "incomplete"] as const) {
+  test(`indeterminate ${recoveryFailure} bundle after Host remains fail-closed until recovery`, async () => {
+    await exerciseUnreceiptedHostRecovery(
+      `indeterminate-recovery-${recoveryFailure}`,
+      (clock) => new IndeterminateRecoveryAfterHostStore(recoveryFailure, { clock }),
+    );
+  });
+}
+
+test("a real oversized recovery bundle never falls through to a terminal worker failure", async () => {
+  let currentNow = fixedNow;
+  const store = new LeaseLossAfterHostStore({ clock: () => new Date(currentNow) });
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "recovery-bundle-real-too-large",
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: { next: async ({ modelStepId }) => {
+      modelCalls += 1;
+      return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+    } },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(store.hostArtifactWrites, 1);
+  assert.ok(store.lastLeaseToken.length > 0);
+  for (let index = 0; index < 129; index += 1) {
+    const reservation = await store.reserveInvocation({
+      invocation: {
+        schemaVersion: "meliora.tool-invocation.v1",
+        invocationId: `overflow-invocation-${index}`,
+        runId: created.body.runId,
+        attemptId: created.body.attemptId,
+        toolName: "read_file",
+        toolVersion: "1.0.0",
+        arguments: { index },
+        argumentsHash: "a".repeat(64),
+        catalogHash: "m0-read-only-workspace-tools-v1",
+        idempotencyKey: `overflow-key-${index}`,
+        status: "reserved",
+      },
+      leaseToken: store.lastLeaseToken,
+      reservedAt: fixedNow,
+    });
+    assert.equal(reservation.kind, "owner");
+  }
+  assert.deepEqual(await store.readRecoveryBundle({ runId: created.body.runId, eventLimit: 128 }), {
+    kind: "failure",
+    code: "recovery_bundle_too_large",
+  });
+
+  currentNow = "2026-09-12T03:00:02.000Z";
+  await submitTurnCommand(request);
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1, "an oversized bundle must not replay Provider");
+  assert.equal(store.hostArtifactWrites, 1, "an oversized bundle must not replay Host");
+  const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+  assert.equal(command?.status, "dispatched");
+  const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(events.events.some((event) => /^run_(blocked|failed|completed|cancelled)$/u.test(event.kind)), false);
+});
+
+test("concurrent replay workers settle one unreceipted Host invocation exactly once", async () => {
+  let currentNow = fixedNow;
+  const store = new LeaseLossAfterHostStore({ clock: () => new Date(currentNow) });
+  const ids = deterministicIds();
+  const deferred: Array<() => Promise<void>> = [];
+  let modelCalls = 0;
+  const request = {
+    schemaVersion: TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+    workspaceId,
+    idempotencyKey: "concurrent-recovery-after-host",
+    message: "读取入口文件",
+  } as const;
+  const submitTurnCommand = createTurnCommandSubmitter({
+    store,
+    workspaceRoots: new Map([[workspaceId, process.cwd()]]),
+    model: { next: async ({ modelStepId }) => {
+      modelCalls += 1;
+      return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
+    } },
+    ids,
+    now: () => currentNow,
+    leaseTtlMs: 1_000,
+    defer: (run) => { deferred.push(run); },
+  });
+  const created = await submitTurnCommand(request);
+  assert.equal(created.status, 202);
+  if (created.status !== 202) throw new Error("expected_created_command");
+  await Promise.resolve(deferred.shift()!());
+  assert.equal(modelCalls, 1);
+  assert.equal(store.hostArtifactWrites, 1);
+  currentNow = "2026-09-12T03:00:02.000Z";
+  await submitTurnCommand(request);
+  await submitTurnCommand(request);
+  assert.equal(deferred.length, 2, "both replay workers must be scheduled before either is run");
+  await Promise.all(deferred.splice(0).map((run) => run()));
+
+  assert.equal(modelCalls, 1, "concurrent recovery must not replay Provider");
+  assert.equal(store.hostArtifactWrites, 1, "concurrent recovery must not replay Host");
+  const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: request.idempotencyKey });
+  assert.equal(command?.status, "terminal");
+  assert.equal(command?.terminalStatus, "blocked");
+  assert.equal(command?.terminalCode, "tool_invocation_outcome_unknown");
+  const events = await store.readEvents({ runId: created.body.runId, afterSequence: 0, limit: 50 });
+  assert.equal(events.events.filter((event) => event.kind === "run_blocked").length, 1);
+  assert.equal(events.events.some((event) => event.kind === "run_failed"), false);
 });
 
 test("POST /api/turns rejects sensitive input before durable command creation", async () => {
