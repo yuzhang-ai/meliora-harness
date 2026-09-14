@@ -133,12 +133,23 @@ export const decodePublicStoredEvent = (storedEvent: unknown, sessionId: unknown
     kind,
     payload: storedEvent.payload as Extract<PublicRunEvent, { kind: typeof kind }>["payload"],
   } as PublicRunEvent;
+  return validatePublicRunEvent(event) === null ? { kind: "invalid" } : { kind: "public", event };
+};
+
+/** Strict validator for values that are already in the browser event shape. */
+export const validatePublicRunEvent = (value: unknown): PublicRunEvent | null => {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "schemaVersion", "eventId", "sessionId", "runId", "sequence", "timestamp", "visibility", "kind", "payload",
+  ])) return null;
+  if (value.schemaVersion !== PUBLIC_RUN_EVENT_SCHEMA_VERSION || !isString(value.eventId)
+    || !isString(value.sessionId) || !isString(value.runId) || !isSafeSequence(value.sequence)
+    || !isString(value.timestamp) || value.visibility !== "public" || !isString(value.kind)
+    || !PUBLIC_KINDS.has(value.kind as PublicRunEvent["kind"])
+    || !isPayloadForKind(value.kind as PublicRunEvent["kind"], value.payload)) return null;
   try {
-    // Scan the final browser-visible envelope, not only the persisted payload:
-    // resolver-provided session IDs and generated IDs are public surface too.
-    assertPersistableJson(event as unknown as JsonValue, "public_event");
+    assertPersistableJson(value as unknown as JsonValue, "public_event");
   } catch {
-    return { kind: "invalid" };
+    return null;
   }
-  return { kind: "public", event };
+  return value as PublicRunEvent;
 };

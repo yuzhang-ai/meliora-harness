@@ -147,6 +147,8 @@ WP-3B.2b.1 只增加 Store-owned staged public tool-result provenance：首次 s
 
 WP-3B.2b.2 将 alias 切换到唯一允许公开的原子边界：`commitReceiptWithPublicEvents` 在一个 adapter critical section / SQLite transaction 内校验 active lease、`executing` reservation、canonical invocation 与 Receipt 的 tool/version/arguments/catalog/run/attempt 全匹配，再由 Store 自己生成 canonical `tool_result_presented` 和可选 `verification_updated`。成功公开验证只能是 `verificationArtifactIds=[]` 或恰为 `[outputArtifactId]`；failed/cancelled 的明确 Host 结果也生成安全 summary alias，但不生成 verification event。Receipt、reservation/invocation terminal status、连续 sequence event batch 和 immutable binding（reservation/receipt/run/attempt、original expected/first/last sequence、canonical events hash）必须全写或全不写。exact replay 只验证并返回既有 binding 的原 StoredEvent，不要求有效 lease/当前 sequence，不追加 sequence；legacy Receipt 缺 binding 或任一 identity/hash/sequence 漂移一律不重放 Host/Provider，也不回填。
 
+WP-3B.2c.1 的 `readEventLogPage` 是只读、Store 内部的固定水位分页原语。首次调用在一个 Memory 同步 read view 或 SQLite read transaction 内先捕获 Run 的 active Attempt `last_event_sequence` 和 `MAX(events.sequence)`，二者不相等或 active Attempt 缺失即 `event_watermark_conflict`；只有二者相等才把该值作为 `throughSequence` 并读取同一视图内 `sequence <= throughSequence` 的页面。后续分页必须携带安全整数水位，且它不能高于当前 head、`afterSequence` 不能高于水位；不认识的 Run 显式 `run_not_found`，伪造/过期水位显式 conflict，绝不伪装为空页。该原语不写 Snapshot、Run、Attempt、Lease、Provider 或 Host，也不新增 migration。
+
 SQLite WAL 记录整页，stage 写入与既有 private artifact 位于同一 B-tree 页时，新增 WAL frame 可以合法带有相邻 private row 的字节。因此 B2b.1 不声称 raw DB/WAL 不含 private artifact；安全断言仅是 provenance row、stage 新建 derivative row 和 schema 不复制 private source identity/content，且整个 stage transaction 原子回滚。
 
 ## 7. SQLite 与生产边界
@@ -169,7 +171,7 @@ Last-Event-ID: <public_event_sequence>
 - 客户端重复收到事件时按 ID 去重。
 - 终态事件后连接可关闭。
 - Server 发射 SSE 与验证 `Last-Event-ID` 都必须调用同一 async `decodePublicStoredEvent + authorizePublicStoredEvent` gate；只有成功 decode、command 的 `(localPrincipalId, sessionId, runId)` scope 匹配且 exact StoredEvent identity 属于 immutable Receipt binding 的 artifact-bearing public event 才能成为 client anchor。`tool_result_presented` 逐项绑定 invocation/status/output alias，`verification_updated` 逐项绑定 Receipt verification alias；任一 ref/binding 不通过即整条 event quarantine，不能删坏 ref 后部分发射。private、unknown、malformed、旧 generic raw ref，及携带 evidenceRefs 的 `plan_updated` 都只是原始扫描中的 gap，绝不能作为 anchor，也不得使后续合法 public terminal 不可达。该 append-only M0 切片不为 retention/同一 read view 新增 Store API，未来若引入保留策略必须另行冻结 cursor 一致性。
-- public snapshot/resume-point 的存储和 projector/SSE 契约尚未在此切片实现；在其冻结前，事件保留不足不得把 private `RunSnapshot` 当作 public payload 或构造 escape hatch。
+- `GET /api/runs/:runId/resume` 的 WP-3B.2c.1 public resume snapshot 是按需、只读的 `PublicRunResumeSnapshot v1`，不是 private `RunSnapshot`，不持久化、没有 retention/reset token、SSE reset、HTTP artifact route 或 Web live 语义。它从 fixed-watermark page 最多扫描 500 条 source events，使用和 SSE 完全相同的 `decodePublicStoredEvent + authorizePublicStoredEvent` gate；private、unknown、malformed、sensitive、带 evidence 的 plan、及无 immutable Receipt binding 的 alias event 都 quarantine 后继续扫描。canonical JSON response 超过 256 KiB 或 source 上限时安全失败、绝不返回 partial。`throughSequence` 是 raw log 水位，绝不是 Last-Event-ID；`resumePoint` 只能是 `origin`（无 authorized event）或数组最后一个 exact authorized PublicRunEvent。由于 SSE 在首个合法 terminal event 后结束，若此后仍有任一 raw event，snapshot 必须 conflict，不能隐式截断或锚到不可通过 SSE 到达的事件。
 - 页面刷新只做 read，不创建新 Run。
 
 ## 9. 数据安全

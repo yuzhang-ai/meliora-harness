@@ -1,8 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { decodePublicStoredEvent, type PublicRunEvent } from "../../../packages/agent-runtime/index.js";
+import {
+  decodePublicStoredEvent,
+  decodePublicRunResumeSnapshot,
+  PUBLIC_RUN_RESUME_SNAPSHOT_SCHEMA_VERSION,
+  type PublicRunEvent,
+  type PublicRunResumeSnapshot,
+} from "../../../packages/agent-runtime/index.js";
 import { RunCommandContractError } from "../../../packages/session-store/run-command-contract.js";
+import { canonicalJson } from "../../../packages/session-store/integrity.js";
 import type { SessionStorePort, StoredEvent } from "../../../packages/session-store/contracts.js";
+import type { JsonValue } from "../../../packages/model-protocol/contracts.js";
 import {
   parseTurnCommandRequest,
   TURN_COMMAND_ERROR_SCHEMA_VERSION,
@@ -51,7 +59,11 @@ export const encodeSseEvent = (event: PublicRunEvent): string => {
 };
 
 const json = (value: unknown): string => JSON.stringify(value);
+const canonicalPublicResumeJson = (snapshot: PublicRunResumeSnapshot): string => canonicalJson(snapshot as unknown as JsonValue);
 const DEFAULT_MAX_JSON_BODY_BYTES = 70 * 1024;
+const MAX_PUBLIC_RESUME_SOURCE_EVENTS = 500;
+const MAX_PUBLIC_RESUME_RESPONSE_BYTES = 256 * 1024;
+const PUBLIC_RESUME_PAGE_SIZE = 100;
 
 export const writeWithBackpressure = async (response: ServerResponse, chunk: string): Promise<boolean> => {
   if (response.destroyed || response.writableEnded) return false;
@@ -218,6 +230,73 @@ const validatePublicCursor = async (
   return event?.sequence === sequence && await decodeAndAuthorizePublicEvent(store, localPrincipalId, sessionId, event) !== null;
 };
 
+type PublicResumeReadResult =
+  | Readonly<{ kind: "found"; snapshot: PublicRunResumeSnapshot }>
+  | Readonly<{ kind: "not_found" }>
+  | Readonly<{ kind: "conflict" }>
+  | Readonly<{ kind: "too_large" }>;
+
+/**
+ * Build a transient public projection only.  The Store fixes the raw log
+ * watermark on its first page; every later page is bounded by that value.
+ */
+export const readPublicRunResumeSnapshot = async (
+  store: SessionStorePort,
+  runId: string,
+  sessionId: string,
+  localPrincipalId: string,
+): Promise<PublicResumeReadResult> => {
+  let throughSequence: number | undefined;
+  let afterSequence = 0;
+  let sourceEventCount = 0;
+  const events: PublicRunEvent[] = [];
+  let terminalSeen = false;
+
+  for (;;) {
+    const page = await store.readEventLogPage({
+      runId,
+      afterSequence,
+      throughSequence,
+      limit: PUBLIC_RESUME_PAGE_SIZE,
+    });
+    if (page.kind === "not_found") return { kind: "not_found" };
+    if (page.kind === "conflict") return { kind: "conflict" };
+    throughSequence = page.throughSequence;
+    sourceEventCount += page.events.length;
+    if (sourceEventCount > MAX_PUBLIC_RESUME_SOURCE_EVENTS) return { kind: "too_large" };
+
+    // Quarantined records remain source-log gaps. They do not stop scanning,
+    // enter the payload, or become a resume anchor.
+    for (const storedEvent of page.events) {
+      // SSE ends at the first exact public terminal event. A later raw record
+      // would make a snapshot resume farther than an SSE client can ever see,
+      // so fail closed rather than silently trim or advance its anchor.
+      if (terminalSeen) return { kind: "conflict" };
+      const event = await decodeAndAuthorizePublicEvent(store, localPrincipalId, sessionId, storedEvent);
+      if (event !== null) {
+        events.push(event);
+        if (isTerminalPublicEvent(event)) terminalSeen = true;
+      }
+    }
+    if (page.nextSequence === null) break;
+    afterSequence = page.nextSequence;
+  }
+
+  const snapshot: PublicRunResumeSnapshot = {
+    schemaVersion: PUBLIC_RUN_RESUME_SNAPSHOT_SCHEMA_VERSION,
+    sessionId,
+    runId,
+    throughSequence: throughSequence ?? 0,
+    resumePoint: events.length === 0 ? { kind: "origin" } : { kind: "public_event", event: events.at(-1)! },
+    events,
+  };
+  // The response has a fixed, canonical field order.  Do this only after the
+  // complete read so an oversized projection never leaks a partial page.
+  if (Buffer.byteLength(canonicalPublicResumeJson(snapshot), "utf8") > MAX_PUBLIC_RESUME_RESPONSE_BYTES) return { kind: "too_large" };
+  const validated = decodePublicRunResumeSnapshot(snapshot);
+  return validated === null ? { kind: "conflict" } : { kind: "found", snapshot: validated };
+};
+
 const handleRequest = async (options: MelioraServerOptions, request: IncomingMessage, response: ServerResponse): Promise<void> => {
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
@@ -233,15 +312,53 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
     await handleTurnCommandRequest(options, request, response);
     return;
   }
+  const runResume = /^\/api\/runs\/([^/]+)\/resume$/u.exec(url.pathname);
   const runEvents = /^\/api\/runs\/([^/]+)\/events$/u.exec(url.pathname);
-  if (request.method !== "GET" || !runEvents) {
+  if (request.method !== "GET" || (!runResume && !runEvents)) {
     writeJsonError(response, 404, { error: "not_found" });
     return;
   }
 
   let runId: string;
-  try { runId = decodeURIComponent(runEvents[1]!); }
+  try { runId = decodeURIComponent((runResume ?? runEvents)![1]!); }
   catch { writeJsonError(response, 400, { error: "invalid_run_id" }); return; }
+
+  if (runResume) {
+    // This endpoint is a read-only public projection, not a cacheable private
+    // recovery snapshot. Set it before any outcome, including safe failures.
+    response.setHeader("cache-control", "no-store");
+    const sessionId = await options.resolveSessionId(runId);
+    const localPrincipalId = await options.resolveLocalPrincipalId(runId);
+    if (sessionId === null || localPrincipalId === null) {
+      writeJsonError(response, 404, { error: "run_not_found" });
+      return;
+    }
+    let result: PublicResumeReadResult;
+    try {
+      result = await readPublicRunResumeSnapshot(options.store, runId, sessionId, localPrincipalId);
+    } catch {
+      writeJsonError(response, 500, { error: "resume_snapshot_failed" });
+      return;
+    }
+    if (result.kind === "not_found") {
+      writeJsonError(response, 404, { error: "run_not_found" });
+      return;
+    }
+    if (result.kind === "conflict") {
+      writeJsonError(response, 409, { error: "resume_snapshot_conflict" });
+      return;
+    }
+    if (result.kind === "too_large") {
+      writeJsonError(response, 413, { error: "resume_snapshot_too_large" });
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    response.end(canonicalPublicResumeJson(result.snapshot));
+    return;
+  }
 
   const header = request.headers["last-event-id"];
   const lastSequence = parseLastSequence(Array.isArray(header) ? header[0] : header);

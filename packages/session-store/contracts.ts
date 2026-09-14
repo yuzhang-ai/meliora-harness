@@ -410,6 +410,28 @@ export type EventPage = Readonly<{
   nextSequence: number | null;
 }>;
 
+/**
+ * A read-only event-log page with a Store-owned fixed watermark.  Omitting
+ * `throughSequence` starts a new read and atomically captures the Run's event
+ * head; every following page must carry that exact value.
+ */
+export type ReadEventLogPageInput = Readonly<{
+  runId: string;
+  afterSequence?: number;
+  throughSequence?: number;
+  limit: number;
+}>;
+
+export type EventLogPage =
+  | Readonly<{
+      kind: "found";
+      events: readonly StoredEvent[];
+      nextSequence: number | null;
+      throughSequence: number;
+    }>
+  | Readonly<{ kind: "not_found"; code: "run_not_found" }>
+  | Readonly<{ kind: "conflict"; code: "event_watermark_conflict" }>;
+
 export type RunSnapshot = Readonly<{
   schemaVersion: "meliora.run-snapshot.v1";
   snapshotId: string;
@@ -948,6 +970,8 @@ export interface SessionStorePort extends RecoveryReadPort {
   createRunAttempt(input: CreateRunAttemptInput): Promise<CreateRunAttemptResult>;
   appendEvents(input: AppendEventsInput): Promise<AppendEventsResult>;
   readEvents(input: ReadEventsInput): Promise<EventPage>;
+  /** Internal read primitive for bounded, replayable public projections. */
+  readEventLogPage(input: ReadEventLogPageInput): Promise<EventLogPage>;
   /** Legacy non-terminal checkpoint helper; terminal bindings require atomic commit. */
   writeSnapshot(input: WriteSnapshotInput): Promise<void>;
   readSnapshot(runId: string): Promise<RunSnapshot | null>;
