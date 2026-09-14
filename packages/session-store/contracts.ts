@@ -737,6 +737,52 @@ export type PutArtifactInput = Readonly<{
   createdAt: string;
 }>;
 
+/**
+ * Opaque Store-only staging alias. B2b.1 does not change the current
+ * PublicArtifactRef artifactId semantics or authorize an event/SSE/HTTP use.
+ * The Store keeps the derivative's physical identity private.
+ */
+export type StagedPublicArtifactManifest = Readonly<{
+  artifactId: string;
+  visibility: "public";
+  contentHash: string;
+  mediaType: "text/plain";
+  byteLength: number;
+  createdAt: string;
+  projectionKind: "tool_result";
+}>;
+
+export type StagePublicToolResultDerivativeInput = Readonly<{
+  runId: string;
+  sessionId: string;
+  attemptId: string;
+  leaseToken: string;
+  reservationId: string;
+  invocationId: string;
+  content: Uint8Array;
+  contentHash: string;
+  mediaType: "text/plain";
+}>;
+
+export type StagePublicToolResultDerivativeResult =
+  | Readonly<{ kind: "staged"; manifest: StagedPublicArtifactManifest }>
+  | Readonly<{ kind: "replay"; manifest: StagedPublicArtifactManifest }>
+  | Readonly<{
+      kind: "conflict";
+      code: "run_attempt_conflict" | "lease_not_held" | "lease_expired" | "invocation_execution_conflict" | "public_artifact_provenance_conflict";
+    }>;
+
+/** Store-only staged read. It is neither SSE/HTTP output nor an authorization decision. */
+export type ResolveStagedPublicArtifactInput = Readonly<{
+  runId: string;
+  sessionId: string;
+  artifactId: string;
+}>;
+
+export type ResolveStagedPublicArtifactResult =
+  | Readonly<{ kind: "found"; manifest: StagedPublicArtifactManifest }>
+  | Readonly<{ kind: "not_found" }>;
+
 export type LeaseRequest = Readonly<{
   runId: string;
   attemptId: string;
@@ -856,6 +902,13 @@ export interface SessionStorePort extends RecoveryReadPort {
   /** New Receipts require a durable `executing` reservation; exact Receipts replay. */
   commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult>;
   readReceipt(input: ReadReceiptInput): Promise<ToolReceipt | null>;
+  /** B2b.1 Store staging only; B2b.2 owns event/SSE/HTTP/public-read authorization. */
+  stagePublicToolResultDerivative(
+    input: StagePublicToolResultDerivativeInput,
+  ): Promise<StagePublicToolResultDerivativeResult>;
+  resolveStagedPublicArtifact(
+    input: ResolveStagedPublicArtifactInput,
+  ): Promise<ResolveStagedPublicArtifactResult>;
   putArtifact(input: PutArtifactInput): Promise<ArtifactRef>;
   getArtifact(id: string): Promise<Artifact | null>;
   acquireLease(input: LeaseRequest): Promise<LeaseResult>;

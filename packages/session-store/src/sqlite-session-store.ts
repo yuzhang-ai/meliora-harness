@@ -20,6 +20,8 @@ import type {
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
   SettleRunCommandWithTerminalEventResult, TransitionRunCommandInput, TransitionRunCommandResult,
   TurnRecord, WriteSnapshotInput, PrivateArtifactRef,
+  StagePublicToolResultDerivativeInput, StagePublicToolResultDerivativeResult,
+  ResolveStagedPublicArtifactInput, ResolveStagedPublicArtifactResult, StagedPublicArtifactManifest,
 } from "../contracts.js";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../contracts.js";
 import {
@@ -47,6 +49,7 @@ const MIGRATIONS = [
   loadMigration(1, "0001_initial.sql"),
   loadMigration(2, "0002_durable_commands.sql"),
   loadMigration(3, "0003_private_recovery_primitives.sql"),
+  loadMigration(4, "0004_public_artifact_provenance.sql"),
 ] as const;
 const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
 type Options = Readonly<{
@@ -912,6 +915,104 @@ export class SqliteSessionStore implements SessionStorePort {
     return row ? this.toReceipt(row) : null;
   }
 
+  async stagePublicToolResultDerivative(
+    input: StagePublicToolResultDerivativeInput,
+  ): Promise<StagePublicToolResultDerivativeResult> {
+    assertPersistableBytes(input.content, "staged_public_derivative.content");
+    if (input.mediaType !== "text/plain" || hashBytes(input.content) !== input.contentHash) {
+      return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+    }
+    try {
+      return this.db.transaction((): StagePublicToolResultDerivativeResult => {
+        const prior = this.db.prepare(`
+          SELECT * FROM staged_public_artifact_provenance
+          WHERE run_id=? AND origin_attempt_id=? AND origin_invocation_id=? AND projection_kind='tool_result'
+        `).get(input.runId, input.attemptId, input.invocationId) as Row | undefined;
+        if (prior) {
+          const manifest = this.readStagedPublicArtifactManifest(prior);
+          if (!manifest || prior.session_id !== input.sessionId || prior.reservation_id !== input.reservationId
+            || manifest.contentHash !== input.contentHash || manifest.mediaType !== input.mediaType
+            || manifest.byteLength !== input.content.byteLength) {
+            return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+          }
+          const physical = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?").get(prior.physical_artifact_id) as Row | undefined;
+          if (!physical || Buffer.from(physical.content).byteLength !== input.content.byteLength
+            || !Buffer.from(physical.content).equals(Buffer.from(input.content))) {
+            return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+          }
+          return { kind: "replay", manifest };
+        }
+
+        const run = this.db.prepare(`
+          SELECT r.session_id,r.active_attempt_id,a.session_id AS attempt_session_id
+          FROM runs r JOIN run_attempts a ON a.run_id=r.run_id AND a.attempt_id=?
+          WHERE r.run_id=?
+        `).get(input.attemptId, input.runId) as Row | undefined;
+        if (!run || run.session_id !== input.sessionId || run.attempt_session_id !== input.sessionId
+          || run.active_attempt_id !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+        const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+        if (lease) return { kind: "conflict", code: lease };
+        const invocation = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
+        if (!invocation || invocation.run_id !== input.runId || invocation.attempt_id !== input.attemptId
+          || invocation.invocation_id !== input.invocationId || invocation.status !== "executing"
+          || invocation.execution_started_at === null || !this.toInvocation(invocation)) {
+          return { kind: "conflict", code: "invocation_execution_conflict" };
+        }
+
+        const publicAlias = `public-artifact-${this.nonce()}`;
+        const physicalArtifactId = `staged-public-physical-${this.nonce()}`;
+        const provenanceCollision = this.db.prepare(`
+          SELECT 1 FROM staged_public_artifact_provenance
+          WHERE public_alias IN (?,?) OR physical_artifact_id IN (?,?)
+        `).get(publicAlias, physicalArtifactId, publicAlias, physicalArtifactId);
+        const artifactCollision = this.db.prepare("SELECT 1 FROM artifacts WHERE artifact_id IN (?,?)")
+          .get(publicAlias, physicalArtifactId);
+        if (provenanceCollision || artifactCollision) {
+          return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+        }
+        const createdAt = this.clock().toISOString();
+        this.db.prepare("INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)").run(
+          physicalArtifactId, input.contentHash, "text/plain", Buffer.from(input.content), input.content.byteLength,
+          "private", null, createdAt,
+        );
+        this.db.prepare(`
+          INSERT INTO staged_public_artifact_provenance (
+            public_alias,physical_artifact_id,run_id,session_id,origin_attempt_id,origin_invocation_id,
+            reservation_id,projection_kind,content_hash,media_type,byte_length,physical_visibility,created_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          publicAlias, physicalArtifactId, input.runId, input.sessionId, input.attemptId, input.invocationId,
+          input.reservationId, "tool_result", input.contentHash, "text/plain", input.content.byteLength, "private", createdAt,
+        );
+        return {
+          kind: "staged",
+          manifest: {
+            artifactId: publicAlias, visibility: "public", contentHash: input.contentHash, mediaType: "text/plain",
+            byteLength: input.content.byteLength, createdAt, projectionKind: "tool_result",
+          },
+        };
+      }).immediate();
+    } catch (error) {
+      if (isUniqueConstraint(error)) return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+      throw error;
+    }
+  }
+
+  async resolveStagedPublicArtifact(
+    input: ResolveStagedPublicArtifactInput,
+  ): Promise<ResolveStagedPublicArtifactResult> {
+    try {
+      const row = this.db.prepare(`
+        SELECT * FROM staged_public_artifact_provenance
+        WHERE public_alias=? AND run_id=? AND session_id=?
+      `).get(input.artifactId, input.runId, input.sessionId) as Row | undefined;
+      const manifest = row ? this.readStagedPublicArtifactManifest(row) : null;
+      return manifest ? { kind: "found", manifest } : { kind: "not_found" };
+    } catch {
+      return { kind: "not_found" };
+    }
+  }
+
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
     assertPersistableBytes(input.content, "artifact.content");
     if (input.metadata !== undefined) assertPersistableJson(input.metadata, "artifact.metadata");
@@ -1172,4 +1273,29 @@ export class SqliteSessionStore implements SessionStorePort {
   private sameInvocation(a: NormalizedToolInvocation, b: NormalizedToolInvocation): boolean { return a.invocationId === b.invocationId && a.runId === b.runId && a.attemptId === b.attemptId && a.toolName === b.toolName && a.toolVersion === b.toolVersion && a.argumentsHash === b.argumentsHash && a.catalogHash === b.catalogHash && a.idempotencyKey === b.idempotencyKey && sameJson(a.arguments, b.arguments); }
   private receiptMatches(receipt: ToolReceipt, invocation: NormalizedToolInvocation): boolean { return receipt.invocationId === invocation.invocationId && receipt.runId === invocation.runId && receipt.attemptId === invocation.attemptId && receipt.toolName === invocation.toolName && receipt.toolVersion === invocation.toolVersion && receipt.argumentsHash === invocation.argumentsHash && receipt.catalogHash === invocation.catalogHash; }
   private toArtifactRef(row: Row): ArtifactRef { return { artifactId: row.artifact_id, contentHash: row.content_hash, mediaType: row.media_type, byteLength: row.byte_length, visibility: row.visibility }; }
+  private readStagedPublicArtifactManifest(row: Row): StagedPublicArtifactManifest | null {
+    const run = this.db.prepare("SELECT session_id FROM runs WHERE run_id=?").get(row.run_id) as Row | undefined;
+    const attempt = this.db.prepare("SELECT session_id FROM run_attempts WHERE run_id=? AND attempt_id=?")
+      .get(row.run_id, row.origin_attempt_id) as Row | undefined;
+    const invocation = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?")
+      .get(row.reservation_id) as Row | undefined;
+    const physical = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id=?")
+      .get(row.physical_artifact_id) as Row | undefined;
+    if (!run || !attempt || !invocation || !physical
+      || run.session_id !== row.session_id || attempt.session_id !== row.session_id
+      || invocation.run_id !== row.run_id || invocation.attempt_id !== row.origin_attempt_id
+      || invocation.invocation_id !== row.origin_invocation_id || invocation.reservation_id !== row.reservation_id
+      || physical.visibility !== "private" || physical.media_type !== "text/plain"
+      || physical.content_hash !== row.content_hash || physical.byte_length !== row.byte_length
+      || physical.created_at !== row.created_at || Buffer.from(physical.content).byteLength !== physical.byte_length
+      || hashBytes(physical.content) !== physical.content_hash || row.physical_visibility !== "private"
+      || row.projection_kind !== "tool_result" || row.media_type !== "text/plain") return null;
+    // Verify the canonical invocation record as part of the reservation binding;
+    // any tampered invocation payload is a fail-closed staged miss.
+    this.toInvocation(invocation);
+    return {
+      artifactId: row.public_alias, visibility: "public", contentHash: row.content_hash, mediaType: "text/plain",
+      byteLength: row.byte_length, createdAt: row.created_at, projectionKind: "tool_result",
+    };
+  }
 }
