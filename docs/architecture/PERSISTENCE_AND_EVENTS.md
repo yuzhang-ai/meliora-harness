@@ -141,6 +141,12 @@ Public SSE 只读取 `visibility=public` 的投影事件。Private 事件可用�
 
 本地开发可使用 workspace 外的受控数据目录。Artifact 路径不能由模型直接决定，下载和 UI 展示仍经过访问控制和脱敏。
 
+WP-3B.2b.1 只增加 Store-owned staged public tool-result provenance：首次 stage 只接受 active Attempt、有效 lease 与 `executing` reservation，并在同一 adapter critical section / SQLite `BEGIN IMMEDIATE` 中生成 opaque staging alias、private physical `text/plain` derivative、Store clock `createdAt` 和 immutable provenance。provenance 固定 `(run, session, origin attempt, origin invocation, reservation, slot=tool_result, hash, media type, byte length)`；同一 origin slot 只能有一个 alias，physical artifact 也只能绑定一个 alias。调用方不能指定 alias、physical ID 或 createdAt；exact replay 即使 lease 已失效也只能在完整 readback 后复用原 manifest，任何 identity/content/hash/media/reservation drift 都 fail closed。
+
+该 staged resolve 的输入仅为 `(runId, sessionId, alias)`，它在 Store 内复核 Run/Session、origin Attempt/Invocation/Reservation、artifact visibility/media/hash/bytes 与 provenance 绑定，并只返回 safe staging manifest，不返回 bytes、physical ID、principal 或 private source ID。同一 Run 的后续 Attempt 可以使用已验证的历史 alias。旧 public ref 不回填；尚无 provenance 的旧 ref 留给后续 Server gate quarantine。B2b.1 不创建 HTTP route、SSE emission、snapshot 或 public-read authorization，也不改变 Runtime/public event 当前 Artifact ID 语义；matching durable Receipt、principal 对外授权及 alias 切换留给 B2b.2。
+
+SQLite WAL 记录整页，stage 写入与既有 private artifact 位于同一 B-tree 页时，新增 WAL frame 可以合法带有相邻 private row 的字节。因此 B2b.1 不声称 raw DB/WAL 不含 private artifact；安全断言仅是 provenance row、stage 新建 derivative row 和 schema 不复制 private source identity/content，且整个 stage transaction 原子回滚。
+
 ## 7. SQLite 与生产边界
 
 M0/M1 可以复用 E3 的 SQLite 思路，但必须放在 adapter 后。Windows 原生依赖建议在短路径 worktree 验证。

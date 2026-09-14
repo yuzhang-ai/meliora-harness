@@ -61,6 +61,11 @@ import type {
   InvocationReconciliationRecord,
   PrivateArtifactRef,
   TerminalModelStepResultRef,
+  StagePublicToolResultDerivativeInput,
+  StagePublicToolResultDerivativeResult,
+  ResolveStagedPublicArtifactInput,
+  ResolveStagedPublicArtifactResult,
+  StagedPublicArtifactManifest,
 } from "./contracts";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "./contracts";
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
@@ -89,6 +94,16 @@ type MemorySessionStoreOptions = Readonly<{
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
 }>;
 
+type StagedPublicArtifactProvenance = Readonly<{
+  manifest: StagedPublicArtifactManifest;
+  physicalArtifactId: string;
+  runId: string;
+  sessionId: string;
+  originAttemptId: string;
+  originInvocationId: string;
+  reservationId: string;
+}>;
+
 const attemptKey = (runId: string, attemptId: string) => `${runId}\u0000${attemptId}`;
 const invocationKey = (runId: string, attemptId: string, invocationId: string) =>
   `${runId}\u0000${attemptId}\u0000${invocationId}`;
@@ -97,6 +112,8 @@ const receiptKey = (runId: string, attemptId: string, receiptId: string) =>
 const commandScopeKey = (scope: RunCommandScope) =>
   `${scope.localPrincipalId}\u0000${scope.workspaceId}\u0000${scope.idempotencyKey}`;
 const modelStepKey = (runId: string, modelStepId: string) => `${runId}\u0000${modelStepId}`;
+const stagedPublicArtifactOriginKey = (runId: string, attemptId: string, invocationId: string) =>
+  `${runId}\u0000${attemptId}\u0000${invocationId}\u0000tool_result`;
 const sameDocument = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 const deepCopy = <T>(value: T): T => structuredClone(value);
 const sameInvocationRequest = (
@@ -136,9 +153,13 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly receipts = new Map<string, ToolReceipt>();
   private readonly receiptByReservation = new Map<string, string>();
   private readonly artifacts = new Map<string, Artifact>();
+  private readonly stagedPublicArtifacts = new Map<string, StagedPublicArtifactProvenance>();
+  private readonly stagedPublicArtifactAliasByOrigin = new Map<string, string>();
+  private readonly stagedPublicArtifactAliasByPhysicalId = new Map<string, string>();
   private readonly leases = new Map<string, Lease>();
   private leaseSequence = 0;
   private reservationSequence = 0;
+  private publicArtifactSequence = 0;
 
   private readonly clock: () => Date;
   private readonly nextLeaseToken: () => string;
@@ -1002,6 +1023,82 @@ export class MemorySessionStore implements SessionStorePort {
     return this.receipts.get(receiptKey(input.runId, input.attemptId, input.receiptId)) ?? null;
   }
 
+  async stagePublicToolResultDerivative(
+    input: StagePublicToolResultDerivativeInput,
+  ): Promise<StagePublicToolResultDerivativeResult> {
+    assertPersistableBytes(input.content, "staged_public_derivative.content");
+    if (input.mediaType !== "text/plain" || hashBytes(input.content) !== input.contentHash) {
+      return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+    }
+    const originKey = stagedPublicArtifactOriginKey(input.runId, input.attemptId, input.invocationId);
+    const existingAlias = this.stagedPublicArtifactAliasByOrigin.get(originKey);
+    if (existingAlias) {
+      const existing = this.stagedPublicArtifacts.get(existingAlias);
+      if (!existing || !this.isValidStagedPublicArtifact(existing)
+        || existing.sessionId !== input.sessionId || existing.reservationId !== input.reservationId
+        || existing.manifest.contentHash !== input.contentHash || existing.manifest.mediaType !== input.mediaType
+        || existing.manifest.byteLength !== input.content.byteLength) {
+        return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+      }
+      const artifact = this.artifacts.get(existing.physicalArtifactId)!;
+      if (artifact.content.byteLength !== input.content.byteLength || !sameDocument(Array.from(artifact.content), Array.from(input.content))) {
+        return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+      }
+      return { kind: "replay", manifest: deepCopy(existing.manifest) };
+    }
+
+    const run = this.runs.get(input.runId);
+    const attempt = this.attemptForRun(input.runId, input.attemptId);
+    if (!run || !attempt || run.activeAttemptId !== input.attemptId || run.sessionId !== input.sessionId || attempt.sessionId !== input.sessionId) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+    if (leaseConflict) return { kind: "conflict", code: leaseConflict };
+    const reservation = this.reservations.get(input.reservationId);
+    const invocation = this.invocations.get(invocationKey(input.runId, input.attemptId, input.invocationId));
+    if (!reservation || !invocation || reservation.runId !== input.runId || reservation.attemptId !== input.attemptId
+      || reservation.invocationId !== input.invocationId || reservation.status !== "executing"
+      || reservation.executionStartedAt === undefined || invocation.status !== "executing") {
+      return { kind: "conflict", code: "invocation_execution_conflict" };
+    }
+
+    const ordinal = ++this.publicArtifactSequence;
+    const alias = `public-artifact-${ordinal}`;
+    const physicalArtifactId = `staged-public-physical-${ordinal}`;
+    if (this.stagedPublicArtifacts.has(alias) || this.artifacts.has(physicalArtifactId)) {
+      return { kind: "conflict", code: "public_artifact_provenance_conflict" };
+    }
+    const createdAt = this.clock().toISOString();
+    const manifest: StagedPublicArtifactManifest = {
+      artifactId: alias, visibility: "public", contentHash: input.contentHash, mediaType: "text/plain",
+      byteLength: input.content.byteLength, createdAt, projectionKind: "tool_result",
+    };
+    const physicalArtifact: Artifact = {
+      artifactId: physicalArtifactId, contentHash: input.contentHash, mediaType: "text/plain",
+      byteLength: input.content.byteLength, visibility: "private", createdAt, content: new Uint8Array(input.content),
+    };
+    const provenance: StagedPublicArtifactProvenance = {
+      manifest, physicalArtifactId, runId: input.runId, sessionId: input.sessionId,
+      originAttemptId: input.attemptId, originInvocationId: input.invocationId, reservationId: input.reservationId,
+    };
+    // Validation completed before the synchronous critical section. These paired
+    // writes model SQLite's BEGIN IMMEDIATE provenance transaction.
+    this.artifacts.set(physicalArtifactId, physicalArtifact);
+    this.stagedPublicArtifacts.set(alias, provenance);
+    this.stagedPublicArtifactAliasByOrigin.set(originKey, alias);
+    this.stagedPublicArtifactAliasByPhysicalId.set(physicalArtifactId, alias);
+    return { kind: "staged", manifest: deepCopy(manifest) };
+  }
+
+  async resolveStagedPublicArtifact(
+    input: ResolveStagedPublicArtifactInput,
+  ): Promise<ResolveStagedPublicArtifactResult> {
+    const provenance = this.stagedPublicArtifacts.get(input.artifactId);
+    if (!provenance || provenance.runId !== input.runId || provenance.sessionId !== input.sessionId
+      || !this.isValidStagedPublicArtifact(provenance)) return { kind: "not_found" };
+    return { kind: "found", manifest: deepCopy(provenance.manifest) };
+  }
+
   async putArtifact(input: PutArtifactInput): Promise<ArtifactRef> {
     assertPersistableJson(input.metadata ?? null, "artifact.metadata");
     if (hashBytes(input.content) !== input.contentHash) throw new Error("artifact_content_hash_conflict");
@@ -1092,6 +1189,34 @@ export class MemorySessionStore implements SessionStorePort {
   private attemptForRun(runId: string, attemptId: string): PersistedRunAttempt | null {
     const attempt = this.attempts.get(attemptKey(runId, attemptId));
     return attempt?.runId === runId ? attempt : null;
+  }
+
+  private isValidStagedPublicArtifact(provenance: StagedPublicArtifactProvenance): boolean {
+    const run = this.runs.get(provenance.runId);
+    const attempt = this.attemptForRun(provenance.runId, provenance.originAttemptId);
+    const reservation = this.reservations.get(provenance.reservationId);
+    const invocation = this.invocations.get(invocationKey(
+      provenance.runId,
+      provenance.originAttemptId,
+      provenance.originInvocationId,
+    ));
+    const artifact = this.artifacts.get(provenance.physicalArtifactId);
+    return !!run && !!attempt && run.sessionId === provenance.sessionId && attempt.sessionId === provenance.sessionId
+      && !!reservation && reservation.runId === provenance.runId && reservation.attemptId === provenance.originAttemptId
+      && reservation.invocationId === provenance.originInvocationId && !!invocation
+      && invocation.runId === provenance.runId && invocation.attemptId === provenance.originAttemptId
+      && invocation.invocationId === provenance.originInvocationId
+      && this.stagedPublicArtifactAliasByOrigin.get(stagedPublicArtifactOriginKey(
+        provenance.runId, provenance.originAttemptId, provenance.originInvocationId,
+      )) === provenance.manifest.artifactId
+      && this.stagedPublicArtifacts.get(provenance.manifest.artifactId) === provenance
+      && this.stagedPublicArtifactAliasByPhysicalId.get(provenance.physicalArtifactId) === provenance.manifest.artifactId
+      && !!artifact && artifact.visibility === "private" && artifact.mediaType === "text/plain"
+      && artifact.createdAt === provenance.manifest.createdAt && artifact.contentHash === provenance.manifest.contentHash
+      && artifact.content.byteLength === artifact.byteLength && artifact.byteLength === provenance.manifest.byteLength
+      && hashBytes(artifact.content) === artifact.contentHash
+      && provenance.manifest.visibility === "public" && provenance.manifest.projectionKind === "tool_result"
+      && provenance.manifest.mediaType === artifact.mediaType;
   }
 
   private receiptMatchesInvocation(receipt: ToolReceipt, invocation: NormalizedToolInvocation): boolean {
