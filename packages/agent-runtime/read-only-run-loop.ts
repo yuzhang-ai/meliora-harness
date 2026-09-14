@@ -5,9 +5,14 @@ import type {
   JsonValue,
 } from "../model-protocol/contracts";
 import type {
+  ArtifactRef,
   NewEvent,
+  PrivateRunSnapshotState,
+  RunSnapshot,
   SessionStorePort,
 } from "../session-store/contracts";
+import { PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../session-store/contracts";
+import { canonicalJson, hashBytes } from "../session-store/integrity";
 import type {
   NormalizedToolInvocation,
   ToolCatalogSnapshot,
@@ -119,11 +124,7 @@ export type ReadOnlyRunLoopDependencies = Readonly<{
     invocation: NormalizedToolInvocation;
     execution: ReadOnlyToolExecution;
   }>): ReadOnlyToolProjection | Promise<ReadOnlyToolProjection>;
-  /**
-   * Server-owned public projection for assistant text before any private tool
-   * observation has entered the current model-call context. Once a private tool
-   * observation is present, the loop publishes only a fixed redaction notice.
-   */
+  /** Reserved for a future strict Server-owned summary decoder; M0 never calls it for Provider text. */
   projectAssistantText(input: Readonly<{ content: string }>): string | Promise<string>;
   isPublicArtifact(artifactId: string): Promise<boolean>;
   ownerId: string;
@@ -179,6 +180,7 @@ const MODEL_STEP_OUTCOME_UNKNOWN_SUMMARY = "模型步骤结果未知，已停止
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
 const DETERMINISTIC_PROVIDER_FAILURE_CODES = new Set(["provider_authentication_failed", "provider_rate_limited"]);
 const PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION = "模型已基于私有工具结果生成回复，内容已隐藏。";
+const PROVIDER_ASSISTANT_TEXT_REDACTION = "模型响应已私有持久化，公开摘要尚未启用。";
 const defaultSummary = (definition: ToolDefinition): string => `正在执行只读工具 ${definition.name}。`;
 const isLeaseLostError = (error: unknown): boolean => error instanceof Error && error.message === "run_lease_lost";
 const isAmbiguousProviderFailure = (event: Extract<CanonicalModelEvent, { kind: "model_step_failed" }>): boolean =>
@@ -205,6 +207,7 @@ export class ReadOnlyRunLoop {
     let leaseToken = "";
     const receipts: ToolReceipt[] = [];
     const verificationIds: string[] = [];
+    const verificationEvidenceArtifactIds: string[] = [];
     const publicEvidenceIds: string[] = [];
     let hasPrivateToolResultObservation = false;
     const messages: CanonicalInputMessage[] = [{ role: "user", content: input.userMessage }];
@@ -219,14 +222,20 @@ export class ReadOnlyRunLoop {
 
     const renewLeaseOrThrow = async (): Promise<void> => {
       if (leaseLost || leaseToken.length === 0) throw new Error("run_lease_lost");
-      const renewed = await this.dependencies.store.renewLease({
-        runId: input.runId,
-        attemptId: input.attemptId,
-        leaseToken,
-        ttlMs: this.dependencies.leaseTtlMs,
-        renewedAt: this.dependencies.now(),
-      });
-      if (!renewed) {
+      try {
+        const renewed = await this.dependencies.store.renewLease({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          ttlMs: this.dependencies.leaseTtlMs,
+          renewedAt: this.dependencies.now(),
+        });
+        if (renewed) return;
+      } catch {
+        // A renewal transport/adapter error is indistinguishable from a lost
+        // lease. Never leak its details or continue a side-effecting path.
+      }
+      {
         leaseLost = true;
         throw new Error("run_lease_lost");
       }
@@ -322,12 +331,12 @@ export class ReadOnlyRunLoop {
       if (status !== "verifying" && status !== "model_streaming" && status !== "tool_assembling" && status !== "executing_tools" && status !== "preparing") {
         throw new Error(`invalid_terminal_source_${status}`);
       }
-      const deferModelStepOutcomeUnknownTerminalProjection =
+      const deferOutcomeUnknownTerminalProjection =
         terminalStatus === "blocked"
-        && code === MODEL_STEP_OUTCOME_UNKNOWN_CODE
+        && (code === MODEL_STEP_OUTCOME_UNKNOWN_CODE || code === "tool_invocation_outcome_unknown")
         && this.dependencies.deferModelStepOutcomeUnknownTerminalEvent === true;
       if (terminalStatus === "completed" && status !== "verifying") await changeStatus("verifying");
-      if (deferModelStepOutcomeUnknownTerminalProjection) {
+      if (deferOutcomeUnknownTerminalProjection) {
         // Server composition writes the terminal projection and its durable
         // Command state through one Store operation. Publishing a terminal
         // status here would make SSE close before that operation is visible.
@@ -367,7 +376,7 @@ export class ReadOnlyRunLoop {
         }
         await publish("run_completed", { outcomeId: outcome.outcomeId, summary });
       } else if (terminalStatus === "blocked") {
-        if (!deferModelStepOutcomeUnknownTerminalProjection) {
+        if (!deferOutcomeUnknownTerminalProjection) {
           await publish("run_blocked", { code: code ?? "run_blocked", message: summary, userActions: [...userActions] });
         }
       } else if (terminalStatus === "failed") {
@@ -385,6 +394,39 @@ export class ReadOnlyRunLoop {
         false,
         MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
       );
+    const terminalToolInvocationOutcomeUnknown = (): Promise<ReadOnlyRunLoopResult> =>
+      terminal(
+        "blocked",
+        "工具执行结果未知，已停止自动重放。",
+        "tool_invocation_outcome_unknown",
+        false,
+        ["先通过 Host readback 或恢复协调器确认工具结果。"],
+      );
+
+    const readArtifactRefs = async (artifactIds: readonly string[]): Promise<ArtifactRef[]> => {
+      const refs: ArtifactRef[] = [];
+      for (const artifactId of [...new Set(artifactIds)]) {
+        const artifact = await this.dependencies.store.getArtifact(artifactId);
+        if (!artifact
+          || artifact.artifactId !== artifactId
+          || artifact.byteLength !== artifact.content.byteLength
+          || artifact.contentHash !== hashBytes(artifact.content)
+          || artifact.mediaType.length === 0
+          || (artifact.visibility !== "private" && artifact.visibility !== "public")) {
+          throw new Error("verification_artifact_integrity_conflict");
+        }
+        refs.push({
+          artifactId: artifact.artifactId,
+          contentHash: artifact.contentHash,
+          mediaType: artifact.mediaType,
+          byteLength: artifact.byteLength,
+          visibility: artifact.visibility,
+        });
+      }
+      return refs;
+    };
+    const readVerificationEvidenceRefs = (): Promise<ArtifactRef[]> =>
+      readArtifactRefs(verificationEvidenceArtifactIds);
 
     const startedCheckpointRemains = async (
       modelStepId: string,
@@ -469,13 +511,15 @@ export class ReadOnlyRunLoop {
         }
         return terminal("failed", "模型调用失败。", "provider_request_failed", true);
       }
-      if (requestFingerprint) {
-        const failedEvent = modelEvents.find((event): event is Extract<CanonicalModelEvent, { kind: "model_step_failed" }> =>
-          event.kind === "model_step_failed",
-        );
-        if (failedEvent && isAmbiguousProviderFailure(failedEvent)) {
+      const failedEvent = modelEvents.find((event): event is Extract<CanonicalModelEvent, { kind: "model_step_failed" }> =>
+        event.kind === "model_step_failed",
+      );
+      if (failedEvent && isAmbiguousProviderFailure(failedEvent)) {
           return terminalModelStepOutcomeUnknown();
-        }
+      }
+      // A deterministic Provider rejection has no result artifact to bind. It
+      // remains the one legacy terminal path allowed by B1b.
+      if (requestFingerprint && failedEvent) {
         let finished: Awaited<ReturnType<ReadOnlyModelStepCheckpointGate["finish"]>>;
         try {
           finished = await this.dependencies.modelStepCheckpoint.finish({
@@ -484,9 +528,7 @@ export class ReadOnlyRunLoop {
             leaseToken,
             modelStepId,
             requestFingerprint,
-            outcome: failedEvent
-              ? { status: "failed", failureCode: failedEvent.code, finishedAt: this.dependencies.now() }
-              : { status: "terminal", finishedAt: this.dependencies.now() },
+            outcome: { status: "failed", failureCode: failedEvent.code, finishedAt: this.dependencies.now() },
           });
         } catch (error) {
           if (isLeaseLostError(error)) throw error;
@@ -527,25 +569,91 @@ export class ReadOnlyRunLoop {
           finishReason = event.finishReason;
         }
       }
+      // No public assistant/tool presentation and no Host access may happen
+      // before this full Provider result has one durable private identity.
+      // The terminal artifact deliberately is the canonical model-visible
+      // history artifact too, so both Snapshot refs name the same atomically
+      // written private bytes.
+      const historyAssistant: CanonicalInputMessage = {
+        role: "assistant",
+        content: assistantContent,
+        ...(completedCalls.length === 0 ? {} : {
+          toolCalls: completedCalls.map((call) => ({
+            invocationId: call.invocationId,
+            toolName: call.toolName,
+            rawArguments: call.rawArguments,
+            ...(call.providerToolCallId === undefined ? {} : { providerToolCallId: call.providerToolCallId }),
+          })),
+        }),
+      };
+      const modelHistoryBytes = new TextEncoder().encode(canonicalJson({
+        schemaVersion: "meliora.canonical-model-history.v1",
+        messages: [...messages, historyAssistant] as unknown as JsonValue,
+      }));
+      const terminalArtifact = {
+        artifactId: `model-result-${modelStepId}`,
+        contentHash: hashBytes(modelHistoryBytes),
+        mediaType: PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE,
+        byteLength: modelHistoryBytes.byteLength,
+        visibility: "private" as const,
+      };
+      try {
+        await renewLeaseOrThrow();
+        // Receipt IDs alone cannot reconstruct verification state. Re-read
+        // every durable verification artifact just before committing this
+        // step's immutable snapshot, so a missing/replaced artifact fails
+        // closed instead of becoming a plausible recovery record.
+        const verificationRefs = await readVerificationEvidenceRefs();
+        const snapshotState: PrivateRunSnapshotState = {
+          schemaVersion: "meliora.private-run-snapshot-state.v1",
+          phase: completedCalls.length > 0 ? "tool_assembling" : "verifying",
+          catalogHash: input.catalog.catalogHash,
+          intentRevision: input.intentRevision,
+          modelHistoryArtifact: terminalArtifact,
+          terminalModelStepResult: {
+            attemptId: input.attemptId,
+            modelStepId,
+            requestFingerprint: requestFingerprint!,
+            artifact: terminalArtifact,
+          },
+          pendingInvocations: [],
+          receiptRefs: receipts.map((receipt) => receipt.receiptId),
+          verificationRefs,
+        };
+        const terminalSnapshot: RunSnapshot = {
+          schemaVersion: "meliora.run-snapshot.v1",
+          snapshotId: `snapshot-${modelStepId}`,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          throughSequence: sequence,
+          state: snapshotState,
+          createdAt: this.dependencies.now(),
+        };
+        const committed = await this.dependencies.store.commitTerminalModelStepResultAndSnapshot({
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseToken,
+          modelStepId,
+          requestFingerprint: requestFingerprint!,
+          finishedAt: this.dependencies.now(),
+          normalizedResult: { ...terminalArtifact, content: modelHistoryBytes },
+          snapshot: terminalSnapshot,
+          expectedSequence: sequence,
+        });
+        if (committed.kind === "conflict") return terminalModelStepOutcomeUnknown();
+      } catch (error) {
+        if (isLeaseLostError(error)) throw error;
+        return terminalModelStepOutcomeUnknown();
+      }
       if (assistantDeltas.length > 0) {
-        let publicAssistantContent: string;
-        if (hasPrivateToolResultObservation) {
-          publicAssistantContent = PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION;
-        } else {
-          try {
-            publicAssistantContent = await withLeaseHeartbeat(() => Promise.resolve(
-              this.dependencies.projectAssistantText({ content: assistantContent }),
-            ));
-          } catch (error) {
-            if (isLeaseLostError(error)) throw error;
-            publicAssistantContent = "模型输出包含无法安全公开的内容，已隐藏。";
-          }
-        }
-        if (publicAssistantContent === assistantContent) {
-          for (const delta of assistantDeltas) await publish("assistant_text_delta", { delta });
-        } else if (publicAssistantContent.length > 0) {
-          await publish("assistant_text_delta", { delta: publicAssistantContent });
-        }
+        // M0 has neither a strict assistant-output decoder nor a Server-owned
+        // summary. Provider text can echo private user input before the first
+        // tool, so no Provider-originated byte may cross into Public SSE.
+        await publish("assistant_text_delta", {
+          delta: hasPrivateToolResultObservation
+            ? PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION
+            : PROVIDER_ASSISTANT_TEXT_REDACTION,
+        });
       }
       if (assistantContent.length > 0 || completedCalls.length > 0) {
         messages.push({
@@ -637,13 +745,39 @@ export class ReadOnlyRunLoop {
         }
         let execution: ReadOnlyToolExecution;
         const startedAt = this.dependencies.now();
-        if (reservation.kind === "replay" && reservation.receipt) {
+        let replayReceipt = reservation.kind === "replay" ? reservation.receipt : null;
+        if (!replayReceipt) {
+          try {
+            const executionGate = await this.dependencies.store.beginInvocationExecution({
+              runId: input.runId,
+              attemptId: input.attemptId,
+              leaseToken,
+              reservationId: reservation.reservationId,
+            });
+            if (executionGate.kind === "receipt_replay") {
+              // Never synthesize a receipt from the current execution path:
+              // only the persisted receipt named by Store may be reused.
+              replayReceipt = await this.dependencies.store.readReceipt({
+                runId: input.runId,
+                attemptId: input.attemptId,
+                receiptId: executionGate.receiptId,
+              });
+              if (!replayReceipt) return terminalToolInvocationOutcomeUnknown();
+            } else if (executionGate.kind === "already_executing_or_unknown" || executionGate.kind === "conflict") {
+              return terminalToolInvocationOutcomeUnknown();
+            }
+          } catch (error) {
+            if (isLeaseLostError(error)) throw error;
+            return terminalToolInvocationOutcomeUnknown();
+          }
+        }
+        if (replayReceipt) {
           execution = {
-            status: reservation.receipt.status,
-            effectSummary: reservation.receipt.effectSummary,
-            outputArtifactId: reservation.receipt.outputArtifactId,
-            verification: reservation.receipt.verificationArtifactIds.length > 0
-              ? { verificationId: `verification:${reservation.receipt.receiptId}`, status: "passed", evidenceArtifactIds: reservation.receipt.verificationArtifactIds }
+            status: replayReceipt.status,
+            effectSummary: replayReceipt.effectSummary,
+            outputArtifactId: replayReceipt.outputArtifactId,
+            verification: replayReceipt.verificationArtifactIds.length > 0
+              ? { verificationId: `verification:${replayReceipt.receiptId}`, status: "passed", evidenceArtifactIds: replayReceipt.verificationArtifactIds }
               : undefined,
           };
         } else {
@@ -651,10 +785,14 @@ export class ReadOnlyRunLoop {
             execution = await withLeaseHeartbeat(() => this.dependencies.tools.execute(invocation, signal));
           } catch (error) {
             if (isLeaseLostError(error)) throw error;
-            execution = { status: signal.aborted ? "cancelled" : "failed", effectSummary: "只读工具执行失败。" };
+            // A throw/abort cannot prove that Host never caused an effect. The
+            // reservation stays executing and no failed/cancelled Receipt is
+            // invented, so a later Run must reconcile rather than re-execute.
+            return terminalToolInvocationOutcomeUnknown();
           }
         }
-        if (signal.aborted || execution.status === "cancelled") return terminal("cancelled", "用户取消了当前任务。", "user_requested");
+        // An explicitly returned failed/cancelled result is evidence and may
+        // be receipted. A thrown or unconfirmed abort was handled above.
         let projection: ReadOnlyToolProjection;
         try {
           projection = await withLeaseHeartbeat(() => Promise.resolve(
@@ -676,8 +814,16 @@ export class ReadOnlyRunLoop {
         ])]) {
           if (await withLeaseHeartbeat(() => this.dependencies.isPublicArtifact(artifactId))) publicArtifactIds.push(artifactId);
         }
-        if (signal.aborted) return terminal("cancelled", "用户取消了当前任务。", "user_requested");
         const publicVerificationArtifactIds = projection.publicVerificationArtifactIds.filter((id) => publicArtifactIds.includes(id));
+        if (execution.verification?.status === "passed") {
+          try {
+            await readArtifactRefs(execution.verification.evidenceArtifactIds);
+            verificationEvidenceArtifactIds.push(...execution.verification.evidenceArtifactIds);
+          } catch (error) {
+            if (isLeaseLostError(error)) throw error;
+            return terminalToolInvocationOutcomeUnknown();
+          }
+        }
         const newReceipt: ToolReceipt = {
           schemaVersion: "meliora.tool-receipt.v1",
           receiptId: this.dependencies.ids.nextReceiptId(),
@@ -697,14 +843,20 @@ export class ReadOnlyRunLoop {
           verificationArtifactIds: publicVerificationArtifactIds,
           redactions: [],
         };
-        const committed = reservation.kind === "replay" && reservation.receipt
-          ? { kind: "replay" as const, receiptId: reservation.receipt.receiptId }
-          : await (async () => {
-              await renewLeaseOrThrow();
-              return this.dependencies.store.commitReceipt({ runId: input.runId, attemptId: input.attemptId, leaseToken, reservationId: reservation.reservationId, receipt: newReceipt });
-            })();
-        if (committed.kind === "conflict") return terminal("failed", "无法提交工具回执。", committed.code, true);
-        receipts.push(reservation.kind === "replay" && reservation.receipt ? reservation.receipt : newReceipt);
+        let committed: Readonly<{ kind: "committed" | "replay"; receiptId: string }> | Readonly<{ kind: "conflict"; code: string }>;
+        try {
+          committed = replayReceipt
+            ? { kind: "replay" as const, receiptId: replayReceipt.receiptId }
+            : await (async () => {
+                await renewLeaseOrThrow();
+                return this.dependencies.store.commitReceipt({ runId: input.runId, attemptId: input.attemptId, leaseToken, reservationId: reservation.reservationId, receipt: newReceipt });
+              })();
+        } catch (error) {
+          if (isLeaseLostError(error)) throw error;
+          return terminalToolInvocationOutcomeUnknown();
+        }
+        if (committed.kind === "conflict") return terminalToolInvocationOutcomeUnknown();
+        receipts.push(replayReceipt ?? newReceipt);
         publicEvidenceIds.push(...publicVerificationArtifactIds);
         await publish("tool_result_presented", {
           invocationId: invocation.invocationId,
@@ -716,6 +868,7 @@ export class ReadOnlyRunLoop {
           hasPrivateToolResultObservation = true;
         }
         if (execution.status === "failed") return terminal("failed", projection.publicSummary, "tool_execution_failed", true);
+        if (execution.status === "cancelled") return terminal("cancelled", "用户取消了当前任务。", "user_requested");
         if (!execution.verification || execution.verification.status !== "passed") {
           return terminal("blocked", "只读工具完成，但验证尚未通过。", "verification_missing", false, ["请执行或补充验证。"]);
         }

@@ -518,6 +518,7 @@ export class SqliteSessionStore implements SessionStorePort {
     this.validateModelStepIdentity(input);
     assertValidCommandTimestamp(input.outcome.finishedAt);
     if (input.outcome.status === "failed") assertValidSafeCode(input.outcome.failureCode);
+    if (input.outcome.status === "terminal") return { kind: "conflict", code: "terminal_model_step_commit_required" };
     return this.db.transaction((): FinishModelStepResult => {
       if (!this.isActiveAttempt(input.runId, input.attemptId)) {
         return { kind: "conflict", code: "run_attempt_conflict" };
@@ -672,6 +673,7 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {
     const snapshot = input.snapshot; assertValidRunSnapshot(snapshot);
+    if (snapshot.state.terminalModelStepResult !== undefined) throw new IdempotencyConflictError("terminal_model_step_commit_required");
     if (!Number.isInteger(snapshot.throughSequence) || snapshot.throughSequence < 0) throw new SequenceConflictError(snapshot.runId, input.expectedSequence, -1);
     this.db.transaction(() => {
       const attempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?").get(snapshot.runId, snapshot.attemptId) as Row | undefined;
@@ -878,15 +880,20 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async commitReceipt(input: CommitReceiptInput): Promise<CommitReceiptResult> {
     return this.db.transaction((): CommitReceiptResult => {
-      if (!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
-      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
-      if (lease) return { kind: "conflict", code: lease };
       const row = this.db.prepare("SELECT * FROM invocations WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
-      if (!row || row.run_id !== input.runId || row.attempt_id !== input.attemptId || row.invocation_id !== input.receipt.invocationId) return { kind: "conflict", code: "invocation_reservation_conflict" };
+      if (!row || row.run_id !== input.runId || row.attempt_id !== input.attemptId || row.invocation_id !== input.receipt.invocationId) {
+        return this.isActiveAttempt(input.runId, input.attemptId)
+          ? { kind: "conflict", code: "invocation_reservation_conflict" }
+          : { kind: "conflict", code: "run_attempt_conflict" };
+      }
       const invocation = this.toInvocation(row);
       if (!this.receiptMatches(input.receipt, invocation)) return { kind: "conflict", code: "receipt_conflict" };
       const prior = this.db.prepare("SELECT * FROM receipts WHERE reservation_id=?").get(input.reservationId) as Row | undefined;
       if (prior) return sameJson(JSON.parse(prior.receipt_json), input.receipt) ? { kind: "replay", receiptId: prior.receipt_id } : { kind: "conflict", code: "receipt_conflict" };
+      if (!this.isActiveAttempt(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
+      const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
+      if (lease) return { kind: "conflict", code: lease };
+      if (row.status !== "executing" || row.execution_started_at === null) return { kind: "conflict", code: "invocation_execution_conflict" };
       const reusedReceiptId = this.db
         .prepare("SELECT reservation_id FROM receipts WHERE run_id=? AND attempt_id=? AND receipt_id=?")
         .get(input.runId, input.attemptId, input.receipt.receiptId) as Row | undefined;

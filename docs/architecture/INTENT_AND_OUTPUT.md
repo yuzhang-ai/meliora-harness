@@ -97,6 +97,8 @@ visibility=public
 
 禁止进入公开事件：API Key、Authorization、完整环境变量、私有 reasoning、未脱敏原始日志、隐藏系统提示、超范围文件内容。
 
+M0 尚未冻结独立的 Server-owned assistant summary 或严格 decoder。因此任何 Provider assistant 原文（包括首次 Model Step、用户输入的逐字/片段/编码回显）都只能写入 private model events 与 private model-history artifact，绝不可直接成为 `assistant_text_delta` 的公开 payload。Runtime 可以发不含原文的固定安全提示；工具调用展示、Server-owned 工具结果投影和最终 Run outcome 按各自契约继续公开。未来若要公开助手内容，必须先在本层冻结来源独立、可审计的 summary/decoder 契约，不能复用 Provider raw text。
+
 ## 6. 结果投影
 
 同一底层结果有三个不同视图：

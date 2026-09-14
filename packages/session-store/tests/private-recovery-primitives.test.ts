@@ -196,6 +196,18 @@ withStores("dormant invocation execution CAS grants exactly one future permit", 
   assert.equal((await store.reserveInvocation({ invocation: { ...invocation, invocationId: "illegal", status: "executing" }, leaseToken, reservedAt: timestamp(4) })).kind, "conflict");
 });
 
+withStores("B1b receipt writes require an executing Store-owned permit", async (store) => {
+  const leaseToken = await ready(store);
+  const invocation = { schemaVersion: "meliora.tool-invocation.v1" as const, invocationId: "receipt-invocation", runId: "run", attemptId: "attempt", toolName: "read_file", toolVersion: "v1", arguments: {}, argumentsHash: hashBytes("receipt-arguments"), catalogHash: "catalog", idempotencyKey: "receipt-key", status: "reserved" as const };
+  const reserved = await store.reserveInvocation({ invocation, leaseToken, reservedAt: timestamp(4) });
+  assert.equal(reserved.kind, "owner"); if (reserved.kind !== "owner") throw new Error("reservation");
+  const receipt = { schemaVersion: "meliora.tool-receipt.v1" as const, receiptId: "receipt-executing", invocationId: invocation.invocationId, runId: "run", attemptId: "attempt", toolName: "read_file", toolVersion: "v1", argumentsHash: invocation.argumentsHash, catalogHash: "catalog", decision: "allow" as const, startedAt: timestamp(5), endedAt: timestamp(6), status: "succeeded" as const, effectSummary: "safe read complete", verificationArtifactIds: [], redactions: [] };
+  assert.deepEqual(await store.commitReceipt({ runId: "run", attemptId: "attempt", leaseToken, reservationId: reserved.reservationId, receipt }), { kind: "conflict", code: "invocation_execution_conflict" });
+  assert.equal((await store.beginInvocationExecution({ runId: "run", attemptId: "attempt", leaseToken, reservationId: reserved.reservationId })).kind, "started");
+  assert.equal((await store.commitReceipt({ runId: "run", attemptId: "attempt", leaseToken, reservationId: reserved.reservationId, receipt })).kind, "committed");
+  assert.equal((await store.commitReceipt({ runId: "run", attemptId: "attempt", leaseToken: "stale-lease", reservationId: reserved.reservationId, receipt })).kind, "replay", "an exact receipt remains a replay proof after its lease ends");
+});
+
 withStores("terminal result bytes follow the private artifact sensitive-data boundary", async (store) => {
   const leaseToken = await ready(store); const secret = new TextEncoder().encode("Bearer opaque-terminal-result-secret");
   const snapshot = { schemaVersion: "meliora.run-snapshot.v1" as const, snapshotId: "snapshot-secret", runId: "run", attemptId: "attempt", throughSequence: 0, state: state("attempt", "result-secret"), createdAt: timestamp(4) };

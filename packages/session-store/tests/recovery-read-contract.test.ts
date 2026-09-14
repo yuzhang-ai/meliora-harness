@@ -253,7 +253,7 @@ const withStore = (name: string, build: (now: () => number, t: TestContext) => S
       assert.equal(started.kind, "started");
       await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-started", throughSequence: 2, state: terminalState() }, expectedSequence: 3, leaseToken: lease.leaseToken }));
       const finished = await store.finishModelStep({ runId: first.runId, attemptId: first.attemptId, leaseToken: lease.leaseToken, modelStepId: "model-step-1", requestFingerprint: fingerprint, outcome: { status: "terminal", finishedAt: timestamp(5_000) } });
-      assert.equal(finished.kind, "committed");
+      assert.deepEqual(finished, { kind: "conflict", code: "terminal_model_step_commit_required" });
       await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-wrong-fingerprint", throughSequence: 2, state: { ...terminalState(), terminalModelStepResult: { ...terminalState().terminalModelStepResult!, requestFingerprint: "c".repeat(64) } } }, expectedSequence: 3, leaseToken: lease.leaseToken }));
       await assert.rejects(store.writeSnapshot({ snapshot: { ...snapshot, snapshotId: "terminal-wrong-attempt", throughSequence: 2, state: { ...terminalState(), terminalModelStepResult: { ...terminalState().terminalModelStepResult!, attemptId: "attempt-wrong" } } }, expectedSequence: 3, leaseToken: lease.leaseToken }));
 
@@ -295,9 +295,11 @@ test("SQLite rejects a structurally tampered private snapshot even with a matchi
     if (lease.kind !== "acquired") throw new Error("lease expected");
     const db = (store as unknown as { db: { prepare(sql: string): { run(...values: unknown[]): void } } }).db;
     const fingerprint = hashBytes("tamper-step");
-    db.prepare("INSERT INTO model_steps (model_step_id,run_id,attempt_id,request_fingerprint,status,failure_code,started_at,finished_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run("tamper-step", input.runId, input.attemptId, fingerprint, "terminal", null, timestamp(), timestamp(), timestamp());
     const terminalState = { ...snapshotState(), terminalModelStepResult: { attemptId: input.attemptId, modelStepId: "tamper-step", requestFingerprint: fingerprint, artifact: { artifactId: "result-1", contentHash: "e".repeat(64), mediaType: "application/json", byteLength: 1, visibility: "private" as const } } };
-    await store.writeSnapshot({ snapshot: { schemaVersion: "meliora.run-snapshot.v1", snapshotId: "snapshot-tamper", runId: input.runId, attemptId: input.attemptId, throughSequence: 0, state: terminalState, createdAt: timestamp() }, expectedSequence: 0, leaseToken: lease.leaseToken });
+    // B1b rejects direct terminal snapshots.  Seed a valid non-terminal legacy
+    // snapshot, then corrupt it into an orphan terminal binding through the raw
+    // SQLite seam to exercise recovery's fail-closed read boundary.
+    await store.writeSnapshot({ snapshot: { schemaVersion: "meliora.run-snapshot.v1", snapshotId: "snapshot-tamper", runId: input.runId, attemptId: input.attemptId, throughSequence: 0, state: snapshotState(), createdAt: timestamp() }, expectedSequence: 0, leaseToken: lease.leaseToken });
     const driftedTerminalJson = JSON.stringify({ ...terminalState, terminalModelStepResult: { ...terminalState.terminalModelStepResult, requestFingerprint: "f".repeat(64) } });
     db.prepare("UPDATE run_snapshots SET state_json=?,state_hash=? WHERE run_id=?").run(driftedTerminalJson, hashBytes(driftedTerminalJson), input.runId);
     await assert.rejects(store.readRecoveryBundle({ runId: input.runId, eventLimit: 1 }), /snapshot_integrity_conflict/u);

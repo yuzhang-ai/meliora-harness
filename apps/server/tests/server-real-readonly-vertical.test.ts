@@ -125,6 +125,19 @@ const readJson = async (request: IncomingMessage): Promise<Readonly<Record<strin
 const frame = (chunk: Readonly<Record<string, unknown>>): string =>
   `data: ${JSON.stringify(chunk)}\n\n`;
 
+/**
+ * Wait for a real asynchronous observation, not a timing guess. `setImmediate`
+ * yields to the fixture provider's request-body reader without adding a fixed
+ * sleep; the deadline makes a lost observation fail deterministically.
+ */
+const waitFor = async (description: string, condition: () => boolean, timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed_out_waiting_for_${description}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+};
+
 const toolContentFromBody = (body: Readonly<Record<string, unknown>>): string => {
   const messages = body.messages;
   if (!Array.isArray(messages)) return "";
@@ -152,7 +165,24 @@ const echoScenarios: readonly EchoScenario[] = [
   { name: "percent-encoded-tool-result", assistantText: ({ toolContent }) => encodeURIComponent(toolContent) },
 ];
 
-const startFakeProvider = async (echoAssistantText: EchoScenario["assistantText"], sourceContent: string) => {
+type PreToolEchoScenario = Readonly<{
+  name: string;
+  echo(input: string): string;
+}>;
+
+const preToolEchoScenarios: readonly PreToolEchoScenario[] = [
+  { name: "exact-user-echo", echo: (input) => input },
+  { name: "substring-marker", echo: (input) => `收到：${input.match(/M0_PRE_TOOL_PRIVATE_USER_MARKER/u)?.[0] ?? input}` },
+  { name: "newline-marker", echo: (input) => `${input.slice(0, 13)}\n${input.slice(13)}` },
+  { name: "percent-encoded-user-echo", echo: (input) => encodeURIComponent(input) },
+  { name: "base64-user-echo", echo: (input) => Buffer.from(input, "utf8").toString("base64") },
+];
+
+const startFakeProvider = async (
+  echoAssistantText: EchoScenario["assistantText"],
+  sourceContent: string,
+  initialAssistantText = "我先读取入口文件。",
+) => {
   const captured: CapturedProviderRequest[] = [];
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     void (async () => {
@@ -161,7 +191,14 @@ const startFakeProvider = async (echoAssistantText: EchoScenario["assistantText"
       captured.push({ authorization: request.headers.authorization, body });
       response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
       if (captured.length === 1) {
-        for (const chunk of deepseekStreamTextSingleToolFixture.rawChunks) response.write(frame(chunk));
+        response.write(frame({
+          id: "ds-response-001",
+          object: "chat.completion.chunk",
+          created: 1788998400,
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: { role: "assistant", content: initialAssistantText } }],
+        }));
+        for (const chunk of deepseekStreamTextSingleToolFixture.rawChunks.slice(1)) response.write(frame(chunk));
       } else {
         const echoedToolContent = toolContentFromBody(body);
         const assistantText = echoAssistantText({ toolContent: echoedToolContent, sourceContent });
@@ -387,6 +424,82 @@ const postTurn = async (url: string, message: string, idempotencyKey = "provider
     }),
   });
 
+for (const preToolScenario of preToolEchoScenarios) {
+test(`Server keeps pre-tool ${preToolScenario.name} private while preserving Provider context`, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "meliora-server-pre-tool-echo-"));
+  const workspaceRoot = join(parent, "workspace");
+  const databasePath = join(parent, "meliora.sqlite");
+  const userInput = `M0_PRE_TOOL_PRIVATE_USER_MARKER-${preToolScenario.name}`;
+  const echoedInput = preToolScenario.echo(userInput);
+  const sourcePath = join(workspaceRoot, "packages", "agent-runtime", "run-state.ts");
+  const sourceContent = "export const readOnlyFixture = true;\n";
+  const provider = await startFakeProvider(() => "post-tool raw provider text", sourceContent, echoedInput);
+  const store = new SqliteSessionStore(databasePath, { clock: () => new Date(fixedNow) });
+  try {
+    await mkdir(join(workspaceRoot, "packages", "agent-runtime"), { recursive: true });
+    await initializeGitWorkspace(workspaceRoot);
+    await writeFile(sourcePath, sourceContent, "utf8");
+    const catalog = createFrozenReadOnlyWorkspaceCatalog();
+    const transport = createDeepSeekChatTransport({
+      endpoint: `${provider.origin}/deepseek/chat/completions`,
+      model: "deepseek-chat",
+      apiKey: "pre-tool-private-fixture-token",
+      trustedEndpointOrigins: [provider.origin],
+    });
+    const model = createProviderBackedReadOnlyRunModel({ provider: "deepseek", transport, catalog, now: () => fixedNow });
+    const submitTurnCommand = createTurnCommandSubmitter({
+      store,
+      workspaceRoots: new Map([[workspaceId, workspaceRoot]]),
+      model,
+      ids: deterministicIds(),
+      now: () => fixedNow,
+    });
+    const app = await startApp(store, submitTurnCommand);
+    try {
+      const create = await postTurn(app.url, userInput, `pre-tool-echo-${preToolScenario.name}`);
+      assert.equal(create.status, 202);
+      const created = await create.json() as TurnCommandResponse;
+      const eventsResponse = await fetch(`${app.url}/api/runs/${created.runId}/events`);
+      assert.equal(eventsResponse.status, 200);
+      const events = sseEvents(await eventsResponse.text());
+      assert.ok(events.some((event) => event.kind === "run_completed"));
+      await waitFor("two_provider_captures", () => provider.captured.length === 2);
+
+      const publicArtifactContents: string[] = [];
+      for (const event of events) {
+        const refs = event.kind === "tool_result_presented"
+          ? event.payload.artifactRefs
+          : event.kind === "verification_updated"
+            ? event.payload.evidenceRefs
+            : [];
+        for (const ref of refs) {
+          const artifact = await store.getArtifact(ref.artifactId);
+          if (artifact?.visibility === "public") publicArtifactContents.push(new TextDecoder().decode(artifact.content));
+        }
+      }
+      const publicSurface = JSON.stringify({ events, publicArtifactContents });
+      for (const forbidden of new Set([userInput, echoedInput, "M0_PRE_TOOL_PRIVATE_USER_MARKER", encodeURIComponent(userInput), Buffer.from(userInput, "utf8").toString("base64")])) {
+        assert.equal(publicSurface.includes(forbidden), false, "Provider/user private text must not reach SSE, public events, or public artifacts");
+      }
+      assert.match(publicSurface, /模型响应已私有持久化，公开摘要尚未启用。/u);
+      const privateEvents = await store.readEvents({ runId: created.runId, limit: 100 });
+      assert.equal(privateEvents.events.some((event) => event.visibility === "private"
+        && (event.payload as { kind?: unknown; delta?: unknown }).kind === "assistant_text_delta"
+        && (event.payload as { delta?: unknown }).delta === echoedInput), true, "canonical Provider event remains private and durable");
+      const secondMessages = provider.captured[1]?.body.messages;
+      assert.ok(Array.isArray(secondMessages));
+      assert.equal(secondMessages.some((message) => typeof message === "object" && message !== null && (message as { role?: unknown; content?: unknown }).role === "assistant" && (message as { content?: unknown }).content === echoedInput), true, "the follow-up Provider context retains the private assistant echo");
+    } finally {
+      await app.close();
+    }
+  } finally {
+    store.close();
+    await provider.close();
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+}
+
 for (const echoScenario of echoScenarios) {
 test(`Server redacts post-tool assistant text for ${echoScenario.name} private echo`, async () => {
   const parent = await mkdtemp(join(tmpdir(), "meliora-server-provider-"));
@@ -482,13 +595,15 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     const privateArtifact = await store.getArtifact(privateArtifactId);
     assert.equal(privateArtifact?.visibility, "private", "deterministic fixture IDs must identify the raw tool artifact");
     assert.equal(publicArtifactIds.has(privateArtifactId), false, "public event references must exclude the raw tool artifact");
+    const snapshot = await store.readSnapshot(created.runId);
+    assert.ok(snapshot, "the private recovery snapshot must retain verified private evidence");
+    assert.ok(snapshot?.state.verificationRefs.some((ref) => ref.artifactId === privateArtifactId && ref.visibility === "private"));
     const publicSurface = JSON.stringify({
       createBody,
       sseBody: firstBody,
       events,
       publicStoredEvents,
       publicArtifactContents,
-      snapshot: await store.readSnapshot(created.runId),
       visibleAssistantText,
     });
     for (const forbiddenValue of [
@@ -502,7 +617,7 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     ]) {
       assert.equal(publicSurface.includes(forbiddenValue), false, "public projection must not leak private Provider, workspace, or artifact data");
     }
-    assert.match(visibleAssistantText, /我先读取入口文件。/u, "safe assistant text before any private tool observation should still stream publicly");
+    assert.match(visibleAssistantText, /模型响应已私有持久化，公开摘要尚未启用。/u, "pre-tool Provider text must never stream publicly");
     assert.equal(visibleAssistantText.includes(attemptedAssistantText), false);
     assert.match(visibleAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u);
     assert.ok(events.some((event) => event.kind === "run_completed"));
@@ -670,6 +785,7 @@ test(`Server blocks ambiguous Provider ${providerScenario.name} without retry pe
     assert.equal(command?.status, "terminal");
     assert.equal(command?.status === "terminal" ? command.terminalStatus : null, "blocked");
     assert.equal(command?.status === "terminal" ? command.terminalCode : null, "model_step_outcome_unknown");
+    await waitFor("first_provider_capture", () => provider.captured.length === 1);
     assert.equal(provider.captured.length, 1);
 
     const replayResponse = await postTurn(app.url, "触发 Provider 模糊失败", idempotencyKey);

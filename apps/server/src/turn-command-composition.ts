@@ -12,7 +12,7 @@ import type {
   OpenAiCompatibleRequestTool,
   OpenAiCompatibleTransport,
 } from "../../../packages/providers/openai-compatible-transport.js";
-import type { SessionStorePort, StoredRunCommand } from "../../../packages/session-store/contracts.js";
+import type { InvocationReconciliationRecord, SessionStorePort, StoredRunCommand } from "../../../packages/session-store/contracts.js";
 import {
   assertPersistableText,
   canonicalRunCommandRequestHash,
@@ -48,6 +48,9 @@ const CATALOG_VERSION = "m0-read-only-workspace-tools-v1";
 const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
 const MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE = "模型步骤结果未知，已停止自动重发 Provider 请求。";
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE = "tool_invocation_outcome_unknown";
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE = "工具执行结果未知，已停止自动重放。";
+const TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS = ["先通过 Host readback 或恢复协调器确认工具结果。"] as const;
 
 export type TurnCommandIds = ReadOnlyRunIds & Readonly<{
   nextSessionId(): string;
@@ -385,17 +388,25 @@ const appendWorkerFailureEvent = async (
   });
 };
 
-const settleStartedModelStepAsUnknown = async (
+const settleOutcomeUnknown = async (
   store: SessionStorePort,
   command: StoredRunCommand,
   leaseToken: string,
   ids: TurnCommandIds,
   now: () => string,
+  input: Readonly<{
+    code: string;
+    message: string;
+    userActions: readonly string[];
+    requireStartedModelStep: boolean;
+  }>,
 ): Promise<boolean> => {
   const latestCommand = await store.readRunCommand(commandScope(command));
   if (!latestCommand || latestCommand.status === "terminal") return false;
-  const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
-  if (latestStep?.status !== "started") return false;
+  if (input.requireStartedModelStep) {
+    const latestStep = await store.readLatestModelStep({ runId: latestCommand.runId });
+    if (latestStep?.status !== "started") return false;
+  }
   try {
     const sequence = await latestSequence(store, latestCommand.runId);
     await store.settleRunCommandWithTerminalEvent({
@@ -406,7 +417,7 @@ const settleStartedModelStepAsUnknown = async (
       expectedCommandStatus: latestCommand.status,
       expectedSequence: sequence,
       terminalStatus: "blocked",
-      terminalCode: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+      terminalCode: input.code,
       updatedAt: now(),
       terminalEvent: {
         schemaVersion: "meliora.session-event.v1",
@@ -414,9 +425,9 @@ const settleStartedModelStepAsUnknown = async (
         kind: "run_blocked",
         visibility: "public",
         payload: {
-          code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
-          message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
-          userActions: [...MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS],
+          code: input.code,
+          message: input.message,
+          userActions: [...input.userActions],
         },
         createdAt: now(),
       },
@@ -428,6 +439,80 @@ const settleStartedModelStepAsUnknown = async (
     return true;
   }
   return true;
+};
+
+type InvocationRecoveryState = "present" | "absent" | "settled" | "indeterminate";
+
+const receiptMatchesTerminalInvocation = (
+  record: InvocationReconciliationRecord,
+): boolean => {
+  const receipt = record.receipt;
+  const invocation = record.invocation;
+  return receipt !== null
+    && receipt.runId === invocation.runId
+    && receipt.attemptId === invocation.attemptId
+    && receipt.invocationId === invocation.invocationId
+    && receipt.toolName === invocation.toolName
+    && receipt.toolVersion === invocation.toolVersion
+    && receipt.argumentsHash === invocation.argumentsHash
+    && receipt.catalogHash === invocation.catalogHash
+    && receipt.status === invocation.status;
+};
+
+const hasValidExecutionStartedAt = (value: string | undefined): boolean =>
+  value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value));
+
+const classifyInvocationRecoveryState = async (
+  store: SessionStorePort,
+  runId: string,
+): Promise<InvocationRecoveryState> => {
+  try {
+    const recovery = await store.readRecoveryBundle({ runId, eventLimit: 128 });
+    if (recovery.kind !== "found") return "indeterminate";
+    let hasUnsafeUnreceiptedInvocation = false;
+    let hasSettledInvocation = false;
+    for (const record of recovery.bundle.invocations) {
+      const { reservation, invocation, receipt } = record;
+      if (reservation.runId !== invocation.runId
+        || reservation.attemptId !== invocation.attemptId
+        || reservation.invocationId !== invocation.invocationId
+        || reservation.idempotencyKey !== invocation.idempotencyKey
+        || reservation.status !== invocation.status) return "indeterminate";
+      if (invocation.status === "reserved") {
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        continue;
+      }
+      if (invocation.status === "awaiting_approval") {
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        // Approval state is neither a completed receipt nor proof that this
+        // command may fall through to Model Step recovery.
+        hasSettledInvocation = true;
+        continue;
+      }
+      if (invocation.status === "executing") {
+        if (receipt !== null || !hasValidExecutionStartedAt(reservation.executionStartedAt)) return "indeterminate";
+        hasUnsafeUnreceiptedInvocation = true;
+        continue;
+      }
+      if (invocation.status === "outcome_unknown") {
+        // v2 migration deliberately clears this field: a legacy database
+        // cannot prove an execution boundary.
+        if (receipt !== null || reservation.executionStartedAt !== undefined) return "indeterminate";
+        hasUnsafeUnreceiptedInvocation = true;
+        continue;
+      }
+      if (invocation.status === "succeeded" || invocation.status === "failed" || invocation.status === "cancelled") {
+        if (receipt === null || !receiptMatchesTerminalInvocation(record)) return "indeterminate";
+        hasSettledInvocation = true;
+        continue;
+      }
+      return "indeterminate";
+    }
+    if (hasUnsafeUnreceiptedInvocation) return "present";
+    return hasSettledInvocation ? "settled" : "absent";
+  } catch {
+    return "indeterminate";
+  }
 };
 
 const runWorker = async (
@@ -453,7 +538,26 @@ const runWorker = async (
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
-      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
+      const invocationState = await classifyInvocationRecoveryState(options.store, current.runId);
+      if (invocationState === "present") {
+        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+          code: TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE,
+          message: TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE,
+          userActions: TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS,
+          requireStartedModelStep: false,
+        });
+        return;
+      }
+      // `failure`, `conflict`, `not_found`, or a read exception cannot prove
+      // the invocation is absent. Preserve dispatched state for a later
+      // recovery worker rather than applying the Model Step fallback.
+      if (invocationState === "indeterminate" || invocationState === "settled") return;
+      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+        userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+        requireStartedModelStep: true,
+      });
       return;
     }
     if (current.status === "reserved") {
@@ -522,17 +626,33 @@ const runWorker = async (
     const code = result.outcome.status === "completed"
       ? undefined
       : result.outcome.unresolved[0]?.code ?? result.outcome.status;
-    if (result.outcome.status === "blocked" && code === MODEL_STEP_OUTCOME_UNKNOWN_CODE) {
-      // The Run Loop deliberately deferred this one terminal event.  The Store
-      // writes it only together with Command terminal state; a failed atomic
-      // settlement leaves dispatched + started for safe recovery.
-      await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now);
+    if (result.outcome.status === "blocked" && (code === MODEL_STEP_OUTCOME_UNKNOWN_CODE || code === TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE)) {
+      // The Run Loop deliberately deferred these ambiguous-outcome terminal
+      // events. Store writes the public terminal event and Command terminal
+      // state together; failed settlement leaves both facts absent.
+      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code,
+        message: result.outcome.summary,
+        userActions: result.outcome.userActions,
+        requireStartedModelStep: code === MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+      });
       return;
     }
     await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
-      if (await settleStartedModelStepAsUnknown(options.store, command, leaseToken, options.ids, options.now)
+      if (await classifyInvocationRecoveryState(options.store, command.runId) !== "absent") {
+        // Host may already have caused an effect but its Receipt was not
+        // durable, or recovery cannot prove otherwise. Leave dispatched and
+        // executing untouched until a later worker can read a complete bundle.
+        return;
+      }
+      if (await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
+        message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
+        userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
+        requireStartedModelStep: true,
+      })
         .catch(() => false)) {
         return;
       }
