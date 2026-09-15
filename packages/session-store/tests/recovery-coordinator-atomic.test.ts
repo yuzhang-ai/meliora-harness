@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import test, { type TestContext } from "node:test";
 
 import type { SessionStorePort } from "../contracts.js";
 import { MemorySessionStore } from "../memory-session-store.js";
 import { canonicalRunCommandRequestHash } from "../run-command-contract.js";
+import { SensitiveDataError } from "../src/errors.js";
 import { SqliteSessionStore } from "../src/sqlite-session-store.js";
 import { createTempDatabase, timestamp } from "./helpers.js";
 
@@ -58,6 +60,23 @@ const atomicInput = (now: () => string, eventId = "terminal-event", expectedSequ
 const adapters: readonly [string, (now: () => number, t: TestContext) => Store][] = [
   ["memory", (now) => new MemorySessionStore({ clock: () => new Date(now()) })],
   ["sqlite", (now, t) => new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(now()) })],
+];
+
+type RecoverySensitiveAttack = Readonly<{
+  terminalEvent?: Readonly<Record<string, string>>;
+  recoveryAttempt?: Readonly<Record<string, string>>;
+}>;
+
+const RECOVERY_SENSITIVE_ATTACKS: readonly RecoverySensitiveAttack[] = [
+  { terminalEvent: { eventId: "sk-recovery-event-secret-123456" } },
+  { terminalEvent: { kind: "Authorization: Bearer opaque-recovery-kind-secret" } },
+  { recoveryAttempt: { attemptId: "api-recovery-attempt-secret-123456" } },
+  { recoveryAttempt: { ownerId: "sk-recovery-owner-secret-123456" } },
+];
+
+const RECOVERY_REJECTED_EVENT_METADATA: readonly RecoverySensitiveAttack[] = [
+  { terminalEvent: { causationId: "bEaReR = opaque-recovery-causation-secret" } },
+  { terminalEvent: { correlationId: "X_API_KEY : opaque-recovery-correlation-secret" } },
 ];
 
 for (const [name, create] of adapters) {
@@ -147,6 +166,78 @@ for (const [name, create] of adapters) {
     } finally { store.close?.(); }
   });
 
+  test(`${name} recovery rejects sensitive terminal metadata and opaque IDs before any write`, async (t) => {
+    let current = Date.parse(timestamp());
+    const now = () => new Date(current).toISOString();
+    const store = create(() => current, t);
+    try {
+      await seed(store, now);
+      current += 1_001;
+      for (const attack of RECOVERY_SENSITIVE_ATTACKS) {
+        const base = atomicInput(now);
+        const input = {
+          ...base,
+          ...(attack.terminalEvent === undefined ? {} : { terminalEvent: { ...base.terminalEvent, ...attack.terminalEvent } }),
+          ...(attack.recoveryAttempt === undefined ? {} : { recoveryAttempt: { ...base.recoveryAttempt, ...attack.recoveryAttempt } }),
+        } as Parameters<SessionStorePort["recoverAndSettleRunCommandWithTerminalEvent"]>[0];
+        await assert.rejects(store.recoverAndSettleRunCommandWithTerminalEvent(input), SensitiveDataError);
+        assert.equal((await store.readRunCommand(scope))?.status, "dispatched");
+        assert.equal((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events.length, 0);
+      }
+      for (const attack of RECOVERY_REJECTED_EVENT_METADATA) {
+        const base = atomicInput(now);
+        const input = {
+          ...base,
+          terminalEvent: { ...base.terminalEvent, ...attack.terminalEvent },
+        } as Parameters<SessionStorePort["recoverAndSettleRunCommandWithTerminalEvent"]>[0];
+        await assert.rejects(store.recoverAndSettleRunCommandWithTerminalEvent(input), SensitiveDataError);
+        assert.equal((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events.length, 0);
+      }
+      await assert.rejects(store.appendEvents({
+        runId: "run", attemptId: "attempt-old", leaseToken: "unused-after-validation", expectedSequence: 0,
+        events: [{
+          ...atomicInput(now).terminalEvent,
+          causationId: " ＡＰＩ Ｋｅｙ : opaque-generic-causation-secret",
+          correlationId: "Ｔｏｋｅｎ : opaque-generic-correlation-secret",
+        }],
+      }), SensitiveDataError);
+      const genericTerminal = atomicInput(now).terminalEvent;
+      const settleInput = {
+        ...scope,
+        runId: "run", attemptId: "attempt-old", leaseToken: "unused-after-validation", expectedCommandStatus: "dispatched" as const,
+        expectedSequence: 0, terminalStatus: "blocked" as const, terminalCode: "model_step_outcome_unknown", updatedAt: now(),
+      };
+      await assert.rejects(store.settleRunCommandWithTerminalEvent({
+        ...settleInput,
+        terminalEvent: { ...genericTerminal, causationId: " ＡＰＩ Ｋｅｙ : opaque-generic-causation-secret" },
+      }), SensitiveDataError);
+      for (const terminalEvent of [
+        { ...genericTerminal, eventId: "sk-generic-event-secret-123456" },
+        { ...genericTerminal, kind: "Authorization: Bearer opaque-generic-kind-secret" },
+      ]) {
+        await assert.rejects(store.appendEvents({
+          runId: "run", attemptId: "attempt-old", leaseToken: "unused-after-validation", expectedSequence: 0, events: [terminalEvent],
+        }), SensitiveDataError);
+        await assert.rejects(store.settleRunCommandWithTerminalEvent({ ...settleInput, terminalEvent }), SensitiveDataError);
+      }
+      await assert.rejects(store.appendEvents({
+        runId: "run", attemptId: "attempt-old", leaseToken: "unused-after-validation", expectedSequence: 0,
+        events: [{ ...genericTerminal, runtimeOnlyMetadata: { mustNotPersist: true } }],
+      } as unknown as Parameters<SessionStorePort["appendEvents"]>[0]), /invalid_event_fields/u);
+      await assert.rejects(store.settleRunCommandWithTerminalEvent({
+        ...settleInput,
+        terminalEvent: { ...genericTerminal, runtimeOnlyMetadata: { mustNotPersist: true } },
+      } as unknown as Parameters<SessionStorePort["settleRunCommandWithTerminalEvent"]>[0]), /invalid_event_fields/u);
+      const base = atomicInput(now);
+      const unknownOwnKey = {
+        ...base,
+        terminalEvent: { ...base.terminalEvent, metadata: { retainedByMemoryWithoutAWhitelist: true } },
+      } as unknown as Parameters<SessionStorePort["recoverAndSettleRunCommandWithTerminalEvent"]>[0];
+      await assert.rejects(store.recoverAndSettleRunCommandWithTerminalEvent(unknownOwnKey), /invalid_event_fields/u);
+      assert.equal((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events.length, 0);
+    } finally { store.close?.(); }
+  });
+
   test(`${name} recovery cursor reaches unsafe tail behind retained prefix`, async (t) => {
     let current = Date.parse(timestamp());
     const store = create(() => current, t);
@@ -190,6 +281,36 @@ for (const [name, create] of adapters) {
     } finally { store.close?.(); }
   });
 }
+
+test("SQLite recovery rejects sensitive terminal metadata and opaque IDs before DB, WAL or SHM writes", async (t) => {
+  let current = Date.parse(timestamp());
+  const now = () => new Date(current).toISOString();
+  const path = createTempDatabase(t);
+  const store = new SqliteSessionStore(path, { clock: () => new Date(current) });
+  try {
+    await seed(store, now);
+    current += 1_001;
+  for (const attack of [...RECOVERY_SENSITIVE_ATTACKS, ...RECOVERY_REJECTED_EVENT_METADATA]) {
+      const base = atomicInput(now);
+      const input = {
+        ...base,
+        ...(attack.terminalEvent === undefined ? {} : { terminalEvent: { ...base.terminalEvent, ...attack.terminalEvent } }),
+        ...(attack.recoveryAttempt === undefined ? {} : { recoveryAttempt: { ...base.recoveryAttempt, ...attack.recoveryAttempt } }),
+      } as Parameters<SessionStorePort["recoverAndSettleRunCommandWithTerminalEvent"]>[0];
+      await assert.rejects(store.recoverAndSettleRunCommandWithTerminalEvent(input), SensitiveDataError);
+    }
+  } finally { store.close(); }
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    const bytes = readFileSync(candidate);
+    for (const attack of [...RECOVERY_SENSITIVE_ATTACKS, ...RECOVERY_REJECTED_EVENT_METADATA]) {
+      for (const value of [...Object.values(attack.terminalEvent ?? {}), ...Object.values(attack.recoveryAttempt ?? {})]) {
+        assert.equal(bytes.includes(Buffer.from(value, "utf8")), false);
+        assert.equal(bytes.includes(Buffer.from(value, "utf16le")), false);
+      }
+    }
+  }
+});
 
 const faultyAdapters: readonly [string, (now: () => number, stage: string, t: TestContext) => Store][] = [
   ["memory", (now, stage) => new MemorySessionStore({

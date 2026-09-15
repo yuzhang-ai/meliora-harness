@@ -78,6 +78,17 @@ type RecoveryClassification =
   | Readonly<{ kind: "retain" }>
   | Readonly<{ kind: "indeterminate" }>;
 
+// A recovered Command still marked dispatched cannot safely override a
+// terminal fact already present in the durable log.  In particular, SSE
+// terminates at the first public terminal event, so appending another one
+// would create an event that no client can reach.
+const TERMINAL_RUN_EVENT_KINDS = new Set([
+  "run_blocked",
+  "run_completed",
+  "run_failed",
+  "run_cancelled",
+]);
+
 const isValidExecutionStartedAt = (value: string | undefined): boolean =>
   value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value));
 
@@ -113,6 +124,14 @@ const classifyBundle = async (
     || bundle.activeAttempt.attemptNumber !== bundle.latestAttemptNumber
     || bundle.eventHeadSequence !== bundle.activeAttempt.lastEventSequence
     || !bundle.tailComplete) return { kind: "indeterminate" };
+
+  if (bundle.tailEvents.length !== bundle.eventHeadSequence - bundle.effectiveAfterSequence
+    || bundle.tailEvents.some((event, index) => event.runId !== bundle.run.runId
+      || event.sequence !== bundle.effectiveAfterSequence + index + 1)) return { kind: "indeterminate" };
+
+  if (bundle.tailEvents.some((event) => TERMINAL_RUN_EVENT_KINDS.has(event.kind))) {
+    return { kind: "indeterminate" };
+  }
 
   let hasUnknownInvocation = false;
   let hasSettledInvocation = false;

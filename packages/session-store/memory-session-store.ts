@@ -24,6 +24,7 @@ import type {
   LeaseRenewal,
   LeaseRequest,
   LeaseResult,
+  NewEvent,
   PersistedRunAttempt,
   PersistedRunRecord,
   PutArtifactInput,
@@ -85,6 +86,7 @@ import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE }
 import type { NormalizedToolInvocation, ToolReceipt } from "../tool-runtime/contracts";
 import type { JsonValue } from "../model-protocol/contracts";
 import {
+  assertPersistableNewEvent,
   assertValidCommandTimestamp,
   assertValidGeneratedId,
   assertValidIdempotencyKey,
@@ -96,10 +98,27 @@ import {
   canTransitionRunCommand,
   privateUserInputContentHash,
 } from "./run-command-contract";
-import { assertPersistableBytes, assertPersistableJson } from "./src/sensitive-data";
+import { assertPersistableBytes, assertPersistableJson, assertPersistableText } from "./src/sensitive-data";
 import { canonicalJson, hashBytes } from "./src/integrity";
 
 type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
+
+const RECOVERY_TERMINAL_EVENT_KEYS = new Set([
+  "schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt",
+]);
+const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
+  schemaVersion: event.schemaVersion,
+  eventId: event.eventId,
+  runId,
+  attemptId,
+  sequence,
+  kind: event.kind,
+  visibility: event.visibility,
+  payload: event.payload,
+  createdAt: event.createdAt,
+  ...(event.causationId === undefined ? {} : { causationId: event.causationId }),
+  ...(event.correlationId === undefined ? {} : { correlationId: event.correlationId }),
+});
 
 type MemorySessionStoreOptions = Readonly<{
   clock?: () => Date;
@@ -390,6 +409,7 @@ export class MemorySessionStore implements SessionStorePort {
     }
     const expectedKind = `run_${input.terminalStatus}`;
     const event = input.terminalEvent;
+    assertPersistableNewEvent(event);
     if (
       event.schemaVersion !== "meliora.session-event.v1"
       || event.kind !== expectedKind
@@ -397,10 +417,6 @@ export class MemorySessionStore implements SessionStorePort {
     ) {
       return { kind: "conflict", code: "command_status_conflict" };
     }
-    assertValidGeneratedId(event.eventId);
-    assertValidCommandTimestamp(event.createdAt);
-    assertPersistableJson(event.payload, "terminal_event.payload");
-
     const key = commandScopeKey(input);
     const command = this.commands.get(key);
     if (!command) return { kind: "not_found", code: "run_command_not_found" };
@@ -412,12 +428,7 @@ export class MemorySessionStore implements SessionStorePort {
     const leaseConflict = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
     if (leaseConflict) return { kind: "conflict", code: leaseConflict };
     const attempt = this.attemptForRun(input.runId, input.attemptId)!;
-    const expectedEvent: StoredEvent = {
-      ...event,
-      runId: input.runId,
-      attemptId: input.attemptId,
-      sequence: input.expectedSequence + 1,
-    };
+    const expectedEvent = toStoredEvent(event, input.runId, input.attemptId, input.expectedSequence + 1);
     const priorEvent = [...this.events.values()].flat().find((candidate) => candidate.eventId === event.eventId);
 
     if (command.status === "terminal") {
@@ -475,16 +486,19 @@ export class MemorySessionStore implements SessionStorePort {
     const recovery = input.recoveryAttempt;
     assertValidGeneratedId(recovery.attemptId);
     assertValidGeneratedId(recovery.ownerId);
+    assertPersistableText(recovery.attemptId, "recovery_attempt.attemptId");
+    assertPersistableText(recovery.ownerId, "recovery_attempt.ownerId");
     assertValidCommandTimestamp(recovery.createdAt);
     assertValidCommandTimestamp(recovery.requestedAt);
     this.requireTtl(recovery.ttlMs);
     const event = input.terminalEvent;
+    assertPersistableNewEvent(event);
     if (event.schemaVersion !== "meliora.session-event.v1" || event.kind !== "run_blocked" || event.visibility !== "public") {
       return { kind: "conflict", code: "command_status_conflict" };
     }
-    assertValidGeneratedId(event.eventId);
-    assertValidCommandTimestamp(event.createdAt);
-    assertPersistableJson(event.payload, "terminal_event.payload");
+    if (Object.keys(event).some((key) => !RECOVERY_TERMINAL_EVENT_KEYS.has(key))) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
     const payload = event.payload;
     if (typeof payload !== "object" || payload === null || Array.isArray(payload)
       || Object.keys(payload).sort().join(",") !== "code,message,userActions"
@@ -534,7 +548,17 @@ export class MemorySessionStore implements SessionStorePort {
       catalogHash: active.catalogHash, intentRevision: active.intentRevision, runtimeState: null,
       createdAt: recovery.createdAt, updatedAt: input.updatedAt,
     };
-    const expectedEvent: StoredEvent = { ...event, runId: input.runId, attemptId: recovery.attemptId, sequence: input.expectedSequence + 1 };
+    const expectedEvent: StoredEvent = {
+      schemaVersion: event.schemaVersion,
+      eventId: event.eventId,
+      runId: input.runId,
+      attemptId: recovery.attemptId,
+      sequence: input.expectedSequence + 1,
+      kind: event.kind,
+      visibility: event.visibility,
+      payload: event.payload,
+      createdAt: event.createdAt,
+    };
     const { terminalStatus: _terminalStatus, terminalCode: _terminalCode, ...base } = command;
     const settled: StoredRunCommand = {
       ...base, status: "terminal", terminalStatus: "blocked", terminalCode: input.terminalCode, updatedAt: input.updatedAt,
@@ -877,9 +901,7 @@ export class MemorySessionStore implements SessionStorePort {
       return { kind: "conflict", code: "event_sequence_conflict" };
     }
     for (const event of input.events) {
-      assertValidGeneratedId(event.eventId);
-      assertValidCommandTimestamp(event.createdAt);
-      assertPersistableJson(event.payload, "event.payload");
+      assertPersistableNewEvent(event);
     }
     const attempt = this.attempts.get(attemptKey(input.runId, input.attemptId));
     if (!attempt) return { kind: "conflict", code: "run_attempt_conflict" };
@@ -889,12 +911,8 @@ export class MemorySessionStore implements SessionStorePort {
       return { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt.lastEventSequence };
     }
     const previous = this.events.get(input.runId) ?? [];
-    const appended = input.events.map((event, index): StoredEvent => ({
-      ...event,
-      runId: input.runId,
-      attemptId: input.attemptId,
-      sequence: input.expectedSequence + index + 1,
-    }));
+    const appended = input.events.map((event, index) =>
+      toStoredEvent(event, input.runId, input.attemptId, input.expectedSequence + index + 1));
     const lastSequence = input.expectedSequence + appended.length;
     this.events.set(input.runId, deepCopy([...previous, ...appended]));
     this.attempts.set(attemptKey(input.runId, input.attemptId), {

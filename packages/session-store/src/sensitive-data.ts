@@ -5,7 +5,7 @@ const SENSITIVE_VALUE =
   /(?:\bbearer\s*[=:]\s*\S+|\bbearer\s+[a-z0-9._~+\/=\-]{16,}(?=$|[^a-z0-9._~+\/=\-])|\b(?:sk|api)[-_][a-z0-9_-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/iu;
 
 const SENSITIVE_TEXT_FIELD =
-  /(?:^|["'\s{,;])(?:[a-z0-9_-]*api[-_]?key|authorization|proxy[-_]?authorization|cookie|set[ _-]?cookie|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|private[-_]?reasoning|raw[-_]?environment)["']?\s*[:=]/iu;
+  /(?:^|["'\s{,;])(?:[a-z0-9_-]*api[ _-]?key|authorization|proxy[-_]?authorization|cookie|set[ _-]?cookie|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|token|private[-_]?reasoning|raw[-_]?environment)["']?\s*[:=]/iu;
 
 const normalizeKey = (key: string): string => key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/gu, "");
 
@@ -18,6 +18,8 @@ const isSensitiveKey = (key: string): boolean => {
     || normalized.endsWith("apikey")
     || normalized.endsWith("accesstoken")
     || normalized.endsWith("refreshtoken")
+    || normalized === "token"
+    || normalized.endsWith("token")
     || normalized.endsWith("clientsecret")
     || normalized.endsWith("password")
     || normalized === "privatereasoning"
@@ -49,7 +51,8 @@ const visit = (value: JsonValue, path: string): void => {
 export const assertPersistableJson = (value: JsonValue, path = "payload"): void => visit(value, path);
 
 export const assertPersistableText = (value: string, path = "text"): void => {
-  if (SENSITIVE_VALUE.test(value) || SENSITIVE_TEXT_FIELD.test(value)) {
+  const normalized = value.normalize("NFKC");
+  if (SENSITIVE_VALUE.test(normalized) || SENSITIVE_TEXT_FIELD.test(normalized)) {
     throw new SensitiveDataError(`Sensitive value rejected at ${path}.`);
   }
 };
