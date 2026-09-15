@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
+import { listenOnFetchSafeLoopbackPort } from "../../../tests/helpers/fetch-safe-listener.js";
 import type { ReadEventLogPageInput, ReadEventsInput, SessionStorePort, StoredEvent } from "../../../packages/session-store/contracts.js";
 import { createLocalMelioraServer } from "../src/persistence.js";
 import { createMelioraServer, encodeSseEvent, projectPublicEvent } from "../src/server.js";
@@ -53,11 +53,7 @@ const startServer = async (
   resolveSessionId: () => Promise<string | null> = async () => "session-1",
 ) => {
   const server = createMelioraServer({ store, resolveSessionId, resolveLocalPrincipalId: async () => "local-user", pollIntervalMs: 10 });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = (server.address() as AddressInfo).port;
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
     server,
     url: `http://127.0.0.1:${port}`,
@@ -88,6 +84,25 @@ const rawGet = async (
   });
   request.on("error", reject);
   request.end();
+});
+
+test("GET resume and SSE reads never trigger the recovery coordinator scan", async () => {
+  let recoveryScans = 0;
+  const store = {
+    ...fakeStore([storedEvent(1, "run_blocked")]),
+    listRecoverableCommands: async () => {
+      recoveryScans += 1;
+      throw new Error("GET/SSE must not start recovery");
+    },
+  } as SessionStorePort;
+  const app = await startServer(store);
+  try {
+    const resume = await fetch(`${app.url}/api/runs/run-1/resume`);
+    assert.equal(resume.status, 200);
+    const sse = await rawGet(app.url, "/api/runs/run-1/events");
+    assert.equal(sse.statusCode, 200);
+    assert.equal(recoveryScans, 0);
+  } finally { await app.close(); }
 });
 
 test("public resume snapshot fixes the raw watermark and only returns exact authorized events", async () => {
@@ -265,12 +280,8 @@ test("missing Run projection returns 404", async () => {
 
 test("local persistence composition resolves Runs through the SQLite adapter", async () => {
   const local = createLocalMelioraServer(":memory:");
-  await new Promise<void>((resolve, reject) => {
-    local.server.once("error", reject);
-    local.server.listen(0, "127.0.0.1", resolve);
-  });
+  const port = await listenOnFetchSafeLoopbackPort(local.server);
   try {
-    const port = (local.server.address() as AddressInfo).port;
     const response = await rawGet(`http://127.0.0.1:${port}`, "/api/runs/missing/events");
     assert.equal(response.statusCode, 404);
     assert.deepEqual(JSON.parse(response.body), { error: "run_not_found" });

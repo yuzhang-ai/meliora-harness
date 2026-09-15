@@ -112,6 +112,15 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 
 验收：Provider 前崩溃、Provider 后/Tool 前崩溃、Receipt 前后崩溃、旧 lease 未过期、旧 lease 过期、cursor 不足和终态重启。
 
+#### WP-3C.1：Recovery coordinator core（施工中）
+
+- 提供显式、bounded `recoverOnce`，使用稳定 recovery cursor 遍历，不让 retained 前缀饿死后续 Run；GET/SSE/Resume read 不得调用它。
+- 仅完整 bundle 可参与分类。新 Attempt、其 lease、`run_blocked` event 与 Command terminal blocked 必须由一个 Store 原子操作全写或全不写；禁止先切 `activeAttemptId` 后再收口。
+- 只收口已证明的 `started` Provider outcome、unreceipted `executing/outcome_unknown` Tool outcome，及完整 Receipt/binding 的后续恢复边界；Provider/Host/旧 worker 不在此切片调用。
+- `reserved / accepted` 的安全派发、正常 Run continuation、SSE reset/restart、retention/reset 和 Web live 均留到后续独立切片。
+
+验收：Memory/SQLite 原子 rollback、lease/CAS race、cursor tail reach、Model/Host exactly-once 和 Server 已有 SSE 对 blocked event 的只读复现通过。
+
 ### WP-4：Web live adapter
 
 Owner：张子恒；后端提供已冻结 API 和本地 fixture server。

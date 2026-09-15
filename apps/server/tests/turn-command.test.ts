@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 
 import { deepseekStreamTextSingleToolFixture } from "../../../fixtures/contracts/v1/deepseek-stream-text-single-tool.js";
+import { listenOnFetchSafeLoopbackPort } from "../../../tests/helpers/fetch-safe-listener.js";
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
 import type { ReadOnlyRunModelPort } from "../../../packages/agent-runtime/read-only-run-loop.js";
 import { MemorySessionStore } from "../../../packages/session-store/memory-session-store.js";
@@ -71,11 +71,7 @@ const startServer = async (
     pollIntervalMs: 10,
     ...(maxJsonBodyBytes === undefined ? {} : { maxJsonBodyBytes }),
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = (server.address() as AddressInfo).port;
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
     url: `http://127.0.0.1:${port}`,
     close: async () => {

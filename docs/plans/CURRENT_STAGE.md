@@ -131,11 +131,11 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；Web 11/11、四档响应式与真实 Chrome 验收、全量 check、CI 和独立复审通过；尚未接入真实 Server/SSE |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`，WP-3B.1b 已由 PR #22 合并至 main `f72d2674`，WP-3B.2a 已由 PR #23 合并至 main `77fbf95a`，B2b.1 已由 PR #24 合并至 main `1055f7f8`，B2b.2 已由 PR #25 squash merge 至 main `b97588c5`。WP-3B.2c.1 正在独立 worktree 实现按需只读 public resume snapshot：fixed-watermark Store read、principal scope gate、500 source/256 KiB response fail-closed 限制；不含持久化 snapshot、retention/reset、SSE reset、Web live、HTTP artifact 或非-loopback 登录。 |
+| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`，WP-3B.1b 已由 PR #22 合并至 main `f72d2674`，WP-3B.2a 已由 PR #23 合并至 main `77fbf95a`，B2b.1 已由 PR #24 合并至 main `1055f7f8`，B2b.2 已由 PR #25 squash merge 至 main `b97588c5`，WP-3B.2c.1 已由 PR #26 合并至 main `5bbc65dc`。当前隔离施工 WP-3C.1 Recovery coordinator core：bounded cursor scan、完整 bundle 分类，以及新 Attempt/lease + run_blocked + Command terminal 的单一原子 Store 收口；不含安全继续派发、SSE reset/restart、retention/reset、Web live、HTTP artifact 或非-loopback 登录。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1 与 B2b.2（PR #25，main `b97588c5`）已合并到 `main`。当前隔离施工 WP-3B.2c.1：先冻结/验证按需只读 public resume snapshot，再推进 C recovery coordinator 与 SSE reset/restart。B2/C 尚未完成。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）与按需 public resume snapshot（PR #26，main `5bbc65dc`）已合并到 `main`。当前隔离施工 WP-3C.1：先冻结/验证 recovery coordinator 的原子安全收口；其后才分别推进 C.2 安全继续派发、WP-3D snapshot→exact public resumePoint→SSE restart，以及 Web live。C/D 尚未完成。

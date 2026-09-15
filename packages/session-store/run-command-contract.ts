@@ -1,6 +1,7 @@
-import { assertPersistableText } from "./src/sensitive-data.js";
+import { assertPersistableJson, assertPersistableText } from "./src/sensitive-data.js";
 import { hashBytes, hashJson } from "./src/integrity.js";
 import type {
+  NewEvent,
   ReserveRunCommandInput,
   RunCommandStatus,
   StoredModelStepCheckpoint,
@@ -110,6 +111,33 @@ export const assertValidSafeCode = (value: string): void => {
 
 export const assertValidCommandTimestamp = (value: string): void => {
   if (!Number.isFinite(Date.parse(value))) throw new RunCommandContractError("invalid_timestamp");
+};
+
+const NEW_EVENT_KEYS = new Set([
+  "schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt", "causationId", "correlationId",
+]);
+const REQUIRED_NEW_EVENT_KEYS = ["schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt"] as const;
+
+/** Validates every value that can cross a NewEvent persistence boundary. */
+export const assertPersistableNewEvent = (event: NewEvent): void => {
+  const keys = Object.keys(event);
+  if (keys.some((key) => !NEW_EVENT_KEYS.has(key)) || REQUIRED_NEW_EVENT_KEYS.some((key) => !Object.hasOwn(event, key))) {
+    throw new TypeError("invalid_event_fields");
+  }
+  if (event.schemaVersion !== "meliora.session-event.v1" || (event.visibility !== "public" && event.visibility !== "private")) {
+    throw new TypeError("invalid_event_envelope");
+  }
+  assertValidGeneratedId(event.eventId);
+  assertPersistableText(event.eventId, "event.eventId");
+  if (typeof event.kind !== "string" || event.kind.length === 0 || event.kind.length > 200 || /[\u0000-\u001f]/u.test(event.kind)) {
+    throw new TypeError("invalid_event_kind");
+  }
+  assertPersistableText(event.kind, "event.kind");
+  assertValidCommandTimestamp(event.createdAt);
+  assertPersistableText(event.createdAt, "event.createdAt");
+  assertPersistableJson(event.payload, "event.payload");
+  if (event.causationId !== undefined) assertPersistableText(event.causationId, "event.causationId");
+  if (event.correlationId !== undefined) assertPersistableText(event.correlationId, "event.correlationId");
 };
 
 export const canonicalRunCommandRequestHash = (request: CanonicalRunCommandRequest): string => {

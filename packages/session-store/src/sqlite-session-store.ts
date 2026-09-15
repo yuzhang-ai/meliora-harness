@@ -10,13 +10,14 @@ import type {
   CommitReceiptWithPublicEventsInput, CommitReceiptWithPublicEventsResult,
   CommitTerminalModelStepResultAndSnapshotInput, CommitTerminalModelStepResultAndSnapshotResult,
   CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
-  EventPage, EventLogPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
+  EventPage, EventLogPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord, NewEvent,
   InvocationReservationInput, LeaseRenewal, LeaseRequest, LeaseResult, PersistedRunAttempt,
   PersistedRunRecord, PutArtifactInput, ReadEventLogPageInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
   ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReceiptPublicEventBindingInput,
   ReadReceiptPublicEventBindingResult, ReadReservationInput,
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
-  RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage,
+  RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage, RecoveryCommandScanInput,
+  RecoverAndSettleRunCommandWithTerminalEventInput, RecoverAndSettleRunCommandWithTerminalEventResult,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
@@ -29,6 +30,7 @@ import type {
 } from "../contracts.js";
 import { assertValidRunSnapshot, PRIVATE_TERMINAL_MODEL_STEP_RESULT_MEDIA_TYPE } from "../contracts.js";
 import {
+  assertPersistableNewEvent,
   assertValidCommandTimestamp,
   assertValidGeneratedId,
   assertValidIdempotencyKey,
@@ -42,7 +44,7 @@ import {
 } from "../run-command-contract.js";
 import { IdempotencyConflictError, SequenceConflictError, StoreIntegrityError } from "./errors.js";
 import { canonicalJson, hashBytes } from "./integrity.js";
-import { assertPersistableBytes, assertPersistableJson } from "./sensitive-data.js";
+import { assertPersistableBytes, assertPersistableJson, assertPersistableText } from "./sensitive-data.js";
 
 type Migration = Readonly<{ version: number; name: string; sql: string; checksum: string }>;
 const loadMigration = (version: number, name: string): Migration => {
@@ -57,11 +59,29 @@ const MIGRATIONS = [
   loadMigration(5, "0005_receipt_public_events.sql"),
 ] as const;
 const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
+const RECOVERY_TERMINAL_EVENT_KEYS = new Set([
+  "schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt",
+]);
+const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
+  schemaVersion: event.schemaVersion,
+  eventId: event.eventId,
+  runId,
+  attemptId,
+  sequence,
+  kind: event.kind,
+  visibility: event.visibility,
+  payload: event.payload,
+  createdAt: event.createdAt,
+  ...(event.causationId === undefined ? {} : { causationId: event.causationId }),
+  ...(event.correlationId === undefined ? {} : { correlationId: event.correlationId }),
+});
 type Options = Readonly<{
   clock?: () => Date;
   nonce?: () => string;
   /** Test-only adapter hook; transaction rollback is the production guarantee. */
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
+  /** Test-only fault injector; SQLite transaction rollback is the guarantee. */
+  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command") => void;
 }>;
 type LeaseConflict = "lease_not_held" | "lease_expired";
 type Row = Record<string, any>;
@@ -101,11 +121,13 @@ export class SqliteSessionStore implements SessionStorePort {
   private readonly clock: () => Date;
   private readonly nonce: () => string;
   private readonly onAtomicTerminalWrite?: Options["onAtomicTerminalWrite"];
+  private readonly onRecoveryAtomicWrite?: Options["onRecoveryAtomicWrite"];
 
   constructor(databasePath: string, options: Options = {}) {
     this.clock = options.clock ?? (() => new Date());
     this.nonce = options.nonce ?? randomUUID;
     this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
+    this.onRecoveryAtomicWrite = options.onRecoveryAtomicWrite;
     this.db = new Database(prepareDatabasePath(databasePath));
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("journal_mode = WAL");
@@ -305,6 +327,7 @@ export class SqliteSessionStore implements SessionStorePort {
       return { kind: "conflict", code: "event_sequence_conflict" };
     }
     const event = input.terminalEvent;
+    assertPersistableNewEvent(event);
     if (
       event.schemaVersion !== "meliora.session-event.v1"
       || event.kind !== `run_${input.terminalStatus}`
@@ -312,10 +335,6 @@ export class SqliteSessionStore implements SessionStorePort {
     ) {
       return { kind: "conflict", code: "command_status_conflict" };
     }
-    assertValidGeneratedId(event.eventId);
-    requireTimestamp(event.createdAt, "terminalEvent.createdAt");
-    assertPersistableJson(event.payload, "terminal_event.payload");
-
     return this.db.transaction((): SettleRunCommandWithTerminalEventResult => {
       const commandRow = this.db.prepare(
         "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
@@ -329,12 +348,7 @@ export class SqliteSessionStore implements SessionStorePort {
       const attempt = this.db.prepare(
         "SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?",
       ).get(input.runId, input.attemptId) as Row;
-      const expectedEvent: StoredEvent = {
-        ...event,
-        runId: input.runId,
-        attemptId: input.attemptId,
-        sequence: input.expectedSequence + 1,
-      };
+      const expectedEvent = toStoredEvent(event, input.runId, input.attemptId, input.expectedSequence + 1);
       const eventRow = this.db.prepare("SELECT * FROM events WHERE event_id=?")
         .get(event.eventId) as Row | undefined;
 
@@ -383,6 +397,124 @@ export class SqliteSessionStore implements SessionStorePort {
     }).immediate();
   }
 
+  async recoverAndSettleRunCommandWithTerminalEvent(
+    input: RecoverAndSettleRunCommandWithTerminalEventInput,
+  ): Promise<RecoverAndSettleRunCommandWithTerminalEventResult> {
+    this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedActiveAttemptId);
+    assertValidSafeCode(input.terminalCode);
+    requireTimestamp(input.updatedAt, "updatedAt");
+    if (input.expectedCommandStatus !== "dispatched") return { kind: "conflict", code: "command_status_conflict" };
+    const recovery = input.recoveryAttempt;
+    assertValidGeneratedId(recovery.attemptId);
+    assertValidGeneratedId(recovery.ownerId);
+    assertPersistableText(recovery.attemptId, "recovery_attempt.attemptId");
+    assertPersistableText(recovery.ownerId, "recovery_attempt.ownerId");
+    requireTimestamp(recovery.createdAt, "recoveryAttempt.createdAt");
+    requireTimestamp(recovery.requestedAt, "recoveryAttempt.requestedAt");
+    this.requireTtl(recovery.ttlMs);
+    if (!Number.isInteger(input.expectedLatestAttemptNumber) || input.expectedLatestAttemptNumber < 1
+      || !Number.isInteger(input.expectedSequence) || input.expectedSequence < 0
+      || recovery.runId !== input.runId || recovery.expectedLatestAttemptNumber !== input.expectedLatestAttemptNumber) return { kind: "conflict", code: "run_attempt_conflict" };
+    const event = input.terminalEvent;
+    assertPersistableNewEvent(event);
+    if (event.schemaVersion !== "meliora.session-event.v1" || event.kind !== "run_blocked" || event.visibility !== "public") {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (Object.keys(event).some((key) => !RECOVERY_TERMINAL_EVENT_KEYS.has(key))) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (recovery.createdAt !== recovery.requestedAt || recovery.createdAt !== input.updatedAt || recovery.createdAt !== event.createdAt) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    const payload = event.payload;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)
+      || Object.keys(payload).sort().join(",") !== "code,message,userActions"
+      || (payload as { code?: unknown }).code !== input.terminalCode
+      || typeof (payload as { message?: unknown }).message !== "string"
+      || !Array.isArray((payload as { userActions?: unknown }).userActions)
+      || !(payload as { userActions: unknown[] }).userActions.every((action) => typeof action === "string")) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+
+    return this.db.transaction((): RecoverAndSettleRunCommandWithTerminalEventResult => {
+      const commandRow = this.db.prepare(
+        "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+      ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+      if (!commandRow) return { kind: "not_found", code: "run_command_not_found" };
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!run || commandRow.run_id !== input.runId
+        || run.active_attempt_id !== input.expectedActiveAttemptId
+        || run.latest_attempt_number !== input.expectedLatestAttemptNumber
+        || run.session_id !== recovery.sessionId || run.turn_id !== recovery.turnId) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const active = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, run.active_attempt_id) as Row | undefined;
+      if (!active || active.attempt_number !== input.expectedLatestAttemptNumber
+        || active.catalog_hash !== recovery.catalogHash || active.intent_revision !== recovery.intentRevision
+        || !!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, recovery.attemptId)) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const activeLease = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND expires_at>?")
+        .get(input.runId, this.clock().toISOString()) as Row | undefined;
+      if (activeLease) return { kind: "conflict", code: "lease_held" };
+      if (commandRow.status !== input.expectedCommandStatus || Date.parse(input.updatedAt) < Date.parse(commandRow.updated_at)) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+      if (active.last_event_sequence !== input.expectedSequence) {
+        return { kind: "conflict", code: "event_sequence_conflict", currentSequence: active.last_event_sequence };
+      }
+      if (this.db.prepare("SELECT 1 FROM events WHERE event_id=?").get(event.eventId)) {
+        return { kind: "conflict", code: "command_status_conflict" };
+      }
+      const attemptNumber = run.latest_attempt_number + 1;
+      const expectedEvent: StoredEvent = {
+        schemaVersion: event.schemaVersion,
+        eventId: event.eventId,
+        runId: input.runId,
+        attemptId: recovery.attemptId,
+        sequence: input.expectedSequence + 1,
+        kind: event.kind,
+        visibility: event.visibility,
+        payload: event.payload,
+        createdAt: event.createdAt,
+      };
+      const leaseToken = this.nonce();
+      const expiresAt = new Date(this.clock().getTime() + recovery.ttlMs).toISOString();
+      this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+        recovery.attemptId, input.runId, run.session_id, run.turn_id, attemptNumber, "created", expectedEvent.sequence,
+        active.catalog_hash, active.intent_revision, "null", recovery.createdAt, input.updatedAt,
+      );
+      this.onRecoveryAtomicWrite?.("attempt");
+      this.db.prepare("UPDATE runs SET active_attempt_id=?,latest_attempt_number=?,updated_at=? WHERE run_id=?").run(
+        recovery.attemptId, attemptNumber, recovery.createdAt, input.runId,
+      );
+      this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?)").run(
+        input.runId, recovery.attemptId, recovery.ownerId, hashBytes(leaseToken), expiresAt,
+      );
+      this.onRecoveryAtomicWrite?.("lease");
+      const payload = canonicalJson(expectedEvent.payload);
+      this.db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+        expectedEvent.eventId, expectedEvent.runId, expectedEvent.attemptId, expectedEvent.sequence,
+        expectedEvent.schemaVersion, expectedEvent.kind, expectedEvent.visibility, payload,
+        hashBytes(json(expectedEvent)), expectedEvent.createdAt, expectedEvent.causationId ?? null, expectedEvent.correlationId ?? null,
+      );
+      this.onRecoveryAtomicWrite?.("event");
+      const commandUpdate = this.db.prepare(`
+        UPDATE run_commands SET status='terminal',terminal_status='blocked',terminal_code=?,updated_at=?,terminal_at=?
+        WHERE run_id=? AND status='dispatched'
+      `).run(input.terminalCode, input.updatedAt, input.updatedAt, input.runId);
+      if (commandUpdate.changes !== 1) throw new StoreIntegrityError("recovery_command_cas_conflict");
+      this.onRecoveryAtomicWrite?.("command");
+      const command = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(input.runId) as Row;
+      const attempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, recovery.attemptId) as Row;
+      return { kind: "settled", command: this.toRunCommand(command), event: expectedEvent, attempt: this.toAttempt(attempt) };
+    }).immediate();
+  }
+
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
     assertValidGeneratedId(input.sessionId);
     assertValidGeneratedId(input.turnId);
@@ -392,21 +524,33 @@ export class SqliteSessionStore implements SessionStorePort {
     return row ? this.toPrivateUserInput(row) : null;
   }
 
-  async listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage> {
+  async listRecoverableCommands(input: RecoveryCommandScanInput): Promise<RecoveryCommandPage> {
     this.requireRecoveryLimit(input.limit, 64, "invalid_recovery_command_limit");
+    if (input.afterCursor !== undefined) {
+      requireTimestamp(input.afterCursor.createdAt, "recoveryCursor.createdAt");
+      assertValidGeneratedId(input.afterCursor.runId);
+    }
+    const cursor = input.afterCursor;
     const rows = this.db.prepare(`
       SELECT run_id,attempt_id,status,created_at FROM run_commands
-      WHERE status != 'terminal'
-      ORDER BY created_at ASC, run_id ASC
+      WHERE status != 'terminal' AND (
+        ? IS NULL OR created_at COLLATE BINARY > ? OR (created_at = ? AND run_id COLLATE BINARY > ?)
+      )
+      ORDER BY created_at COLLATE BINARY ASC, run_id COLLATE BINARY ASC
       LIMIT ?
-    `).all(input.limit + 1) as Row[];
+    `).all(cursor?.createdAt ?? null, cursor?.createdAt ?? null, cursor?.createdAt ?? null, cursor?.runId ?? null, input.limit + 1) as Row[];
     const commands: RecoverableCommandRef[] = rows.slice(0, input.limit).map((row) => ({
       runId: row.run_id,
       initialAttemptId: row.attempt_id,
       status: row.status,
       createdAt: row.created_at,
     }));
-    return { commands, sweepComplete: rows.length <= input.limit };
+    const sweepComplete = rows.length <= input.limit;
+    return {
+      commands,
+      sweepComplete,
+      nextCursor: sweepComplete ? null : { createdAt: commands.at(-1)!.createdAt, runId: commands.at(-1)!.runId },
+    };
   }
 
   async readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult> {
@@ -650,9 +794,7 @@ export class SqliteSessionStore implements SessionStorePort {
 
   async appendEvents(input: AppendEventsInput): Promise<AppendEventsResult> {
     for (const event of input.events) {
-      requireId(event.eventId, "eventId");
-      requireTimestamp(event.createdAt, "event.createdAt");
-      assertPersistableJson(event.payload, "event.payload");
+      assertPersistableNewEvent(event);
     }
     return this.db.transaction((): AppendEventsResult => {
       const attempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
@@ -660,7 +802,7 @@ export class SqliteSessionStore implements SessionStorePort {
       const lease = this.leaseConflict(input.runId, input.attemptId, input.leaseToken);
       if (lease) return { kind: "conflict", code: lease };
       if (attempt.last_event_sequence !== input.expectedSequence) return { kind: "conflict", code: "event_sequence_conflict", currentSequence: attempt.last_event_sequence };
-      const events: StoredEvent[] = input.events.map((event, index) => ({ ...event, runId: input.runId, attemptId: input.attemptId, sequence: input.expectedSequence + index + 1 }));
+      const events = input.events.map((event, index) => toStoredEvent(event, input.runId, input.attemptId, input.expectedSequence + index + 1));
       for (const event of events) {
         const payload = canonicalJson(event.payload);
         this.db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(event.eventId, event.runId, event.attemptId, event.sequence, event.schemaVersion, event.kind, event.visibility, payload, hashBytes(json(event)), event.createdAt, event.causationId ?? null, event.correlationId ?? null);

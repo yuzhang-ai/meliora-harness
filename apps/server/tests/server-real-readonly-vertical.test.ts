@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import { deepseekStreamTextSingleToolFixture } from "../../../fixtures/contracts/v1/deepseek-stream-text-single-tool.js";
+import { listenOnFetchSafeLoopbackPort } from "../../../tests/helpers/fetch-safe-listener.js";
 import { publicRunEventReplays } from "../../../fixtures/contracts/v1/public-run-event-replays.js";
 import {
   PUBLIC_RUN_EVENT_SCHEMA_VERSION,
@@ -216,11 +217,7 @@ const startFakeProvider = async (
       response.end(error instanceof Error ? error.message : "fixture provider failed");
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = (server.address() as AddressInfo).port;
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
     origin: `http://127.0.0.1:${port}`,
     captured,
@@ -276,11 +273,7 @@ const startFailingProvider = async (scenario: ProviderFailureScenario) => {
       response.end(error instanceof Error ? error.message : "fixture provider failed");
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = (server.address() as AddressInfo).port;
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
     origin: `http://127.0.0.1:${port}`,
     captured,
@@ -302,20 +295,7 @@ const startApp = async (
     resolveLocalPrincipalId: () => "local-user",
     pollIntervalMs: 10,
   });
-  let port: number | undefined;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", resolve);
-    });
-    const candidate = (server.address() as AddressInfo).port;
-    if (candidate !== 6000) {
-      port = candidate;
-      break;
-    }
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  }
-  if (port === undefined) throw new Error("could_not_allocate_fetch_safe_loopback_port");
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
     url: `http://127.0.0.1:${port}`,
     close: async () => {
