@@ -595,6 +595,10 @@ export class SqliteSessionStore implements SessionStorePort {
       const attemptCount = (this.db.prepare("SELECT COUNT(*) AS count FROM run_attempts WHERE run_id=?")
         .get(input.runId) as Row).count as number;
       if (!initialAttempt || initialAttempt.attempt_number !== 1
+        // Attempt #1 is written by this adapter as the canonical literal
+        // `null`. A parse-only check would let noncanonical / damaged storage
+        // masquerade as the proven pristine pre-dispatch state.
+        || initialAttempt.status !== "created" || initialAttempt.runtime_state_json !== "null"
         || initialAttempt.session_id !== run.session_id || initialAttempt.turn_id !== run.turn_id
         || initialAttempt.catalog_hash !== recovery.catalogHash || initialAttempt.intent_revision !== recovery.intentRevision
         || !session || session.session_id !== run.session_id || session.workspace_id !== commandRow.workspace_id

@@ -73,6 +73,36 @@ const adapters: readonly [string, (now: () => number, t: TestContext) => Store][
   ["sqlite", (now, t) => new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(now()) })],
 ];
 
+// A rejected claim must not mint an Attempt/lease, move Run authority, alter
+// the Command, or touch the event log. Keep this adapter-private snapshot
+// deliberately narrow so the assertion covers exactly that authority set.
+const recoveryAuthoritySnapshot = (store: Store): unknown => {
+  if (store instanceof MemorySessionStore) {
+    const raw = store as unknown as {
+      attempts: Map<string, unknown>;
+      runs: Map<string, unknown>;
+      leases: Map<string, unknown>;
+      commands: Map<string, unknown>;
+      events: Map<string, unknown>;
+    };
+    return structuredClone({
+      attempts: [...raw.attempts.entries()],
+      runs: [...raw.runs.entries()],
+      leases: [...raw.leases.entries()],
+      commands: [...raw.commands.entries()],
+      events: [...raw.events.entries()],
+    });
+  }
+  const db = (store as unknown as { db: Database.Database }).db;
+  return {
+    attempts: db.prepare("SELECT * FROM run_attempts WHERE run_id=? ORDER BY attempt_number").all("run"),
+    runs: db.prepare("SELECT * FROM runs WHERE run_id=?").all("run"),
+    leases: db.prepare("SELECT * FROM run_leases WHERE run_id=? ORDER BY attempt_id").all("run"),
+    commands: db.prepare("SELECT * FROM run_commands WHERE run_id=?").all("run"),
+    events: db.prepare("SELECT * FROM events WHERE run_id=? ORDER BY sequence").all("run"),
+  };
+};
+
 for (const [name, create] of adapters) {
   for (const [status, prefix] of [
     ["reserved", []],
@@ -100,7 +130,7 @@ for (const [name, create] of adapters) {
         assert.equal(bundle.bundle.activeAttempt.attemptId, "attempt-recovered");
         assert.equal(bundle.bundle.latestAttemptNumber, 2);
         assert.equal((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events.length, prefix.length);
-      } finally { store.close?.(); }
+      } finally { (store as Store).close?.(); }
     });
   }
 
@@ -286,6 +316,62 @@ for (const [name, create] of adapters) {
     });
   }
 }
+
+// `created + null` is part of the proof that Attempt #1 never crossed the
+// outbound boundary. Both drifts must fail before the atomic claim writes any
+// replacement authority. The nested loops intentionally produce four attacks:
+// status/runtimeState across Memory and SQLite.
+for (const [name, create] of adapters) {
+  for (const drift of ["status", "runtime_state"] as const) {
+    test(`${name} C.2a rejects initial Attempt ${drift} drift without writes`, async (t) => {
+      let current = Date.parse(timestamp());
+      const now = () => new Date(current).toISOString();
+      const store = create(() => current, t);
+      try {
+        await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted");
+        if (store instanceof MemorySessionStore) {
+          const raw = store as unknown as {
+            attempts: Map<string, { status: string; runtimeState: unknown }>;
+          };
+          const initial = raw.attempts.get("run\u0000attempt-initial");
+          assert.ok(initial);
+          raw.attempts.set("run\u0000attempt-initial", drift === "status"
+            ? { ...initial, status: "executing" }
+            : { ...initial, runtimeState: { phase: "tampered" } });
+        } else {
+          const db = (store as unknown as { db: Database.Database }).db;
+          if (drift === "status") {
+            db.prepare("UPDATE run_attempts SET status=? WHERE run_id=? AND attempt_id=?").run("executing", "run", "attempt-initial");
+          } else {
+            db.prepare("UPDATE run_attempts SET runtime_state_json=? WHERE run_id=? AND attempt_id=?")
+              .run('{"phase":"tampered"}', "run", "attempt-initial");
+          }
+        }
+        const before = recoveryAuthoritySnapshot(store);
+        assert.deepEqual(await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 0, now)), { kind: "conflict", code: "initial_recovery_not_safe" });
+        assert.deepEqual(recoveryAuthoritySnapshot(store), before);
+      } finally { (store as Store).close?.(); }
+    });
+  }
+}
+
+// SQLite stores the pristine runtime state as the exact canonical JSON text
+// `null`. Semantic JSON equivalence is insufficient here: whitespace is a
+// storage drift signal and must also leave all authority rows untouched.
+test("sqlite C.2a rejects noncanonical null runtime state without writes", async (t) => {
+  let current = Date.parse(timestamp());
+  const now = () => new Date(current).toISOString();
+  const store = new SqliteSessionStore(createTempDatabase(t), { clock: () => new Date(current) });
+  try {
+    await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted");
+    const db = (store as unknown as { db: Database.Database }).db;
+    db.prepare("UPDATE run_attempts SET runtime_state_json=? WHERE run_id=? AND attempt_id=?")
+      .run(" null ", "run", "attempt-initial");
+    const before = recoveryAuthoritySnapshot(store);
+    assert.deepEqual(await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 0, now)), { kind: "conflict", code: "initial_recovery_not_safe" });
+    assert.deepEqual(recoveryAuthoritySnapshot(store), before);
+  } finally { store.close(); }
+});
 
 const faultyAdapters: readonly [string, (now: () => number, stage: "takeover_attempt" | "takeover_lease" | "takeover_run", t: TestContext) => Store][] = [
   ["memory", (now, stage) => new MemorySessionStore({

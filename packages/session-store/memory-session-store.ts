@@ -663,6 +663,7 @@ export class MemorySessionStore implements SessionStorePort {
       || run.latestAttemptNumber !== 1
       || initialAttempt.attemptId !== input.expectedInitialAttemptId
       || initialAttempt.attemptNumber !== 1
+      || initialAttempt.status !== "created" || initialAttempt.runtimeState !== null
       || command.sessionId !== run.sessionId || command.turnId !== run.turnId
       || initialAttempt.sessionId !== run.sessionId || initialAttempt.turnId !== run.turnId
       || recovery.sessionId !== run.sessionId || recovery.turnId !== run.turnId
