@@ -18,6 +18,7 @@ import type {
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
   RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage, RecoveryCommandScanInput,
   RecoverAndSettleRunCommandWithTerminalEventInput, RecoverAndSettleRunCommandWithTerminalEventResult,
+  ClaimInitialPreDispatchRunCommandForRecoveryInput, ClaimInitialPreDispatchRunCommandForRecoveryResult,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
@@ -40,6 +41,7 @@ import {
   assertValidSafeCode,
   assertValidWorkspaceId,
   canTransitionRunCommand,
+  canonicalRunCommandRequestHash,
   privateUserInputContentHash,
 } from "../run-command-contract.js";
 import { IdempotencyConflictError, SequenceConflictError, StoreIntegrityError } from "./errors.js";
@@ -62,6 +64,35 @@ const LATEST_MIGRATION_VERSION = MIGRATIONS.at(-1)!.version;
 const RECOVERY_TERMINAL_EVENT_KEYS = new Set([
   "schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt",
 ]);
+const INITIAL_PRE_DISPATCH_STATUSES = ["preparing", "model_streaming"] as const;
+
+/** Mirrors the ReadOnlyRunLoop's exact durable prefix before startModelStep. */
+const hasOnlyInitialPreDispatchPrefix = (
+  events: readonly StoredEvent[],
+  runId: string,
+  attemptId: string,
+  commandStatus: "reserved" | "accepted",
+  expectedSequence: number,
+): boolean => {
+  if (events.length !== expectedSequence || events.length > INITIAL_PRE_DISPATCH_STATUSES.length) return false;
+  if (commandStatus === "reserved" && events.length !== 0) return false;
+  return events.every((event, index) => {
+    const payload = event.payload;
+    return event.schemaVersion === "meliora.session-event.v1"
+      && event.runId === runId
+      && event.attemptId === attemptId
+      && event.sequence === index + 1
+      && event.kind === "run_status_changed"
+      && event.visibility === "public"
+      && event.causationId === undefined
+      && event.correlationId === undefined
+      && typeof payload === "object"
+      && payload !== null
+      && !Array.isArray(payload)
+      && Object.keys(payload).length === 1
+      && (payload as { status?: unknown }).status === INITIAL_PRE_DISPATCH_STATUSES[index];
+  });
+};
 const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
   schemaVersion: event.schemaVersion,
   eventId: event.eventId,
@@ -81,7 +112,7 @@ type Options = Readonly<{
   /** Test-only adapter hook; transaction rollback is the production guarantee. */
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
   /** Test-only fault injector; SQLite transaction rollback is the guarantee. */
-  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command") => void;
+  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command" | "takeover_attempt" | "takeover_lease" | "takeover_run") => void;
 }>;
 type LeaseConflict = "lease_not_held" | "lease_expired";
 type Row = Record<string, any>;
@@ -512,6 +543,127 @@ export class SqliteSessionStore implements SessionStorePort {
       const attempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
         .get(input.runId, recovery.attemptId) as Row;
       return { kind: "settled", command: this.toRunCommand(command), event: expectedEvent, attempt: this.toAttempt(attempt) };
+    }).immediate();
+  }
+
+  async claimInitialPreDispatchRunCommandForRecovery(
+    input: ClaimInitialPreDispatchRunCommandForRecoveryInput,
+  ): Promise<ClaimInitialPreDispatchRunCommandForRecoveryResult> {
+    this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedInitialAttemptId);
+    if (input.expectedLatestAttemptNumber !== 1 || (input.expectedCommandStatus !== "reserved" && input.expectedCommandStatus !== "accepted")) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    if (!Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "event_sequence_conflict" };
+    }
+    const recovery = input.recoveryAttempt;
+    assertValidGeneratedId(recovery.attemptId);
+    assertValidGeneratedId(recovery.ownerId);
+    assertPersistableText(recovery.attemptId, "recovery_attempt.attemptId");
+    assertPersistableText(recovery.ownerId, "recovery_attempt.ownerId");
+    requireTimestamp(recovery.createdAt, "recoveryAttempt.createdAt");
+    requireTimestamp(recovery.requestedAt, "recoveryAttempt.requestedAt");
+    this.requireTtl(recovery.ttlMs);
+    if (recovery.runId !== input.runId
+      || recovery.expectedLatestAttemptNumber !== 1
+      || recovery.attemptId === input.expectedInitialAttemptId
+      || recovery.createdAt !== recovery.requestedAt) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+
+    return this.db.transaction((): ClaimInitialPreDispatchRunCommandForRecoveryResult => {
+      const commandRow = this.db.prepare(
+        "SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?",
+      ).get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+      if (!commandRow) return { kind: "not_found", code: "run_command_not_found" };
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!run || commandRow.run_id !== input.runId
+        || commandRow.attempt_id !== input.expectedInitialAttemptId
+        || run.active_attempt_id !== input.expectedInitialAttemptId
+        || run.latest_attempt_number !== 1
+        || commandRow.session_id !== run.session_id || commandRow.turn_id !== run.turn_id
+        || recovery.sessionId !== run.session_id || recovery.turnId !== run.turn_id) {
+        return { kind: "conflict", code: "run_attempt_conflict" };
+      }
+      const initialAttempt = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, input.expectedInitialAttemptId) as Row | undefined;
+      const session = this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(run.session_id) as Row | undefined;
+      const turn = this.db.prepare("SELECT * FROM turns WHERE turn_id=?").get(run.turn_id) as Row | undefined;
+      const privateInput = this.db.prepare("SELECT * FROM run_command_inputs WHERE run_id=?").get(input.runId) as Row | undefined;
+      const attemptCount = (this.db.prepare("SELECT COUNT(*) AS count FROM run_attempts WHERE run_id=?")
+        .get(input.runId) as Row).count as number;
+      if (!initialAttempt || initialAttempt.attempt_number !== 1
+        || initialAttempt.session_id !== run.session_id || initialAttempt.turn_id !== run.turn_id
+        || initialAttempt.catalog_hash !== recovery.catalogHash || initialAttempt.intent_revision !== recovery.intentRevision
+        || !session || session.session_id !== run.session_id || session.workspace_id !== commandRow.workspace_id
+        || session.created_at !== commandRow.created_at || session.updated_at !== commandRow.created_at
+        || !turn || turn.turn_id !== run.turn_id || turn.session_id !== run.session_id || turn.intent_revision !== initialAttempt.intent_revision
+        || turn.created_at !== commandRow.created_at || turn.updated_at !== commandRow.created_at
+        || !privateInput || privateInput.schema_version !== "meliora.private-user-input.v1"
+        || privateInput.session_id !== run.session_id || privateInput.turn_id !== run.turn_id
+        || privateInput.role !== "user" || privateInput.visibility !== "private"
+        || privateInput.created_at !== commandRow.created_at || privateInput.content_hash !== privateUserInputContentHash(privateInput.content)
+        || commandRow.canonical_request_hash !== canonicalRunCommandRequestHash({ workspaceId: commandRow.workspace_id, message: privateInput.content })
+        || run.created_at !== commandRow.created_at || initialAttempt.created_at !== commandRow.created_at
+        || this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, recovery.attemptId)) {
+        return { kind: "conflict", code: "initial_recovery_not_safe" };
+      }
+      if (commandRow.status !== input.expectedCommandStatus) return { kind: "conflict", code: "command_status_conflict" };
+      if (Date.parse(recovery.createdAt) < Date.parse(commandRow.updated_at)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+
+      // A crash can happen between durable reservation and the first lease
+      // acquisition, so no initial lease is a valid no-worker proof. A lease
+      // row with an invalid timestamp is data drift, while a live lease on
+      // any Attempt of the Run is still authoritative.
+      const leaseRows = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=?")
+        .all(input.runId) as Row[];
+      for (const lease of leaseRows) {
+        const expiresAt = Date.parse(lease.expires_at);
+        if (!Number.isFinite(expiresAt)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+        if (expiresAt > this.clock().getTime()) return { kind: "conflict", code: "lease_held" };
+      }
+      if (attemptCount !== 1) return { kind: "conflict", code: "initial_recovery_not_safe" };
+      if (initialAttempt.last_event_sequence !== input.expectedSequence) {
+        return { kind: "conflict", code: "event_sequence_conflict", currentSequence: initialAttempt.last_event_sequence };
+      }
+
+      const eventRows = this.db.prepare("SELECT * FROM events WHERE run_id=? ORDER BY sequence ASC")
+        .all(input.runId) as Row[];
+      const events = eventRows.map((row) => this.toEvent(row));
+      const hasUnsafeHistory =
+        this.db.prepare("SELECT 1 FROM model_steps WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM model_step_terminal_results WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM run_snapshots WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM run_snapshot_history WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM invocations WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM receipts WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM receipt_public_event_bindings WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM staged_public_artifact_provenance WHERE run_id=? LIMIT 1").get(input.runId) !== undefined;
+      if (!hasOnlyInitialPreDispatchPrefix(events, input.runId, input.expectedInitialAttemptId, input.expectedCommandStatus, input.expectedSequence)
+        || hasUnsafeHistory) return { kind: "conflict", code: "initial_recovery_not_safe" };
+
+      const attemptNumber = 2;
+      const leaseToken = this.nonce();
+      const expiresAt = new Date(this.clock().getTime() + recovery.ttlMs).toISOString();
+      this.db.prepare("INSERT INTO run_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+        recovery.attemptId, input.runId, run.session_id, run.turn_id, attemptNumber, "created", input.expectedSequence,
+        initialAttempt.catalog_hash, initialAttempt.intent_revision, "null", recovery.createdAt, recovery.createdAt,
+      );
+      this.onRecoveryAtomicWrite?.("takeover_attempt");
+      this.db.prepare("UPDATE runs SET active_attempt_id=?,latest_attempt_number=?,updated_at=? WHERE run_id=?").run(
+        recovery.attemptId, attemptNumber, recovery.createdAt, input.runId,
+      );
+      this.onRecoveryAtomicWrite?.("takeover_run");
+      this.db.prepare("INSERT INTO run_leases VALUES (?,?,?,?,?)").run(
+        input.runId, recovery.attemptId, recovery.ownerId, hashBytes(leaseToken), expiresAt,
+      );
+      this.onRecoveryAtomicWrite?.("takeover_lease");
+      const command = this.toRunCommand(commandRow);
+      const attemptRow = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, recovery.attemptId) as Row;
+      return { kind: "claimed", command, attempt: this.toAttempt(attemptRow), lease: { leaseToken, expiresAt } };
     }).immediate();
   }
 

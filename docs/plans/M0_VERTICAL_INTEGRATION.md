@@ -121,6 +121,15 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 
 验收：Memory/SQLite 原子 rollback、lease/CAS race、cursor tail reach、Model/Host exactly-once 和 Server 已有 SSE 对 blocked event 的只读复现通过。
 
+#### WP-3C.2a：initial pre-dispatch Store claim（施工中）
+
+- 先只冻结一条 Store-only 原子接管：它不扫描/调度所有 command，不调用 Provider、Host、Server worker 或 SSE。
+- 仅完整证明 Command 仍为初始 Attempt #1 的 `reserved / accepted` 且尚未抵达 `startModelStep` 时，才可在 Store 内创建新的 Attempt #2 与新 lease。初始 Attempt 不可复用，Command 状态与既有事件不由该操作改变。
+- `accepted` 仅允许 ReadOnlyRunLoop 在 checkpoint 前真实会写出的空、`preparing`、`preparing -> model_streaming` 前缀；`reserved` 仅允许空前缀。任意 checkpoint、snapshot/history、invocation、receipt、terminal/unknown event 或 identity drift 都拒绝。
+- reservation 后尚未 acquire lease 的崩溃可以接管；若有任意同 Run lease，必须全部有效可解析且过期。活 lease、无效 lease、CAS race 或原子写故障都全不写。
+
+验收：Memory/SQLite 双 adapter 覆盖无 lease、已过期 lease、任意 Attempt 活 lease、NaN lease、允许/伪造 event prefix、invocation drift、故障 rollback 与并发单 winner；成功不产生 Provider/Host 调用、不追加 event、不将 Command dispatch。
+
 ### WP-4：Web live adapter
 
 Owner：张子恒；后端提供已冻结 API 和本地 fixture server。
