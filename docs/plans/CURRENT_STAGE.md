@@ -138,4 +138,4 @@ WP-A read-only runtime + WP-C store
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）与按需 public resume snapshot（PR #26，main `5bbc65dc`）已合并到 `main`；WP-3C.1 已获独立批准。当前隔离施工 WP-3C.2a：先完成 Store-only 的 initial pre-dispatch 原子 claim；其后才分别推进 C.2b scheduler/安全继续派发、WP-3D snapshot→exact public resumePoint→SSE restart，以及 Web live。C/D 尚未完成。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）与按需 public resume snapshot（PR #26，main `5bbc65dc`）已合并到 `main`；WP-3C.1、C.2a 已获独立批准。当前隔离施工 WP-3C.2b：初始 pre-dispatch 的显式安全继续、Attempt #2 唯一执行权及 worker 前二次崩溃的 #2 lease 重领；不含通用 snapshot/history 续跑、旧 invocation adoption、SSE reset/restart 或 Web live。C/D 尚未完成。

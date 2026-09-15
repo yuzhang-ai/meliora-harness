@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   ReadOnlyRunLoop,
+  createSafeRecoveryDispatcher,
   type ReadOnlyModelStepCheckpointGate,
   type ReadOnlyRunIds,
   type ReadOnlyRunModelPort,
@@ -117,7 +118,6 @@ export const createFrozenReadOnlyWorkspaceCatalog = (): ToolCatalogSnapshot => {
     definitions,
   };
 };
-
 const workspaceMap = (roots: WorkspaceRoots): ReadonlyMap<string, string> =>
   roots instanceof Map ? new Map(roots) : new Map(Object.entries(roots));
 
@@ -154,7 +154,7 @@ const toResponse = (
       }
     : { ...base, commandStatus: command.status };
 };
-
+// Intentionally exported without registration in read-only Server routes.
 const commandScope = (command: StoredRunCommand) => ({
   localPrincipalId: command.localPrincipalId,
   workspaceId: command.workspaceId,
@@ -333,6 +333,7 @@ export const createProviderBackedReadOnlyRunModel = (
 const settleCommand = async (
   store: SessionStorePort,
   command: StoredRunCommand,
+  authorityAttemptId: string,
   leaseToken: string,
   terminalStatus: "completed" | "blocked" | "failed" | "cancelled",
   code: string | undefined,
@@ -343,7 +344,7 @@ const settleCommand = async (
   await store.transitionRunCommand({
     ...commandScope(command),
     runId: latest.runId,
-    attemptId: latest.attemptId,
+    attemptId: authorityAttemptId,
     leaseToken,
     expectedStatus: latest.status,
     nextStatus: "terminal",
@@ -352,10 +353,10 @@ const settleCommand = async (
     updatedAt: now(),
   });
 };
-
 const appendWorkerFailureEvent = async (
   store: SessionStorePort,
   command: StoredRunCommand,
+  authorityAttemptId: string,
   leaseToken: string,
   code: string,
   message: string,
@@ -365,7 +366,7 @@ const appendWorkerFailureEvent = async (
   const sequence = await latestSequence(store, command.runId);
   await store.appendEvents({
     runId: command.runId,
-    attemptId: command.attemptId,
+    attemptId: authorityAttemptId,
     leaseToken,
     expectedSequence: sequence,
     events: [{
@@ -382,6 +383,7 @@ const appendWorkerFailureEvent = async (
 const settleOutcomeUnknown = async (
   store: SessionStorePort,
   command: StoredRunCommand,
+  authorityAttemptId: string,
   leaseToken: string,
   ids: TurnCommandIds,
   now: () => string,
@@ -403,7 +405,7 @@ const settleOutcomeUnknown = async (
     await store.settleRunCommandWithTerminalEvent({
       ...commandScope(latestCommand),
       runId: latestCommand.runId,
-      attemptId: latestCommand.attemptId,
+      attemptId: authorityAttemptId,
       leaseToken,
       expectedCommandStatus: latestCommand.status,
       expectedSequence: sequence,
@@ -515,32 +517,38 @@ const classifyInvocationRecoveryState = async (
   }
 };
 
-const runWorker = async (
+type WorkerAuthority = Readonly<{ attemptId: string; leaseToken?: string; continuation?: Readonly<{ status: "created" | "preparing" | "model_streaming"; sequence: 0 | 1 | 2 }> }>;
+
+export const runWorkerWithAuthority = async (
   options: Required<Omit<TurnCommandSubmitterOptions, "defer" | "ids">> & Readonly<{
     ids: TurnCommandIds;
     catalog: ToolCatalogSnapshot;
     workspaceRoots: ReadonlyMap<string, string>;
   }>,
   command: StoredRunCommand,
+  suppliedAuthority?: WorkerAuthority,
 ): Promise<void> => {
-  let leaseToken = "";
+  const authorityAttemptId = suppliedAuthority?.attemptId ?? command.attemptId;
+  let leaseToken = suppliedAuthority?.leaseToken ?? "";
   try {
+    if (!suppliedAuthority) {
     const lease = await options.store.acquireLease({
       runId: command.runId,
-      attemptId: command.attemptId,
+      attemptId: authorityAttemptId,
       ownerId: options.ownerId,
       ttlMs: options.leaseTtlMs,
       requestedAt: options.now(),
     });
     if (lease.kind !== "acquired") return;
     leaseToken = lease.leaseToken;
+    }
 
     const current = await options.store.readRunCommand(commandScope(command));
     if (!current || current.status === "terminal") return;
     if (current.status === "dispatched") {
       const invocationState = await classifyInvocationRecoveryState(options.store, current.runId);
       if (invocationState === "present") {
-        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
           code: TOOL_INVOCATION_OUTCOME_UNKNOWN_CODE,
           message: TOOL_INVOCATION_OUTCOME_UNKNOWN_MESSAGE,
           userActions: TOOL_INVOCATION_OUTCOME_UNKNOWN_ACTIONS,
@@ -556,7 +564,7 @@ const runWorker = async (
         // model step/Command terminal write completed. Do not silently leave
         // this Command dispatched and do not replay Host/Provider: atomically
         // make the recovery boundary visible instead.
-        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
           code: TOOL_RECEIPT_RECOVERY_REQUIRED_CODE,
           message: TOOL_RECEIPT_RECOVERY_REQUIRED_MESSAGE,
           userActions: TOOL_RECEIPT_RECOVERY_REQUIRED_ACTIONS,
@@ -565,7 +573,7 @@ const runWorker = async (
         return;
       }
       if (invocationState === "settled_unbound") {
-        await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+        await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
           code: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_CODE,
           message: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_MESSAGE,
           userActions: RECEIPT_PUBLIC_EVENT_BINDING_INVALID_ACTIONS,
@@ -574,7 +582,7 @@ const runWorker = async (
         return;
       }
       if (invocationState === "indeterminate") return;
-      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+      await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
         userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
@@ -586,7 +594,7 @@ const runWorker = async (
       const accepted = await options.store.transitionRunCommand({
         ...commandScope(command),
         runId: command.runId,
-        attemptId: command.attemptId,
+        attemptId: authorityAttemptId,
         leaseToken,
         expectedStatus: "reserved",
         nextStatus: "accepted",
@@ -600,8 +608,8 @@ const runWorker = async (
       turnId: command.turnId,
     });
     if (!input) {
-      await appendWorkerFailureEvent(options.store, command, leaseToken, "private_input_missing", "无法读取私有用户输入。", options.ids, options.now);
-      await settleCommand(options.store, command, leaseToken, "failed", "private_input_missing", options.now);
+      await appendWorkerFailureEvent(options.store, command, authorityAttemptId, leaseToken, "private_input_missing", "无法读取私有用户输入。", options.ids, options.now);
+      await settleCommand(options.store, command, authorityAttemptId, leaseToken, "failed", "private_input_missing", options.now);
       return;
     }
 
@@ -638,11 +646,13 @@ const runWorker = async (
       workspaceId: command.workspaceId,
       turnId: command.turnId,
       runId: command.runId,
-      attemptId: command.attemptId,
+      attemptId: authorityAttemptId,
       intentRevision: options.intentRevision,
       catalog: options.catalog,
       userMessage: input.content,
       precreated: { leaseToken },
+      executionAuthority: { attemptId: authorityAttemptId, leaseToken },
+      ...(suppliedAuthority?.continuation === undefined ? {} : { initialPreDispatchContinuation: suppliedAuthority.continuation }),
       maxModelSteps: options.maxModelSteps,
     });
     const code = result.outcome.status === "completed"
@@ -652,7 +662,7 @@ const runWorker = async (
       // The Run Loop deliberately deferred these ambiguous-outcome terminal
       // events. Store writes the public terminal event and Command terminal
       // state together; failed settlement leaves both facts absent.
-      await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+      await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
         code,
         message: result.outcome.summary,
         userActions: result.outcome.userActions,
@@ -660,7 +670,7 @@ const runWorker = async (
       });
       return;
     }
-    await settleCommand(options.store, command, leaseToken, result.outcome.status, code, options.now);
+    await settleCommand(options.store, command, authorityAttemptId, leaseToken, result.outcome.status, code, options.now);
   } catch {
     if (leaseToken.length > 0) {
       if (await classifyInvocationRecoveryState(options.store, command.runId) !== "absent") {
@@ -669,7 +679,7 @@ const runWorker = async (
         // executing untouched until a later worker can read a complete bundle.
         return;
       }
-      if (await settleOutcomeUnknown(options.store, command, leaseToken, options.ids, options.now, {
+      if (await settleOutcomeUnknown(options.store, command, authorityAttemptId, leaseToken, options.ids, options.now, {
         code: MODEL_STEP_OUTCOME_UNKNOWN_CODE,
         message: MODEL_STEP_OUTCOME_UNKNOWN_MESSAGE,
         userActions: MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS,
@@ -678,9 +688,9 @@ const runWorker = async (
         .catch(() => false)) {
         return;
       }
-      await appendWorkerFailureEvent(options.store, command, leaseToken, "worker_failed", "后台执行失败。", options.ids, options.now)
+      await appendWorkerFailureEvent(options.store, command, authorityAttemptId, leaseToken, "worker_failed", "后台执行失败。", options.ids, options.now)
         .catch(() => undefined);
-      await settleCommand(options.store, command, leaseToken, "failed", "worker_failed", options.now)
+      await settleCommand(options.store, command, authorityAttemptId, leaseToken, "failed", "worker_failed", options.now)
         .catch(() => undefined);
     }
   }
@@ -737,9 +747,44 @@ export const createTurnCommandSubmitter = (
       return submissionError(409, reserve.code, false);
     }
     if (reserve.kind === "owner" || reserve.command.status !== "terminal") {
-      defer(() => runWorker(options, reserve.command));
+      defer(() => runWorkerWithAuthority(options, reserve.command));
     }
     const body = toResponse(reserve.kind === "owner" ? "created" : "replay", reserve.command);
     return { status: turnCommandHttpStatus(body), body };
   };
 };
+
+/**
+ * Explicit lifecycle hook for C.2b only.  Server construction and read
+ * routes never call this; an owner chooses when to sweep/dispatch one run.
+ */
+export const createSafeRecoveryTurnDispatcher = (inputOptions: TurnCommandSubmitterOptions) => {
+  const ids = inputOptions.ids ?? createDefaultTurnCommandIds();
+  const now = inputOptions.now ?? (() => new Date().toISOString());
+  const options = {
+    store: inputOptions.store,
+    workspaceRoots: workspaceMap(inputOptions.workspaceRoots),
+    model: inputOptions.model,
+    ids, now,
+    localPrincipalId: inputOptions.localPrincipalId ?? LOCAL_PRINCIPAL_ID,
+    ownerId: inputOptions.ownerId ?? WORKER_OWNER_ID,
+    policyVersion: inputOptions.policyVersion ?? POLICY_VERSION,
+    leaseTtlMs: inputOptions.leaseTtlMs ?? LEASE_TTL_MS,
+    intentRevision: inputOptions.intentRevision ?? INTENT_REVISION,
+    maxModelSteps: inputOptions.maxModelSteps ?? MAX_MODEL_STEPS,
+    catalog: createFrozenReadOnlyWorkspaceCatalog(),
+  } as const;
+  return createSafeRecoveryDispatcher({
+    store: options.store,
+    ownerId: options.ownerId,
+    leaseTtlMs: options.leaseTtlMs,
+    now: options.now,
+    nextAttemptId: options.ids.nextAttemptId,
+    execute: async ({ command, authority, continuation }) => runWorkerWithAuthority(options, command, {
+      attemptId: authority.attemptId,
+      leaseToken: authority.leaseToken,
+      continuation,
+    }),
+  });
+};
+// No implicit startup/read-route registration: callers invoke dispatchOne().

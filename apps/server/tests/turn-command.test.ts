@@ -28,6 +28,8 @@ import {
 import { createMelioraServer } from "../src/server.js";
 import {
   createDefaultTurnCommandIds,
+  createFrozenReadOnlyWorkspaceCatalog,
+  createSafeRecoveryTurnDispatcher,
   createTurnCommandSubmitter,
   type TurnCommandIds,
 } from "../src/turn-command-composition.js";
@@ -92,6 +94,55 @@ const sseEvents = (body: string): PublicRunEvent[] =>
   body.split("\n")
     .filter((line) => line.startsWith("data: "))
     .map((line) => JSON.parse(line.slice(6)) as PublicRunEvent);
+
+test("explicit C.2b dispatcher runs the real worker only under Attempt #2 authority", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "meliora-c2b-worker-"));
+  const workspaceRoot = join(parent, "workspace");
+  const databasePath = join(parent, "meliora.sqlite");
+  await mkdir(workspaceRoot, { recursive: true });
+  let current = Date.parse(fixedNow);
+  const now = () => new Date(current).toISOString();
+  const store = new SqliteSessionStore(databasePath, { clock: () => new Date(current), nonce: (() => { let i = 0; return () => `nonce-${++i}`; })() });
+  const ids = deterministicIds();
+  let providerCalls = 0;
+  const options = {
+    store, workspaceRoots: new Map([[workspaceId, workspaceRoot]]), ids, now,
+    model: { next: async ({ modelStepId }: { modelStepId: string }) => {
+      providerCalls += 1;
+      return [
+        { schemaVersion: "meliora.model-event.v1" as const, modelStepId, streamIndex: 0, occurredAt: now(), kind: "assistant_text_delta" as const, delta: "private" },
+        { schemaVersion: "meliora.model-event.v1" as const, modelStepId, streamIndex: 1, occurredAt: now(), kind: "model_step_completed" as const, finishReason: "stop" as const },
+      ];
+    } },
+  };
+  try {
+    const reserved = await store.reserveRunCommand({
+      localPrincipalId: "local-user", workspaceId, idempotencyKey: "c2b-key",
+      canonicalRequestHash: canonicalRunCommandRequestHash({ workspaceId, message: "recover" }),
+      sessionId: "session-c2b", turnId: "turn-c2b", runId: "run-c2b", attemptId: "attempt-initial",
+      catalogHash: createFrozenReadOnlyWorkspaceCatalog().catalogHash, intentRevision: 1, userMessage: "recover", reservedAt: now(),
+    });
+    assert.equal(reserved.kind, "owner");
+    const oldLease = await store.acquireLease({ runId: "run-c2b", attemptId: "attempt-initial", ownerId: "old", ttlMs: 1_000, requestedAt: now() });
+    assert.equal(oldLease.kind, "acquired");
+    if (oldLease.kind !== "acquired") throw new Error("lease_expected");
+    assert.equal((await store.transitionRunCommand({
+      localPrincipalId: "local-user", workspaceId, idempotencyKey: "c2b-key", runId: "run-c2b", attemptId: "attempt-initial",
+      leaseToken: oldLease.leaseToken, expectedStatus: "reserved", nextStatus: "accepted", updatedAt: now(),
+    })).kind, "updated");
+    current += 1_001;
+    const dispatcher = createSafeRecoveryTurnDispatcher(options);
+    assert.equal((await dispatcher.dispatchOne({ localPrincipalId: "local-user", workspaceId, idempotencyKey: "c2b-key", runId: "run-c2b" })).kind, "dispatched");
+    assert.equal(providerCalls, 1);
+    const bundle = await store.readRecoveryBundle({ runId: "run-c2b", eventLimit: 32 });
+    assert.equal(bundle.kind, "found");
+    if (bundle.kind !== "found") throw new Error("bundle_expected");
+    assert.equal(bundle.bundle.activeAttempt.attemptNumber, 2);
+    assert.equal(bundle.bundle.latestModelStep?.attemptId, bundle.bundle.activeAttempt.attemptId);
+    assert.equal((await store.readEvents({ runId: "run-c2b", afterSequence: 0, limit: 32 })).events.every((event) => event.attemptId === bundle.bundle.activeAttempt.attemptId), true);
+    assert.equal((await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey: "c2b-key" }))?.status, "terminal");
+  } finally { store.close(); await rm(parent, { recursive: true, force: true }); }
+});
 
 test("POST /api/turns creates a durable read-only run and replays by idempotency key", async () => {
   const parent = await mkdtemp(join(tmpdir(), "meliora-server-turn-"));

@@ -48,6 +48,8 @@ import type {
   RecoverAndSettleRunCommandWithTerminalEventResult,
   ClaimInitialPreDispatchRunCommandForRecoveryInput,
   ClaimInitialPreDispatchRunCommandForRecoveryResult,
+  ReclaimInitialPreDispatchExecutionAuthorityInput,
+  ReclaimInitialPreDispatchExecutionAuthorityResult,
   RecoverableCommandRef,
   ReservationResult,
   ReserveRunCommandInput,
@@ -120,17 +122,22 @@ const INITIAL_PRE_DISPATCH_STATUSES = ["preparing", "model_streaming"] as const;
 const hasOnlyInitialPreDispatchPrefix = (
   events: readonly StoredEvent[],
   runId: string,
-  attemptId: string,
+  attemptId: string | readonly string[],
   commandStatus: "reserved" | "accepted",
   expectedSequence: number,
 ): boolean => {
   if (events.length !== expectedSequence || events.length > INITIAL_PRE_DISPATCH_STATUSES.length) return false;
   if (commandStatus === "reserved" && events.length !== 0) return false;
+  let enteredRecoveryAttempt = false;
   return events.every((event, index) => {
     const payload = event.payload;
     return event.schemaVersion === "meliora.session-event.v1"
       && event.runId === runId
-      && event.attemptId === attemptId
+      && (typeof attemptId === "string"
+        ? event.attemptId === attemptId
+        : event.attemptId === attemptId[1]
+          ? (enteredRecoveryAttempt = true)
+          : event.attemptId === attemptId[0] && !enteredRecoveryAttempt)
       && event.sequence === index + 1
       && event.kind === "run_status_changed"
       && event.visibility === "public"
@@ -143,6 +150,11 @@ const hasOnlyInitialPreDispatchPrefix = (
       && (payload as { status?: unknown }).status === INITIAL_PRE_DISPATCH_STATUSES[index];
   });
 };
+const continuationForPrefix = (sequence: number) => sequence === 0
+  ? { status: "created" as const, sequence: 0 as const }
+  : sequence === 1
+    ? { status: "preparing" as const, sequence: 1 as const }
+    : { status: "model_streaming" as const, sequence: 2 as const };
 const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
   schemaVersion: event.schemaVersion,
   eventId: event.eventId,
@@ -735,7 +747,83 @@ export class MemorySessionStore implements SessionStorePort {
       updatedAt: recovery.createdAt,
     });
     this.leases.set(attemptKey(input.runId, attempt.attemptId), lease);
-    return { kind: "claimed", command: deepCopy(command), attempt: deepCopy(attempt), lease: { leaseToken: lease.token, expiresAt: lease.expiresAt } };
+    return { kind: "claimed", command: deepCopy(command), attempt: deepCopy(attempt), lease: { leaseToken: lease.token, expiresAt: lease.expiresAt }, continuation: continuationForPrefix(input.expectedSequence) };
+  }
+
+  async reclaimInitialPreDispatchExecutionAuthority(
+    input: ReclaimInitialPreDispatchExecutionAuthorityInput,
+  ): Promise<ReclaimInitialPreDispatchExecutionAuthorityResult> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedInitialAttemptId);
+    assertValidGeneratedId(input.expectedActiveAttemptId);
+    assertValidGeneratedId(input.ownerId);
+    assertPersistableText(input.ownerId, "reclaim.ownerId");
+    assertValidCommandTimestamp(input.requestedAt);
+    this.requireTtl(input.ttlMs);
+    if (input.expectedLatestAttemptNumber !== 2
+      || input.expectedActiveAttemptId === input.expectedInitialAttemptId
+      || (input.expectedCommandStatus !== "reserved" && input.expectedCommandStatus !== "accepted")
+      || !Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    const command = this.commands.get(commandScopeKey(input));
+    if (!command) return { kind: "not_found", code: "run_command_not_found" };
+    const run = this.runs.get(input.runId);
+    const initial = this.attemptForRun(input.runId, input.expectedInitialAttemptId);
+    const active = this.attemptForRun(input.runId, input.expectedActiveAttemptId);
+    const session = run ? this.sessions.get(run.sessionId) : undefined;
+    const turn = run ? this.turns.get(run.turnId) : undefined;
+    const privateInput = run ? this.privateUserInputs.get(run.turnId) : undefined;
+    const attempts = [...this.attempts.values()].filter((attempt) => attempt.runId === input.runId);
+    if (!run || !initial || !active
+      || command.runId !== input.runId || command.initialAttemptId !== input.expectedInitialAttemptId || command.attemptId !== input.expectedInitialAttemptId
+      || run.activeAttemptId !== input.expectedActiveAttemptId || run.latestAttemptNumber !== 2
+      || initial.attemptNumber !== 1 || active.attemptNumber !== 2
+      || initial.status !== "created" || active.status !== "created" || initial.runtimeState !== null || active.runtimeState !== null
+      || initial.sessionId !== run.sessionId || initial.turnId !== run.turnId || active.sessionId !== run.sessionId || active.turnId !== run.turnId
+      || command.sessionId !== run.sessionId || command.turnId !== run.turnId
+      || !session || session.sessionId !== run.sessionId || session.workspaceId !== command.workspaceId
+      || session.createdAt !== command.createdAt || session.updatedAt !== command.createdAt
+      || !turn || turn.turnId !== run.turnId || turn.sessionId !== run.sessionId || turn.intentRevision !== initial.intentRevision
+      || turn.createdAt !== command.createdAt || turn.updatedAt !== command.createdAt
+      || !privateInput || privateInput.schemaVersion !== "meliora.private-user-input.v1" || privateInput.sessionId !== run.sessionId || privateInput.turnId !== run.turnId
+      || privateInput.role !== "user" || privateInput.visibility !== "private" || privateInput.contentHash !== privateUserInputContentHash(privateInput.content)
+      || privateInput.createdAt !== command.createdAt || run.createdAt !== command.createdAt || initial.createdAt !== command.createdAt
+      || command.canonicalRequestHash !== canonicalRunCommandRequestHash({ workspaceId: command.workspaceId, message: privateInput.content })
+      || initial.catalogHash !== active.catalogHash || initial.intentRevision !== active.intentRevision
+      || attempts.length !== 2 || active.lastEventSequence !== input.expectedSequence) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    if (command.status !== input.expectedCommandStatus) return { kind: "conflict", code: "command_status_conflict" };
+    const events = this.events.get(input.runId) ?? [];
+    const initialEventHead = events.filter((event) => event.attemptId === initial.attemptId).at(-1)?.sequence ?? 0;
+    if (initial.lastEventSequence !== initialEventHead
+      || !hasOnlyInitialPreDispatchPrefix(events, input.runId, [initial.attemptId, active.attemptId], input.expectedCommandStatus, input.expectedSequence)
+      || [...this.modelSteps.values()].some((step) => step.runId === input.runId)
+      || this.snapshots.has(input.runId)
+      || [...this.terminalSnapshotHistory.values()].some((history) => history.snapshot.runId === input.runId)
+      || [...this.terminalModelStepResults.keys()].some((key) => key.startsWith(`${input.runId}\u0000`))
+      || [...this.invocations.values()].some((value) => value.runId === input.runId)
+      || [...this.receipts.values()].some((value) => value.runId === input.runId)
+      || [...this.receiptPublicEventBindings.values()].some((binding) => binding.events.some((event) => event.runId === input.runId))
+      || [...this.stagedPublicArtifacts.values()].some((artifact) => artifact.runId === input.runId)) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    const activeLeaseKey = attemptKey(input.runId, active.attemptId);
+    if (!this.leases.has(activeLeaseKey)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+    for (const [key, lease] of this.leases) {
+      if (!key.startsWith(`${input.runId}\u0000`) || !Number.isFinite(Date.parse(lease.expiresAt))) {
+        if (key.startsWith(`${input.runId}\u0000`)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+        continue;
+      }
+      if (!this.isExpired(lease)) return { kind: "conflict", code: "lease_held" };
+    }
+    const lease = this.newLease(input.ownerId, input.ttlMs);
+    this.leases.set(activeLeaseKey, lease);
+    return { kind: "reclaimed", command: deepCopy(command), attempt: deepCopy(active), lease: { leaseToken: lease.token, expiresAt: lease.expiresAt }, continuation: continuationForPrefix(input.expectedSequence) };
   }
 
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
@@ -1000,6 +1088,9 @@ export class MemorySessionStore implements SessionStorePort {
       };
     }
     const latestAttempt = this.attemptForRun(input.runId, run.activeAttemptId);
+    if (latestAttempt && this.isC2bPristineAttempt(input.runId, latestAttempt.attemptId)) {
+      return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run.latestAttemptNumber };
+    }
     if (
       !latestAttempt ||
       latestAttempt.attemptNumber !== run.latestAttemptNumber ||
@@ -1653,6 +1744,9 @@ export class MemorySessionStore implements SessionStorePort {
     if (!run || run.activeAttemptId !== input.attemptId) {
       return { kind: "conflict", code: "run_attempt_conflict" };
     }
+    if (this.isC2bPristineAttempt(input.runId, input.attemptId)) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
     const activeLease = this.activeLeaseForRun(input.runId);
     if (activeLease) return { kind: "held", expiresAt: activeLease.expiresAt };
     const lease = this.newLease(input.ownerId, input.ttlMs);
@@ -1696,6 +1790,23 @@ export class MemorySessionStore implements SessionStorePort {
   private attemptForRun(runId: string, attemptId: string): PersistedRunAttempt | null {
     const attempt = this.attempts.get(attemptKey(runId, attemptId));
     return attempt?.runId === runId ? attempt : null;
+  }
+
+  /** Generic lease/attempt APIs must not bypass C.2b's proof-bearing reclaim. */
+  private isC2bPristineAttempt(runId: string, attemptId: string): boolean {
+    const run = this.runs.get(runId);
+    const active = this.attemptForRun(runId, attemptId);
+    const key = this.commandScopeByRunId.get(runId);
+    const command = key === undefined ? undefined : this.commands.get(key);
+    if (!run || !active || !command || run.activeAttemptId !== attemptId || run.latestAttemptNumber !== 2
+      || active.attemptNumber !== 2
+      || (command.status !== "reserved" && command.status !== "accepted")) return false;
+    const initial = this.attemptForRun(runId, command.initialAttemptId);
+    // Broad recovery-attempt identity, not the reclaim proof: malformed
+    // history must close generic lease/attempt paths rather than reopen them.
+    return command.attemptId === command.initialAttemptId
+      && initial?.attemptNumber === 1
+      && initial.attemptId !== active.attemptId;
   }
 
   private isValidStagedPublicArtifact(provenance: StagedPublicArtifactProvenance): boolean {

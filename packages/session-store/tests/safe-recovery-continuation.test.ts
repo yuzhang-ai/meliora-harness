@@ -5,7 +5,7 @@ import type { SessionStorePort } from "../contracts.js";
 import { MemorySessionStore } from "../memory-session-store.js";
 import { canonicalRunCommandRequestHash } from "../run-command-contract.js";
 import { SqliteSessionStore } from "../src/sqlite-session-store.js";
-import { hashBytes } from "../src/integrity.js";
+import { canonicalJson, hashBytes } from "../src/integrity.js";
 import { createTempDatabase, timestamp } from "./helpers.js";
 
 type Store = SessionStorePort & Readonly<{ close?: () => void }>;
@@ -66,6 +66,19 @@ const claimInput = (status: "reserved" | "accepted", expectedSequence: number, n
     expectedLatestAttemptNumber: 1, catalogHash: "catalog", intentRevision: 1,
     createdAt: now(), requestedAt: now(), ownerId: "recovery-worker", ttlMs: 1_000,
   },
+});
+
+const reclaimInput = (status: "reserved" | "accepted", expectedSequence: number, now: () => string) => ({
+  ...scope,
+  runId: "run",
+  expectedInitialAttemptId: "attempt-initial",
+  expectedActiveAttemptId: "attempt-recovered",
+  expectedLatestAttemptNumber: 2 as const,
+  expectedCommandStatus: status,
+  expectedSequence,
+  ownerId: "recovery-worker-2",
+  ttlMs: 1_000,
+  requestedAt: now(),
 });
 
 const adapters: readonly [string, (now: () => number, t: TestContext) => Store][] = [
@@ -146,7 +159,7 @@ for (const [name, create] of adapters) {
         catalogHash: "catalog", intentRevision: 1, userMessage: "recover", reservedAt: now(),
       })).kind, "owner");
       assert.equal((await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("reserved", 0, now))).kind, "claimed");
-    } finally { store.close?.(); }
+    } finally { (store as Store).close?.(); }
 
     current = Date.parse(timestamp());
     const held = create(() => current, t);
@@ -159,6 +172,239 @@ for (const [name, create] of adapters) {
       assert.equal(bundle.kind, "found");
       if (bundle.kind === "found") assert.equal(bundle.bundle.activeAttempt.attemptId, "attempt-initial");
     } finally { held.close?.(); }
+  });
+}
+
+for (const [name, create] of adapters) {
+  for (const [firstPrefix, secondStatus, sequence] of [
+    [["preparing"], "model_streaming", 2],
+    [[], "preparing", 1],
+  ] as const) {
+    test(`${name} C.2b reclaims Attempt #2 after its own ${secondStatus} prefix without #3`, async (t) => {
+      let current = Date.parse(timestamp());
+      const now = () => new Date(current).toISOString();
+      const store = create(() => current, t);
+      try {
+        await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted", firstPrefix);
+      const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", firstPrefix.length, now));
+      assert.equal(claimed.kind, "claimed");
+      if (claimed.kind !== "claimed") throw new Error("claim_expected");
+      assert.deepEqual(await store.acquireLease({ runId: "run", attemptId: "attempt-recovered", ownerId: "bypass", ttlMs: 1_000, requestedAt: now() }), { kind: "conflict", code: "run_attempt_conflict" });
+      assert.deepEqual(await store.startModelStep({
+        runId: "run", attemptId: "attempt-recovered", leaseToken: "bypass-token", modelStepId: "bypass-step",
+        requestFingerprint: hashBytes("bypass"), startedAt: now(),
+      }), { kind: "conflict", code: "lease_not_held" });
+      assert.equal((await store.createRunAttempt({
+        sessionId: "session", turnId: "turn", runId: "run", attemptId: "attempt-illegal-third", expectedLatestAttemptNumber: 2,
+        catalogHash: "catalog", intentRevision: 1, ownerId: "bypass", ttlMs: 1_000, createdAt: now(), requestedAt: now(),
+      })).kind, "conflict");
+        assert.equal((await store.appendEvents({
+          runId: "run", attemptId: "attempt-recovered", leaseToken: claimed.lease.leaseToken, expectedSequence: firstPrefix.length,
+          events: [{ schemaVersion: "meliora.session-event.v1", eventId: `attempt-two-${secondStatus}`, kind: "run_status_changed", visibility: "public", payload: { status: secondStatus }, createdAt: now() }],
+        })).kind, "appended");
+        current += 1_001;
+        const reclaimed = await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", sequence, now));
+        assert.equal(reclaimed.kind, "reclaimed");
+        if (reclaimed.kind !== "reclaimed") throw new Error("reclaim_expected");
+        assert.equal(reclaimed.continuation.status, secondStatus);
+        const bundle = await store.readRecoveryBundle({ runId: "run", eventLimit: 8 });
+        assert.equal(bundle.kind, "found");
+        if (bundle.kind === "found") assert.equal(bundle.bundle.latestAttemptNumber, 2);
+      } finally { store.close?.(); }
+    });
+  }
+}
+
+for (const [name, create] of adapters) {
+  test(`${name} C.2b rejects a drifted #1 prefix watermark before reclaim`, async (t) => {
+    let current = Date.parse(timestamp());
+    const now = () => new Date(current).toISOString();
+    const store = create(() => current, t);
+    try {
+      await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted", ["preparing"]);
+      const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 1, now));
+      assert.equal(claimed.kind, "claimed");
+      if (claimed.kind !== "claimed") throw new Error("claim_expected");
+      assert.equal((await store.appendEvents({
+        runId: "run", attemptId: "attempt-recovered", leaseToken: claimed.lease.leaseToken, expectedSequence: 1,
+        events: [{ schemaVersion: "meliora.session-event.v1", eventId: "attempt-two-model", kind: "run_status_changed", visibility: "public", payload: { status: "model_streaming" }, createdAt: now() }],
+      })).kind, "appended");
+      if (store instanceof MemorySessionStore) {
+        const raw = store as unknown as { attempts: Map<string, { lastEventSequence: number }> };
+        const initial = raw.attempts.get("run\u0000attempt-initial")!;
+        raw.attempts.set("run\u0000attempt-initial", { ...initial, lastEventSequence: 0 });
+      } else {
+        const db = (store as unknown as { db: Database.Database }).db;
+        db.prepare("UPDATE run_attempts SET last_event_sequence=0 WHERE run_id=? AND attempt_id=?").run("run", "attempt-initial");
+      }
+      current += 1_001;
+      assert.deepEqual(await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", 2, now)), { kind: "conflict", code: "initial_recovery_not_safe" });
+    } finally { (store as Store).close?.(); }
+  });
+}
+
+// The recovery Attempt #2 is a closed window even when its evidence has
+// become unsafe.  Otherwise a malformed prefix could deliberately make the
+// proof fail and then reacquire a generic lease to start a Model Step.
+for (const [name, create] of adapters) {
+  test(`${name} C.2b unsafe Attempt #2 prefix cannot reopen generic execution`, async (t) => {
+    let current = Date.parse(timestamp());
+    const now = () => new Date(current).toISOString();
+    const store = create(() => current, t);
+    try {
+      await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted");
+      const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 0, now));
+      assert.equal(claimed.kind, "claimed");
+      if (claimed.kind !== "claimed") throw new Error("claim_expected");
+      assert.equal((await store.appendEvents({
+        runId: "run", attemptId: "attempt-recovered", leaseToken: claimed.lease.leaseToken, expectedSequence: 0,
+        events: [{ schemaVersion: "meliora.session-event.v1", eventId: "unsafe-attempt-two-prefix", kind: "run_status_changed", visibility: "public", payload: { status: "verifying" }, createdAt: now() }],
+      })).kind, "appended");
+      current += 1_001;
+      assert.deepEqual(await store.acquireLease({
+        runId: "run", attemptId: "attempt-recovered", ownerId: "bypass", ttlMs: 1_000, requestedAt: now(),
+      }), { kind: "conflict", code: "run_attempt_conflict" });
+      assert.deepEqual(await store.startModelStep({
+        runId: "run", attemptId: "attempt-recovered", leaseToken: "bypass-token", modelStepId: "bypass-step",
+        requestFingerprint: hashBytes("bypass"), startedAt: now(),
+      }), { kind: "conflict", code: "lease_not_held" });
+      assert.deepEqual(await store.createRunAttempt({
+        sessionId: "session", turnId: "turn", runId: "run", attemptId: "attempt-illegal-third", expectedLatestAttemptNumber: 2,
+        catalogHash: "catalog", intentRevision: 1, ownerId: "bypass", ttlMs: 1_000, createdAt: now(), requestedAt: now(),
+      }), { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: 2 });
+      assert.deepEqual(await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", 1, now)), {
+        kind: "conflict", code: "initial_recovery_not_safe",
+      });
+    } finally { store.close?.(); }
+  });
+}
+
+// Generic entry points identify the recovery window structurally, while the
+// reclaim primitive independently validates its proof.  Tampering any proof
+// field must therefore fail closed rather than make a generic lease available.
+for (const [name, create] of adapters) {
+  for (const [label, target, value] of [
+    ["#1 status", "attempt-initial", "failed"],
+    ["#1 runtime state", "attempt-initial", "{\"tampered\":true}"],
+    ["#2 status", "attempt-recovered", "failed"],
+    ["#2 runtime state", "attempt-recovered", "{\"tampered\":true}"],
+  ] as const) {
+    test(`${name} C.2b ${label} drift cannot reopen generic authority`, async (t) => {
+      let current = Date.parse(timestamp());
+      const now = () => new Date(current).toISOString();
+      const store = create(() => current, t);
+      try {
+        await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted");
+        const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 0, now));
+        assert.equal(claimed.kind, "claimed");
+        if (claimed.kind !== "claimed") throw new Error("claim_expected");
+        if (store instanceof MemorySessionStore) {
+          const raw = store as unknown as { attempts: Map<string, Record<string, unknown>> };
+          const key = `run\u0000${target}`;
+          const attempt = raw.attempts.get(key)!;
+          raw.attempts.set(key, {
+            ...attempt,
+            ...(label.includes("status") ? { status: value } : { runtimeState: JSON.parse(value) }),
+          });
+        } else {
+          const db = (store as unknown as { db: Database.Database }).db;
+          if (label.includes("status")) {
+            db.prepare("UPDATE run_attempts SET status=? WHERE run_id=? AND attempt_id=?").run(value, "run", target);
+          } else {
+            db.prepare("UPDATE run_attempts SET runtime_state_json=? WHERE run_id=? AND attempt_id=?").run(value, "run", target);
+          }
+        }
+        current += 1_001;
+        assert.deepEqual(await store.acquireLease({
+          runId: "run", attemptId: "attempt-recovered", ownerId: "bypass", ttlMs: 1_000, requestedAt: now(),
+        }), { kind: "conflict", code: "run_attempt_conflict" });
+        assert.deepEqual(await store.createRunAttempt({
+          sessionId: "session", turnId: "turn", runId: "run", attemptId: "attempt-illegal-third", expectedLatestAttemptNumber: 2,
+          catalogHash: "catalog", intentRevision: 1, ownerId: "bypass", ttlMs: 1_000, createdAt: now(), requestedAt: now(),
+        }), { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: 2 });
+      } finally { (store as Store).close?.(); }
+    });
+  }
+}
+
+// A recovery suffix may begin only once: #1 prefix events, followed by #2.
+// A corrupted #2 -> #1 ownership reversal must not pass the exact prefix
+// proof merely because both IDs belong to the same Run.
+for (const [name, create] of adapters) {
+  test(`${name} C.2b rejects reversed #2 to #1 prefix ownership`, async (t) => {
+    let current = Date.parse(timestamp());
+    const now = () => new Date(current).toISOString();
+    const store = create(() => current, t);
+    try {
+      await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted");
+      const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 0, now));
+      assert.equal(claimed.kind, "claimed");
+      if (claimed.kind !== "claimed") throw new Error("claim_expected");
+      assert.equal((await store.appendEvents({
+        runId: "run", attemptId: "attempt-recovered", leaseToken: claimed.lease.leaseToken, expectedSequence: 0,
+        events: [{ schemaVersion: "meliora.session-event.v1", eventId: "attempt-two-preparing", kind: "run_status_changed", visibility: "public", payload: { status: "preparing" }, createdAt: now() }],
+      })).kind, "appended");
+      if (store instanceof MemorySessionStore) {
+        const raw = store as unknown as {
+          attempts: Map<string, Record<string, unknown>>;
+          events: Map<string, Array<Record<string, unknown>>>;
+        };
+        const events = raw.events.get("run")!;
+        events.push({
+          ...events[0]!, eventId: "attempt-one-model-after-two", attemptId: "attempt-initial", sequence: 2,
+          payload: { status: "model_streaming" }, createdAt: now(),
+        });
+        for (const id of ["attempt-initial", "attempt-recovered"]) {
+          const key = `run\u0000${id}`;
+          raw.attempts.set(key, { ...raw.attempts.get(key)!, lastEventSequence: 2 });
+        }
+      } else {
+        const db = (store as unknown as { db: Database.Database }).db;
+        const reverse = {
+          schemaVersion: "meliora.session-event.v1", eventId: "attempt-one-model-after-two", runId: "run", attemptId: "attempt-initial", sequence: 2,
+          kind: "run_status_changed", visibility: "public", payload: { status: "model_streaming" }, createdAt: now(),
+        };
+        const payload = JSON.stringify(reverse.payload);
+        db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+          reverse.eventId, reverse.runId, reverse.attemptId, reverse.sequence, reverse.schemaVersion, reverse.kind, reverse.visibility,
+          payload, hashBytes(canonicalJson(reverse)), reverse.createdAt, null, null,
+        );
+        db.prepare("UPDATE run_attempts SET last_event_sequence=2 WHERE run_id=? AND attempt_id IN (?,?)")
+          .run("run", "attempt-initial", "attempt-recovered");
+      }
+      current += 1_001;
+      assert.deepEqual(await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", 2, now)), {
+        kind: "conflict", code: "initial_recovery_not_safe",
+      });
+    } finally { (store as Store).close?.(); }
+  });
+}
+
+// C.2b must survive a second crash after C.2a's atomic claim but before a
+// worker begins.  The only safe repair is a new lease on the same pristine
+// Attempt #2: never mint an Attempt #3, and never accept an unexpired token.
+for (const [name, create] of adapters) {
+  test(`${name} C.2b reclaims only expired pristine Attempt #2 without creating #3`, async (t) => {
+    let current = Date.parse(timestamp());
+    const now = () => new Date(current).toISOString();
+    const store = create(() => current, t);
+    try {
+      await reserveAndExpireInitialLease(store, now, (milliseconds) => { current += milliseconds; }, "accepted", ["preparing"]);
+      const claimed = await store.claimInitialPreDispatchRunCommandForRecovery(claimInput("accepted", 1, now));
+      assert.equal(claimed.kind, "claimed");
+      assert.deepEqual(await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", 1, now)), { kind: "conflict", code: "lease_held" });
+      current += 1_001;
+      const reclaimed = await store.reclaimInitialPreDispatchExecutionAuthority(reclaimInput("accepted", 1, now));
+      assert.equal(reclaimed.kind, "reclaimed");
+      if (reclaimed.kind !== "reclaimed") throw new Error("reclaim_expected");
+      assert.equal(reclaimed.attempt.attemptId, "attempt-recovered");
+      const bundle = await store.readRecoveryBundle({ runId: "run", eventLimit: 10 });
+      assert.equal(bundle.kind, "found");
+      if (bundle.kind !== "found") throw new Error("bundle_expected");
+      assert.equal(bundle.bundle.activeAttempt.attemptId, "attempt-recovered");
+      assert.equal(bundle.bundle.latestAttemptNumber, 2);
+      assert.equal((await store.readEvents({ runId: "run", afterSequence: 0, limit: 10 })).events.length, 1);
+    } finally { store.close?.(); }
   });
 }
 

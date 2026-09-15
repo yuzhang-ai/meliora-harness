@@ -4,4 +4,5 @@ export * from "./public-events";
 export * from "./public-run-resume-snapshot";
 export * from "./read-only-run-loop";
 export * from "./recovery-coordinator";
+export * from "./safe-recovery-dispatcher";
 export * from "./run-state";

@@ -19,6 +19,7 @@ import type {
   RecoverableCommandRef, RecoveryBundle, RecoveryBundleInput, RecoveryBundleResult, RecoveryCommandPage, RecoveryCommandScanInput,
   RecoverAndSettleRunCommandWithTerminalEventInput, RecoverAndSettleRunCommandWithTerminalEventResult,
   ClaimInitialPreDispatchRunCommandForRecoveryInput, ClaimInitialPreDispatchRunCommandForRecoveryResult,
+  ReclaimInitialPreDispatchExecutionAuthorityInput, ReclaimInitialPreDispatchExecutionAuthorityResult,
   RunCommandScope, RunCommandStatus, RunSnapshot, SessionRecord, SessionStorePort, StartModelStepInput,
   StartModelStepResult, StoredEvent, StoredInvocationReservation, StoredModelStepCheckpoint,
   StoredPrivateUserInput, StoredRunCommand, SettleRunCommandWithTerminalEventInput,
@@ -70,17 +71,22 @@ const INITIAL_PRE_DISPATCH_STATUSES = ["preparing", "model_streaming"] as const;
 const hasOnlyInitialPreDispatchPrefix = (
   events: readonly StoredEvent[],
   runId: string,
-  attemptId: string,
+  attemptId: string | readonly string[],
   commandStatus: "reserved" | "accepted",
   expectedSequence: number,
 ): boolean => {
   if (events.length !== expectedSequence || events.length > INITIAL_PRE_DISPATCH_STATUSES.length) return false;
   if (commandStatus === "reserved" && events.length !== 0) return false;
+  let enteredRecoveryAttempt = false;
   return events.every((event, index) => {
     const payload = event.payload;
     return event.schemaVersion === "meliora.session-event.v1"
       && event.runId === runId
-      && event.attemptId === attemptId
+      && (typeof attemptId === "string"
+        ? event.attemptId === attemptId
+        : event.attemptId === attemptId[1]
+          ? (enteredRecoveryAttempt = true)
+          : event.attemptId === attemptId[0] && !enteredRecoveryAttempt)
       && event.sequence === index + 1
       && event.kind === "run_status_changed"
       && event.visibility === "public"
@@ -93,6 +99,11 @@ const hasOnlyInitialPreDispatchPrefix = (
       && (payload as { status?: unknown }).status === INITIAL_PRE_DISPATCH_STATUSES[index];
   });
 };
+const continuationForPrefix = (sequence: number) => sequence === 0
+  ? { status: "created" as const, sequence: 0 as const }
+  : sequence === 1
+    ? { status: "preparing" as const, sequence: 1 as const }
+    : { status: "model_streaming" as const, sequence: 2 as const };
 const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
   schemaVersion: event.schemaVersion,
   eventId: event.eventId,
@@ -667,7 +678,87 @@ export class SqliteSessionStore implements SessionStorePort {
       const command = this.toRunCommand(commandRow);
       const attemptRow = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
         .get(input.runId, recovery.attemptId) as Row;
-      return { kind: "claimed", command, attempt: this.toAttempt(attemptRow), lease: { leaseToken, expiresAt } };
+      return { kind: "claimed", command, attempt: this.toAttempt(attemptRow), lease: { leaseToken, expiresAt }, continuation: continuationForPrefix(input.expectedSequence) };
+    }).immediate();
+  }
+
+  async reclaimInitialPreDispatchExecutionAuthority(
+    input: ReclaimInitialPreDispatchExecutionAuthorityInput,
+  ): Promise<ReclaimInitialPreDispatchExecutionAuthorityResult> {
+    this.validateRunCommandScope(input);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedInitialAttemptId);
+    assertValidGeneratedId(input.expectedActiveAttemptId);
+    assertValidGeneratedId(input.ownerId);
+    assertPersistableText(input.ownerId, "reclaim.ownerId");
+    requireTimestamp(input.requestedAt, "reclaim.requestedAt");
+    this.requireTtl(input.ttlMs);
+    if (input.expectedLatestAttemptNumber !== 2 || input.expectedActiveAttemptId === input.expectedInitialAttemptId
+      || (input.expectedCommandStatus !== "reserved" && input.expectedCommandStatus !== "accepted")
+      || !Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    return this.db.transaction((): ReclaimInitialPreDispatchExecutionAuthorityResult => {
+      const command = this.db.prepare("SELECT * FROM run_commands WHERE local_principal_id=? AND workspace_id=? AND idempotency_key=?")
+        .get(input.localPrincipalId, input.workspaceId, input.idempotencyKey) as Row | undefined;
+      if (!command) return { kind: "not_found", code: "run_command_not_found" };
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      const initial = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, input.expectedInitialAttemptId) as Row | undefined;
+      const active = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, input.expectedActiveAttemptId) as Row | undefined;
+      const session = run ? this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(run.session_id) as Row | undefined : undefined;
+      const turn = run ? this.db.prepare("SELECT * FROM turns WHERE turn_id=?").get(run.turn_id) as Row | undefined : undefined;
+      const privateInput = this.db.prepare("SELECT * FROM run_command_inputs WHERE run_id=?").get(input.runId) as Row | undefined;
+      const attemptCount = (this.db.prepare("SELECT COUNT(*) AS count FROM run_attempts WHERE run_id=?").get(input.runId) as Row).count as number;
+      if (!run || !initial || !active
+        || command.run_id !== input.runId || command.attempt_id !== input.expectedInitialAttemptId
+        || run.active_attempt_id !== input.expectedActiveAttemptId || run.latest_attempt_number !== 2
+        || initial.attempt_number !== 1 || active.attempt_number !== 2
+        || initial.status !== "created" || active.status !== "created" || initial.runtime_state_json !== "null" || active.runtime_state_json !== "null"
+        || initial.session_id !== run.session_id || initial.turn_id !== run.turn_id || active.session_id !== run.session_id || active.turn_id !== run.turn_id
+        || command.session_id !== run.session_id || command.turn_id !== run.turn_id
+        || !session || session.session_id !== run.session_id || session.workspace_id !== command.workspace_id
+        || session.created_at !== command.created_at || session.updated_at !== command.created_at
+        || !turn || turn.turn_id !== run.turn_id || turn.session_id !== run.session_id || turn.intent_revision !== initial.intent_revision
+        || turn.created_at !== command.created_at || turn.updated_at !== command.created_at
+        || !privateInput || privateInput.schema_version !== "meliora.private-user-input.v1" || privateInput.session_id !== run.session_id || privateInput.turn_id !== run.turn_id
+        || privateInput.role !== "user" || privateInput.visibility !== "private" || privateInput.content_hash !== privateUserInputContentHash(privateInput.content)
+        || privateInput.created_at !== command.created_at || run.created_at !== command.created_at || initial.created_at !== command.created_at
+        || command.canonical_request_hash !== canonicalRunCommandRequestHash({ workspaceId: command.workspace_id, message: privateInput.content })
+        || initial.catalog_hash !== active.catalog_hash || initial.intent_revision !== active.intent_revision
+        || attemptCount !== 2 || active.last_event_sequence !== input.expectedSequence) {
+        return { kind: "conflict", code: "initial_recovery_not_safe" };
+      }
+      if (command.status !== input.expectedCommandStatus) return { kind: "conflict", code: "command_status_conflict" };
+      const rows = this.db.prepare("SELECT * FROM events WHERE run_id=? ORDER BY sequence ASC").all(input.runId) as Row[];
+      const events = rows.map((row) => this.toEvent(row));
+      const unsafe = this.db.prepare("SELECT 1 FROM model_steps WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM model_step_terminal_results WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM run_snapshots WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM run_snapshot_history WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM invocations WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM receipts WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM receipt_public_event_bindings WHERE run_id=? LIMIT 1").get(input.runId) !== undefined
+        || this.db.prepare("SELECT 1 FROM staged_public_artifact_provenance WHERE run_id=? LIMIT 1").get(input.runId) !== undefined;
+      const initialEventHead = events.filter((event) => event.attemptId === input.expectedInitialAttemptId).at(-1)?.sequence ?? 0;
+      if (initial.last_event_sequence !== initialEventHead
+        || !hasOnlyInitialPreDispatchPrefix(events, input.runId, [input.expectedInitialAttemptId, input.expectedActiveAttemptId], input.expectedCommandStatus, input.expectedSequence) || unsafe) {
+        return { kind: "conflict", code: "initial_recovery_not_safe" };
+      }
+      const leaseRows = this.db.prepare("SELECT attempt_id,expires_at FROM run_leases WHERE run_id=?").all(input.runId) as Row[];
+      if (!leaseRows.some((lease) => lease.attempt_id === input.expectedActiveAttemptId)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+      for (const lease of leaseRows) {
+        const expiresAt = Date.parse(lease.expires_at);
+        if (!Number.isFinite(expiresAt)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+        if (expiresAt > this.clock().getTime()) return { kind: "conflict", code: "lease_held" };
+      }
+      const leaseToken = this.nonce();
+      const expiresAt = new Date(this.clock().getTime() + input.ttlMs).toISOString();
+      const update = this.db.prepare("UPDATE run_leases SET owner_id=?,lease_token_hash=?,expires_at=? WHERE run_id=? AND attempt_id=?")
+        .run(input.ownerId, hashBytes(leaseToken), expiresAt, input.runId, input.expectedActiveAttemptId);
+      if (update.changes !== 1) throw new StoreIntegrityError("reclaim_lease_cas_conflict");
+      return { kind: "reclaimed", command: this.toRunCommand(command), attempt: this.toAttempt(active), lease: { leaseToken, expiresAt }, continuation: continuationForPrefix(input.expectedSequence) };
     }).immediate();
   }
 
@@ -933,6 +1024,7 @@ export class SqliteSessionStore implements SessionStorePort {
       const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
       if (!run || run.latest_attempt_number !== input.expectedLatestAttemptNumber) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run?.latest_attempt_number ?? -1 };
       const latest = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, run.active_attempt_id) as Row | undefined;
+      if (latest && this.isC2bPristineAttempt(input.runId, latest.attempt_id)) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run.latest_attempt_number };
       const forged = run.session_id !== input.sessionId || run.turn_id !== input.turnId || latest?.catalog_hash !== input.catalogHash || latest?.intent_revision !== input.intentRevision || !!this.db.prepare("SELECT 1 FROM run_attempts WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId);
       if (forged) return { kind: "conflict", code: "run_attempt_conflict", latestAttemptNumber: run.latest_attempt_number };
       const active = this.db.prepare("SELECT expires_at FROM run_leases WHERE run_id=? AND expires_at>?").get(input.runId, now.toISOString()) as Row | undefined;
@@ -1574,6 +1666,7 @@ export class SqliteSessionStore implements SessionStorePort {
       const now = this.clock();
       const run = this.db.prepare("SELECT active_attempt_id FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
       if (!run || run.active_attempt_id !== input.attemptId) return { kind: "conflict", code: "run_attempt_conflict" };
+      if (this.isC2bPristineAttempt(input.runId, input.attemptId)) return { kind: "conflict", code: "run_attempt_conflict" };
       const prior = this.db.prepare("SELECT * FROM run_leases WHERE run_id=? AND attempt_id=?").get(input.runId, input.attemptId) as Row | undefined;
       if (prior && Date.parse(prior.expires_at) > now.getTime()) return { kind: "held", expiresAt: prior.expires_at };
       const leaseToken = this.nonce(); const expiresAt = new Date(now.getTime() + input.ttlMs).toISOString();
@@ -1628,6 +1721,21 @@ export class SqliteSessionStore implements SessionStorePort {
       "SELECT 1 FROM runs WHERE run_id=? AND active_attempt_id=?",
     ).get(runId, attemptId);
     return row !== undefined;
+  }
+  /** Generic lease/attempt APIs must not bypass C.2b's proof-bearing reclaim. */
+  private isC2bPristineAttempt(runId: string, attemptId: string): boolean {
+    const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(runId) as Row | undefined;
+    const command = this.db.prepare("SELECT * FROM run_commands WHERE run_id=?").get(runId) as Row | undefined;
+    const active = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(runId, attemptId) as Row | undefined;
+    if (!run || !command || !active || run.active_attempt_id !== attemptId || run.latest_attempt_number !== 2
+      || active.attempt_number !== 2
+      || (command.status !== "reserved" && command.status !== "accepted")) return false;
+    const initial = this.db.prepare("SELECT * FROM run_attempts WHERE run_id=? AND attempt_id=?").get(runId, command.attempt_id) as Row | undefined;
+    // This is deliberately broader than the reclaim proof.  A malformed
+    // prefix or drifted watermark must close generic paths, not reopen them.
+    return !!initial && initial.attempt_number === 1
+      && initial.attempt_id === command.attempt_id
+      && initial.attempt_id !== active.attempt_id;
   }
   private toRunCommand(row: Row): StoredRunCommand {
     const base = {

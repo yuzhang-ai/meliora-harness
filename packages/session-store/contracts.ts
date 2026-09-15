@@ -251,6 +251,7 @@ export type ClaimInitialPreDispatchRunCommandForRecoveryResult =
       command: StoredRunCommand;
       attempt: PersistedRunAttempt;
       lease: Readonly<{ leaseToken: string; expiresAt: string }>;
+      continuation: InitialPreDispatchContinuation;
     }>
   | Readonly<{
       kind: "conflict";
@@ -258,6 +259,44 @@ export type ClaimInitialPreDispatchRunCommandForRecoveryResult =
       currentSequence?: number;
     }>
   | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
+
+/**
+ * C.2b may recover the short crash window after C.2a has already created
+ * Attempt #2 but before a worker has written anything.  This deliberately
+ * renews that exact pristine authority; it never creates Attempt #3.
+ */
+export type ReclaimInitialPreDispatchExecutionAuthorityInput = RunCommandScope & Readonly<{
+  runId: string;
+  expectedInitialAttemptId: string;
+  expectedActiveAttemptId: string;
+  expectedLatestAttemptNumber: 2;
+  expectedCommandStatus: "reserved" | "accepted";
+  expectedSequence: number;
+  ownerId: string;
+  ttlMs: number;
+  requestedAt: string;
+}>;
+
+export type ReclaimInitialPreDispatchExecutionAuthorityResult =
+  | Readonly<{
+      kind: "reclaimed";
+      command: StoredRunCommand;
+      attempt: PersistedRunAttempt;
+      lease: Readonly<{ leaseToken: string; expiresAt: string }>;
+      continuation: InitialPreDispatchContinuation;
+    }>
+  | Readonly<{
+      kind: "conflict";
+      code: "command_status_conflict" | "event_sequence_conflict" | "run_attempt_conflict" | "lease_held" | "initial_recovery_not_safe";
+      currentSequence?: number;
+    }>
+  | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
+
+/** Store-owned exact prefix emitted before `startModelStep`; not a snapshot resume. */
+export type InitialPreDispatchContinuation = Readonly<{
+  status: "created" | "preparing" | "model_streaming";
+  sequence: 0 | 1 | 2;
+}>;
 
 export type ReadPrivateUserInputInput = Readonly<{
   sessionId: string;
@@ -1032,6 +1071,9 @@ export interface SessionStorePort extends RecoveryReadPort {
   claimInitialPreDispatchRunCommandForRecovery(
     input: ClaimInitialPreDispatchRunCommandForRecoveryInput,
   ): Promise<ClaimInitialPreDispatchRunCommandForRecoveryResult>;
+  reclaimInitialPreDispatchExecutionAuthority(
+    input: ReclaimInitialPreDispatchExecutionAuthorityInput,
+  ): Promise<ReclaimInitialPreDispatchExecutionAuthorityResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
   /** B1b: only deterministic failed outcomes may use this; terminal requires atomic commit. */
