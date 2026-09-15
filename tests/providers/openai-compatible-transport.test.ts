@@ -4,6 +4,7 @@ import { once } from "node:events";
 import test from "node:test";
 import { deepseekStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/deepseek-stream-text-single-tool";
 import { kimiStreamTextSingleToolFixture } from "../../fixtures/contracts/v1/kimi-stream-text-single-tool";
+import { listenOnFetchSafeLoopbackPort } from "../helpers/fetch-safe-listener";
 import type { CanonicalInputMessage } from "../../packages/model-protocol/contracts";
 import {
   createDeepSeekChatTransport,
@@ -40,12 +41,9 @@ async function startFixtureServer(
   handler: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
 ): Promise<Readonly<{ origin: string; close: () => Promise<void> }>> {
   const server = createServer((request, response) => { void handler(request, response); });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("fixture_server_address_unavailable");
+  const port = await listenOnFetchSafeLoopbackPort(server);
   return {
-    origin: `http://127.0.0.1:${address.port}`,
+    origin: `http://127.0.0.1:${port}`,
     close: async () => { server.close(); await once(server, "close"); },
   };
 }

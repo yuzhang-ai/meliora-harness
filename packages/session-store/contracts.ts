@@ -200,6 +200,32 @@ export type SettleRunCommandWithTerminalEventResult =
     }>
   | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
 
+/**
+ * Recovery must not first change Run.activeAttemptId and then try a separate
+ * terminal write: an interrupted second step could hide an old `started`
+ * Model Step.  This is one all-or-nothing recovery boundary.
+ */
+export type RecoverAndSettleRunCommandWithTerminalEventInput = RunCommandScope & Readonly<{
+  runId: string;
+  expectedActiveAttemptId: string;
+  expectedLatestAttemptNumber: number;
+  expectedCommandStatus: "dispatched";
+  expectedSequence: number;
+  recoveryAttempt: CreateRunAttemptInput;
+  terminalCode: string;
+  updatedAt: string;
+  terminalEvent: NewEvent;
+}>;
+
+export type RecoverAndSettleRunCommandWithTerminalEventResult =
+  | Readonly<{ kind: "settled"; command: StoredRunCommand; event: StoredEvent; attempt: PersistedRunAttempt }>
+  | Readonly<{
+      kind: "conflict";
+      code: "command_status_conflict" | "event_sequence_conflict" | "run_attempt_conflict" | "lease_held";
+      currentSequence?: number;
+    }>
+  | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
+
 export type ReadPrivateUserInputInput = Readonly<{
   sessionId: string;
   turnId: string;
@@ -896,14 +922,26 @@ export type LeaseRenewal = Readonly<{
   renewedAt: string;
 }>;
 
+export type RecoveryCommandCursor = Readonly<{
+  createdAt: string;
+  runId: string;
+}>;
+
+export type RecoveryCommandScanInput = Readonly<{
+  limit: number;
+  /** Exclusive immutable `(createdAt, runId)` tuple from the prior page. */
+  afterCursor?: RecoveryCommandCursor;
+}>;
+
 export type RecoveryReadPort = Readonly<{
-  listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage>;
+  listRecoverableCommands(input: RecoveryCommandScanInput): Promise<RecoveryCommandPage>;
   readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult>;
 }>;
 
 export type RecoveryCommandPage = Readonly<{
   commands: readonly RecoverableCommandRef[];
-  /** No cursor exists: false means another bounded sweep is required. */
+  /** Null means this complete ordered sweep reached its end. */
+  nextCursor: RecoveryCommandCursor | null;
   sweepComplete: boolean;
 }>;
 
@@ -955,6 +993,9 @@ export interface SessionStorePort extends RecoveryReadPort {
   settleRunCommandWithTerminalEvent(
     input: SettleRunCommandWithTerminalEventInput,
   ): Promise<SettleRunCommandWithTerminalEventResult>;
+  recoverAndSettleRunCommandWithTerminalEvent(
+    input: RecoverAndSettleRunCommandWithTerminalEventInput,
+  ): Promise<RecoverAndSettleRunCommandWithTerminalEventResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
   /** B1b: only deterministic failed outcomes may use this; terminal requires atomic commit. */

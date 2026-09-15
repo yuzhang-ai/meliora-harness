@@ -42,6 +42,9 @@ import type {
   RecoveryBundleInput,
   RecoveryBundleResult,
   RecoveryCommandPage,
+  RecoveryCommandScanInput,
+  RecoverAndSettleRunCommandWithTerminalEventInput,
+  RecoverAndSettleRunCommandWithTerminalEventResult,
   RecoverableCommandRef,
   ReservationResult,
   ReserveRunCommandInput,
@@ -109,6 +112,8 @@ type MemorySessionStoreOptions = Readonly<{
   onAtomicTerminalWrite?: (stage: "artifact" | "checkpoint" | "terminal_result" | "snapshot") => void;
   /** Test-only adapter hook; validates Receipt/event all-or-nothing writes. */
   onReceiptPublicEventWrite?: (stage: "receipt" | "event" | "binding" | "invocation" | "attempt") => void;
+  /** Test-only recovery boundary preflight; hooks run before its no-await commit. */
+  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command") => void;
 }>;
 
 type StagedPublicArtifactProvenance = Readonly<{
@@ -190,6 +195,7 @@ export class MemorySessionStore implements SessionStorePort {
   private readonly nextPublicArtifactPhysicalNonce: () => string;
   private readonly onReceiptPublicEventWrite?: MemorySessionStoreOptions["onReceiptPublicEventWrite"];
   private readonly onAtomicTerminalWrite?: MemorySessionStoreOptions["onAtomicTerminalWrite"];
+  private readonly onRecoveryAtomicWrite?: MemorySessionStoreOptions["onRecoveryAtomicWrite"];
 
   constructor(options: MemorySessionStoreOptions = {}) {
     this.clock = options.clock ?? (() => new Date());
@@ -199,6 +205,7 @@ export class MemorySessionStore implements SessionStorePort {
     this.nextPublicArtifactPhysicalNonce = options.nextPublicArtifactPhysicalNonce ?? (() => randomUUID());
     this.onReceiptPublicEventWrite = options.onReceiptPublicEventWrite;
     this.onAtomicTerminalWrite = options.onAtomicTerminalWrite;
+    this.onRecoveryAtomicWrite = options.onRecoveryAtomicWrite;
   }
 
   async reserveRunCommand(input: ReserveRunCommandInput): Promise<ReserveRunCommandResult> {
@@ -454,18 +461,126 @@ export class MemorySessionStore implements SessionStorePort {
     return { kind: "settled", command: settled, event: expectedEvent };
   }
 
+  async recoverAndSettleRunCommandWithTerminalEvent(
+    input: RecoverAndSettleRunCommandWithTerminalEventInput,
+  ): Promise<RecoverAndSettleRunCommandWithTerminalEventResult> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedActiveAttemptId);
+    assertValidSafeCode(input.terminalCode);
+    assertValidCommandTimestamp(input.updatedAt);
+    if (input.expectedCommandStatus !== "dispatched") return { kind: "conflict", code: "command_status_conflict" };
+    const recovery = input.recoveryAttempt;
+    assertValidGeneratedId(recovery.attemptId);
+    assertValidGeneratedId(recovery.ownerId);
+    assertValidCommandTimestamp(recovery.createdAt);
+    assertValidCommandTimestamp(recovery.requestedAt);
+    this.requireTtl(recovery.ttlMs);
+    const event = input.terminalEvent;
+    if (event.schemaVersion !== "meliora.session-event.v1" || event.kind !== "run_blocked" || event.visibility !== "public") {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    assertValidGeneratedId(event.eventId);
+    assertValidCommandTimestamp(event.createdAt);
+    assertPersistableJson(event.payload, "terminal_event.payload");
+    const payload = event.payload;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)
+      || Object.keys(payload).sort().join(",") !== "code,message,userActions"
+      || (payload as { code?: unknown }).code !== input.terminalCode
+      || typeof (payload as { message?: unknown }).message !== "string"
+      || !Array.isArray((payload as { userActions?: unknown }).userActions)
+      || !(payload as { userActions: unknown[] }).userActions.every((action) => typeof action === "string")) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+    if (!Number.isInteger(input.expectedLatestAttemptNumber) || input.expectedLatestAttemptNumber < 1
+      || !Number.isInteger(input.expectedSequence) || input.expectedSequence < 0
+      || recovery.runId !== input.runId || recovery.expectedLatestAttemptNumber !== input.expectedLatestAttemptNumber) return { kind: "conflict", code: "run_attempt_conflict" };
+    if (recovery.createdAt !== recovery.requestedAt || recovery.createdAt !== input.updatedAt || recovery.createdAt !== event.createdAt) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+
+    const key = commandScopeKey(input);
+    const command = this.commands.get(key);
+    if (!command) return { kind: "not_found", code: "run_command_not_found" };
+    const run = this.runs.get(input.runId);
+    const active = run ? this.attemptForRun(input.runId, run.activeAttemptId) : undefined;
+    if (!run || !active
+      || command.runId !== input.runId
+      || run.activeAttemptId !== input.expectedActiveAttemptId
+      || run.latestAttemptNumber !== input.expectedLatestAttemptNumber
+      || active.attemptNumber !== input.expectedLatestAttemptNumber
+      || recovery.sessionId !== run.sessionId || recovery.turnId !== run.turnId
+      || recovery.catalogHash !== active.catalogHash || recovery.intentRevision !== active.intentRevision
+      || this.attempts.has(attemptKey(input.runId, recovery.attemptId))) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+    if (this.activeLeaseForRun(input.runId)) return { kind: "conflict", code: "lease_held" };
+    if (command.status !== input.expectedCommandStatus || active.lastEventSequence !== input.expectedSequence
+      || Date.parse(input.updatedAt) < Date.parse(command.updatedAt)) {
+      return active.lastEventSequence !== input.expectedSequence
+        ? { kind: "conflict", code: "event_sequence_conflict", currentSequence: active.lastEventSequence }
+        : { kind: "conflict", code: "command_status_conflict" };
+    }
+    if ([...this.events.values()].flat().some((candidate) => candidate.eventId === event.eventId)) {
+      return { kind: "conflict", code: "command_status_conflict" };
+    }
+
+    const attempt: PersistedRunAttempt = {
+      schemaVersion: "meliora.persisted-run-attempt.v1",
+      sessionId: run.sessionId, turnId: run.turnId, runId: input.runId, attemptId: recovery.attemptId,
+      attemptNumber: run.latestAttemptNumber + 1, status: "created", lastEventSequence: input.expectedSequence + 1,
+      catalogHash: active.catalogHash, intentRevision: active.intentRevision, runtimeState: null,
+      createdAt: recovery.createdAt, updatedAt: input.updatedAt,
+    };
+    const expectedEvent: StoredEvent = { ...event, runId: input.runId, attemptId: recovery.attemptId, sequence: input.expectedSequence + 1 };
+    const { terminalStatus: _terminalStatus, terminalCode: _terminalCode, ...base } = command;
+    const settled: StoredRunCommand = {
+      ...base, status: "terminal", terminalStatus: "blocked", terminalCode: input.terminalCode, updatedAt: input.updatedAt,
+    };
+    const lease = this.newLease(recovery.ownerId, recovery.ttlMs);
+    // Validate every injectable write before this no-await critical section;
+    // unlike SQLite there is no rollback-capable engine below these Maps.
+    this.onRecoveryAtomicWrite?.("attempt");
+    this.onRecoveryAtomicWrite?.("lease");
+    this.onRecoveryAtomicWrite?.("event");
+    this.onRecoveryAtomicWrite?.("command");
+    // All inputs were validated before this no-await critical section.  The
+    // new Attempt, lease, terminal Command and public event are one fact.
+    this.attempts.set(attemptKey(input.runId, attempt.attemptId), attempt);
+    this.runs.set(input.runId, { ...run, activeAttemptId: attempt.attemptId, latestAttemptNumber: attempt.attemptNumber, updatedAt: recovery.createdAt });
+    this.leases.set(attemptKey(input.runId, attempt.attemptId), lease);
+    this.events.set(input.runId, [...(this.events.get(input.runId) ?? []), expectedEvent]);
+    this.commands.set(key, settled);
+    return { kind: "settled", command: settled, event: expectedEvent, attempt };
+  }
+
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
     const record = this.privateUserInputs.get(input.turnId);
     return record?.sessionId === input.sessionId ? deepCopy(record) : null;
   }
 
-  async listRecoverableCommands(input: Readonly<{ limit: number }>): Promise<RecoveryCommandPage> {
+  async listRecoverableCommands(input: RecoveryCommandScanInput): Promise<RecoveryCommandPage> {
     this.assertRecoveryLimit(input.limit, 64, "invalid_recovery_command_limit");
+    if (input.afterCursor !== undefined) {
+      assertValidCommandTimestamp(input.afterCursor.createdAt);
+      assertValidGeneratedId(input.afterCursor.runId);
+    }
     const commands: RecoverableCommandRef[] = [...this.commands.values()]
       .filter((command) => command.status !== "terminal")
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId))
+      .sort((left, right) => left.createdAt < right.createdAt ? -1 : left.createdAt > right.createdAt ? 1 : left.runId < right.runId ? -1 : left.runId > right.runId ? 1 : 0)
+      .filter((command) => input.afterCursor === undefined
+        || command.createdAt > input.afterCursor.createdAt
+        || (command.createdAt === input.afterCursor.createdAt && command.runId > input.afterCursor.runId))
       .map((command) => ({ runId: command.runId, initialAttemptId: command.initialAttemptId, status: command.status, createdAt: command.createdAt }));
-    return { commands: deepCopy(commands.slice(0, input.limit)), sweepComplete: commands.length <= input.limit };
+    const page = commands.slice(0, input.limit);
+    const sweepComplete = commands.length <= input.limit;
+    return {
+      commands: deepCopy(page),
+      sweepComplete,
+      nextCursor: sweepComplete ? null : deepCopy({ createdAt: page.at(-1)!.createdAt, runId: page.at(-1)!.runId }),
+    };
   }
 
   async readRecoveryBundle(input: RecoveryBundleInput): Promise<RecoveryBundleResult> {
