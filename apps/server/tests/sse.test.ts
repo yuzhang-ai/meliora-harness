@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events.js";
-import type { ReadEventsInput, SessionStorePort, StoredEvent } from "../../../packages/session-store/contracts.js";
+import type { ReadEventLogPageInput, ReadEventsInput, SessionStorePort, StoredEvent } from "../../../packages/session-store/contracts.js";
 import { createLocalMelioraServer } from "../src/persistence.js";
 import { createMelioraServer, encodeSseEvent, projectPublicEvent } from "../src/server.js";
 
@@ -32,6 +32,18 @@ const fakeStore = (
     const eligible = events.filter((event) => event.runId === runId && event.sequence > afterSequence);
     const page = eligible.slice(0, limit);
     return { events: page, nextSequence: eligible.length > page.length ? page.at(-1)?.sequence ?? null : null };
+  },
+  readEventLogPage: async ({ runId, afterSequence = 0, throughSequence, limit }: ReadEventLogPageInput) => {
+    const eligible = events.filter((event) => event.runId === runId);
+    const head = eligible.at(-1)?.sequence ?? 0;
+    if (!events.some((event) => event.runId === runId)) return { kind: "not_found" as const, code: "run_not_found" as const };
+    if (throughSequence !== undefined && (!Number.isSafeInteger(throughSequence) || throughSequence < 0 || throughSequence > head)) {
+      return { kind: "conflict" as const, code: "event_watermark_conflict" as const };
+    }
+    const watermark = throughSequence ?? head;
+    const page = eligible.filter((event) => event.sequence > afterSequence && event.sequence <= watermark).slice(0, limit);
+    const hasMore = eligible.some((event) => event.sequence > (page.at(-1)?.sequence ?? afterSequence) && event.sequence <= watermark);
+    return { kind: "found" as const, events: page, nextSequence: hasMore ? page.at(-1)?.sequence ?? null : null, throughSequence: watermark };
   },
   authorizePublicStoredEvent,
 } as unknown as SessionStorePort);
@@ -76,6 +88,69 @@ const rawGet = async (
   });
   request.on("error", reject);
   request.end();
+});
+
+test("public resume snapshot fixes the raw watermark and only returns exact authorized events", async () => {
+  const resumeEvents: readonly StoredEvent[] = [
+    { ...storedEvent(1, "assistant_text_delta"), visibility: "private" },
+    { ...storedEvent(2, "unknown_public_kind"), payload: { anything: "nope" } },
+    {
+      ...storedEvent(3, "plan_updated"),
+      payload: { steps: [{ id: "step-1", title: "private evidence", status: "completed", evidenceRefs: [{ artifactId: "alias-1", visibility: "public" }] }] },
+    },
+    {
+      ...storedEvent(4, "tool_result_presented"),
+      payload: { invocationId: "invocation-1", status: "succeeded", summary: "done", artifactRefs: [{ artifactId: "unbound-alias", visibility: "public" }] },
+    },
+    { ...storedEvent(5, "assistant_text_delta"), payload: { delta: "Bearer opaque-public-secret" } },
+    { ...storedEvent(6, "run_completed"), payload: { outcomeId: "outcome-1", summary: "done" } },
+    { ...storedEvent(7, "assistant_text_delta"), visibility: "private" },
+  ];
+  const app = await startServer(fakeStore(resumeEvents, async ({ event }) =>
+    event.kind === "tool_result_presented" ? { kind: "rejected" } : { kind: "authorized" },
+  ));
+  try {
+    const response = await fetch(`${app.url}/api/runs/run-1/resume`);
+    assert.equal(response.status, 409);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await response.json(), { error: "resume_snapshot_conflict" });
+  } finally { await app.close(); }
+});
+
+test("public resume point is not a raw throughSequence or SSE Last-Event-ID", async () => {
+  const app = await startServer(fakeStore([
+    storedEvent(1, "assistant_text_delta"),
+    { ...storedEvent(2, "model.reasoning_delta"), visibility: "private" },
+  ]));
+  try {
+    const response = await fetch(`${app.url}/api/runs/run-1/resume`);
+    assert.equal(response.status, 200);
+    const snapshot = await response.json() as Record<string, unknown>;
+    assert.equal(snapshot.throughSequence, 2);
+    assert.deepEqual((snapshot.events as { sequence: number }[]).map((event) => event.sequence), [1]);
+    assert.equal(((snapshot.resumePoint as { event: { sequence: number } }).event).sequence, 1);
+  } finally { await app.close(); }
+});
+
+test("public resume snapshot safely rejects source and response size limits", async () => {
+  const sourceOverflow = Array.from({ length: 501 }, (_, index) => ({
+    ...storedEvent(index + 1, "model.reasoning_delta"), visibility: "private" as const,
+  }));
+  const sourceApp = await startServer(fakeStore(sourceOverflow));
+  try {
+    const response = await fetch(`${sourceApp.url}/api/runs/run-1/resume`);
+    assert.equal(response.status, 413);
+    assert.deepEqual(await response.json(), { error: "resume_snapshot_too_large" });
+  } finally { await sourceApp.close(); }
+
+  const responseApp = await startServer(fakeStore([{
+    ...storedEvent(1, "assistant_text_delta"), payload: { delta: "x".repeat(300 * 1024) },
+  }]));
+  try {
+    const response = await fetch(`${responseApp.url}/api/runs/run-1/resume`);
+    assert.equal(response.status, 413);
+    assert.deepEqual(await response.json(), { error: "resume_snapshot_too_large" });
+  } finally { await responseApp.close(); }
 });
 
 test("SSE resumes from numeric Last-Event-ID and filters private events", async () => {

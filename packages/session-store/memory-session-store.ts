@@ -19,6 +19,7 @@ import type {
   CreateSessionInput,
   CreateTurnInput,
   EventPage,
+  EventLogPage,
   InvocationReservationInput,
   LeaseRenewal,
   LeaseRequest,
@@ -30,6 +31,7 @@ import type {
   ReadModelStepInput,
   ReadPrivateUserInputInput,
   ReadEventsInput,
+  ReadEventLogPageInput,
   ReadInvocationInput,
   ReadInvocationByIdempotencyKeyInput,
   ReadReceiptInput,
@@ -795,6 +797,37 @@ export class MemorySessionStore implements SessionStorePort {
     return {
       events,
       nextSequence: eligible.length > events.length ? events.at(-1)?.sequence ?? null : null,
+    };
+  }
+
+  async readEventLogPage(input: ReadEventLogPageInput): Promise<EventLogPage> {
+    const after = input.afterSequence ?? 0;
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(input.limit) || input.limit < 1) {
+      throw new TypeError("invalid_event_log_page");
+    }
+    const run = this.runs.get(input.runId);
+    if (!run) return { kind: "not_found", code: "run_not_found" };
+
+    // This synchronous section is the Memory adapter's read view: capture the
+    // head before selecting the page, and deep-copy before yielding.
+    const source = this.events.get(input.runId) ?? [];
+    const currentHead = source.at(-1)?.sequence ?? 0;
+    const activeAttempt = this.attempts.get(attemptKey(input.runId, run.activeAttemptId));
+    if (!activeAttempt || activeAttempt.lastEventSequence !== currentHead) {
+      return { kind: "conflict", code: "event_watermark_conflict" };
+    }
+    const throughSequence = input.throughSequence ?? currentHead;
+    if (!Number.isSafeInteger(throughSequence) || throughSequence < 0 || throughSequence > currentHead) {
+      return { kind: "conflict", code: "event_watermark_conflict" };
+    }
+    if (after > throughSequence) return { kind: "conflict", code: "event_watermark_conflict" };
+    const eligible = source.filter((event) => event.sequence > after && event.sequence <= throughSequence);
+    const events = deepCopy(eligible.slice(0, input.limit));
+    return {
+      kind: "found",
+      events,
+      nextSequence: eligible.length > events.length ? events.at(-1)?.sequence ?? null : null,
+      throughSequence,
     };
   }
 

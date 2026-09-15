@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import { publicRunEventReplays } from "../../fixtures/contracts/v1/public-run-event-replays";
-import { decodePublicStoredEvent, type PublicRunEvent } from "../../packages/agent-runtime/index";
+import { decodePublicRunResumeSnapshot, decodePublicStoredEvent, type PublicRunEvent } from "../../packages/agent-runtime/index";
 import type { StoredEvent } from "../../packages/session-store/contracts";
 
 const toStored = (event: PublicRunEvent): StoredEvent => ({
@@ -169,5 +169,55 @@ for (const field of ["eventId", "runId"] as const) {
   expectInvalid(`credential-shaped public ${field}`, { ...toStored(first), [field]: sensitive }, first.sessionId);
 }
 expectInvalid("credential-shaped resolver sessionId", toStored(first), sensitive);
+
+const validSnapshot = {
+  schemaVersion: "meliora.public-run-resume-snapshot.v1" as const,
+  sessionId: first.sessionId,
+  runId: first.runId,
+  throughSequence: first.sequence,
+  resumePoint: { kind: "public_event" as const, event: first },
+  events: [first],
+};
+assert.deepEqual(decodePublicRunResumeSnapshot(validSnapshot), validSnapshot, "public resume snapshot decodes exactly");
+const completionForResume = eventFor("run_completed") as Extract<PublicRunEvent, { kind: "run_completed" }>;
+const reorderedCompletion = {
+  ...completionForResume,
+  payload: { summary: completionForResume.payload.summary, outcomeId: completionForResume.payload.outcomeId },
+};
+assert.notEqual(JSON.stringify(completionForResume), JSON.stringify(reorderedCompletion), "fixture must differ only in key insertion order");
+assert.notEqual(
+  decodePublicRunResumeSnapshot({
+    ...validSnapshot,
+    sessionId: completionForResume.sessionId,
+    runId: completionForResume.runId,
+    throughSequence: completionForResume.sequence,
+    events: [completionForResume],
+    resumePoint: { kind: "public_event", event: reorderedCompletion },
+  }),
+  null,
+  "resume point accepts structurally exact event with reordered JSON keys",
+);
+for (const [name, snapshot] of [
+  ["origin with event", { ...validSnapshot, resumePoint: { kind: "origin" } }],
+  ["extra key", { ...validSnapshot, injected: true }],
+  ["event beyond watermark", { ...validSnapshot, throughSequence: first.sequence - 1 }],
+  ["wrong event scope", { ...validSnapshot, events: [{ ...first, runId: "other-run" }] }],
+  ["resume event drift", { ...validSnapshot, resumePoint: { kind: "public_event", event: { ...first, eventId: "other-event" } } }],
+  ["sensitive event", { ...validSnapshot, events: [{ ...first, eventId: sensitive }] }],
+] as const) assert.equal(decodePublicRunResumeSnapshot(snapshot), null, `resume snapshot rejects ${name}`);
+assert.deepEqual(
+  decodePublicRunResumeSnapshot({ ...validSnapshot, events: [], resumePoint: { kind: "origin" } }),
+  { ...validSnapshot, events: [], resumePoint: { kind: "origin" } },
+  "origin is accepted only for an empty event list",
+);
+for (const field of ["sessionId", "runId"] as const) {
+  assert.equal(
+    decodePublicRunResumeSnapshot({
+      ...validSnapshot, events: [], resumePoint: { kind: "origin" }, [field]: sensitive,
+    }),
+    null,
+    `empty origin snapshot rejects credential-shaped ${field}`,
+  );
+}
 
 console.log(JSON.stringify({ gate: "public-stored-event-decoder-contract", status: "PASS", kinds: byKind.size }));

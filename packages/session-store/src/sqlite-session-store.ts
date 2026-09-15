@@ -10,9 +10,9 @@ import type {
   CommitReceiptWithPublicEventsInput, CommitReceiptWithPublicEventsResult,
   CommitTerminalModelStepResultAndSnapshotInput, CommitTerminalModelStepResultAndSnapshotResult,
   CreateRunAttemptInput, CreateRunAttemptResult, CreateRunInput, CreateSessionInput, CreateTurnInput,
-  EventPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
+  EventPage, EventLogPage, FinishModelStepInput, FinishModelStepResult, InvocationReconciliationRecord,
   InvocationReservationInput, LeaseRenewal, LeaseRequest, LeaseResult, PersistedRunAttempt,
-  PersistedRunRecord, PutArtifactInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
+  PersistedRunRecord, PutArtifactInput, ReadEventLogPageInput, ReadEventsInput, ReadLatestModelStepInput, ReadModelStepInput,
   ReadInvocationByIdempotencyKeyInput, ReadInvocationInput, ReadReceiptInput, ReadReceiptPublicEventBindingInput,
   ReadReceiptPublicEventBindingResult, ReadReservationInput,
   ReadPrivateUserInputInput, ReserveRunCommandInput, ReserveRunCommandResult, ReservationResult,
@@ -677,6 +677,44 @@ export class SqliteSessionStore implements SessionStorePort {
     const rows = this.db.prepare("SELECT * FROM events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ?").all(input.runId, after, input.limit + 1) as Row[];
     const events = rows.slice(0, input.limit).map((row) => this.toEvent(row));
     return { events, nextSequence: rows.length > input.limit ? events.at(-1)?.sequence ?? null : null };
+  }
+
+  async readEventLogPage(input: ReadEventLogPageInput): Promise<EventLogPage> {
+    const after = input.afterSequence ?? 0;
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(input.limit) || input.limit < 1) {
+      throw new TypeError("invalid_event_log_page");
+    }
+    return this.db.transaction((): EventLogPage => {
+      const run = this.db.prepare("SELECT * FROM runs WHERE run_id=?").get(input.runId) as Row | undefined;
+      if (!run) return { kind: "not_found", code: "run_not_found" };
+
+      // This first query establishes the SQLite transaction snapshot before
+      // the page query, so another process cannot append between head capture
+      // and selection.
+      const headRow = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) AS head FROM events WHERE run_id=?")
+        .get(input.runId) as Row;
+      const currentHead = headRow.head as number;
+      const activeAttempt = this.db.prepare("SELECT last_event_sequence FROM run_attempts WHERE run_id=? AND attempt_id=?")
+        .get(input.runId, run.active_attempt_id) as Row | undefined;
+      if (!activeAttempt || activeAttempt.last_event_sequence !== currentHead) {
+        return { kind: "conflict", code: "event_watermark_conflict" };
+      }
+      const throughSequence = input.throughSequence ?? currentHead;
+      if (!Number.isSafeInteger(throughSequence) || throughSequence < 0 || throughSequence > currentHead) {
+        return { kind: "conflict", code: "event_watermark_conflict" };
+      }
+      if (after > throughSequence) return { kind: "conflict", code: "event_watermark_conflict" };
+      const rows = this.db.prepare(
+        "SELECT * FROM events WHERE run_id=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+      ).all(input.runId, after, throughSequence, input.limit + 1) as Row[];
+      const events = rows.slice(0, input.limit).map((row) => this.toEvent(row));
+      return {
+        kind: "found",
+        events,
+        nextSequence: rows.length > input.limit ? events.at(-1)?.sequence ?? null : null,
+        throughSequence,
+      };
+    })();
   }
 
   async writeSnapshot(input: WriteSnapshotInput): Promise<void> {

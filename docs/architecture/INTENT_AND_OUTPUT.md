@@ -115,6 +115,12 @@ WP-3B.2a 的共享 `decodePublicStoredEvent`（从 `packages/agent-runtime` 正�
 
 公开事件中的 artifact/evidence 引用必须使用带 `visibility=public` 的 `PublicArtifactRef`。B2b.2 中的 `artifactId` 是 Store 生成的 opaque staged alias，绝不是内部物理 Artifact ID；它只能由 matching durable Receipt 的原子 Store-owned event batch 引用，且 public `tool_result_presented` 必须精确匹配 invocation/status/output alias，`verification_updated` 的 evidence alias 必须在该 Receipt 的 verificationArtifactIds。SSE 与 cursor 以 exact StoredEvent binding、Run/Session/local principal scope 为最终 gate；alias 单独存在、旧 generic raw ref、复制 alias 的另一 event 或非空 evidenceRefs 的 `plan_updated` 均不得公开或成为 anchor。该 alias 不返回 bytes/physical ID，也不新增 HTTP/UI artifact read。WP-3 的 private recovery snapshot 不是 public resume snapshot；public snapshot/resume-point 会在单独的 projector/SSE 契约中冻结，不能用 private artifact ref 旁路本层边界。
 
+### 6.1 Public Run Resume Snapshot v1
+
+`PublicRunResumeSnapshot v1` 是服务器按需生成的独立公开 read model：`schemaVersion / sessionId / runId / throughSequence / resumePoint / events`。`events` 只能是当前 `(local principal, session, run)` scope 下经过既有 public decoder 和 exact StoredEvent/Receipt authorization 的原样 `PublicRunEvent[]`；它不读取或转换 private `RunSnapshot`。`resumePoint` 严格二选一：空数组时仅 `{ kind: "origin" }`，非空时仅 `{ kind: "public_event", event: events[events.length - 1] }`，而且这个 event 必须与数组最后一项逐字段相等。全部 event 必须与 envelope 的 Session/Run 相同、sequence 严格递增且不超过 fixed raw `throughSequence`；unknown key、敏感值、scope 漂移、非终点 resume event 或看似可修复的 malformed 值都拒绝。`throughSequence` 只说明原始日志的读水位，不是 SSE Last-Event-ID 或可对外接受的 cursor。
+
+该 v1 不持久化 snapshot，不提供 artifact bytes、retention/reset token、SSE reset、Web live 或非-loopback auth。HTTP `GET /api/runs/:runId/resume` 必须 `Cache-Control: no-store`，达到扫描/response 上限或完整性冲突时只返回安全错误而不返回 partial payload。
+
 ## 7. Outcome Contract
 
 ```ts
