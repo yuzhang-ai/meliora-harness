@@ -34,7 +34,6 @@ export interface MelioraServerOptions {
   maxJsonBodyBytes?: number;
   pollIntervalMs?: number;
   heartbeatMs?: number;
-  isTerminalEvent?: (event: PublicRunEvent) => boolean;
 }
 
 const isTerminalPublicEvent = (event: PublicRunEvent): boolean =>
@@ -217,17 +216,38 @@ const decodeAndAuthorizePublicEvent = async (
   return authorization.kind === "authorized" ? decoded.event : null;
 };
 
+type PublicCursorValidation =
+  | Readonly<{ kind: "origin" }>
+  | Readonly<{ kind: "event"; event: PublicRunEvent }>
+  | Readonly<{ kind: "terminal_complete"; event: PublicRunEvent }>
+  | Readonly<{ kind: "terminal_tail" }>
+  | Readonly<{ kind: "invalid" }>;
+
+/**
+ * A resume cursor is not merely a number: it must name one exact event that
+ * can be emitted to this principal.  For a terminal cursor, also capture a
+ * fixed raw-log watermark.  A clean terminal has nothing left for an
+ * EventSource reconnect to observe, while any raw tail is an integrity
+ * conflict rather than something to silently skip.
+ */
 const validatePublicCursor = async (
   store: SessionStorePort,
   runId: string,
   localPrincipalId: string,
   sessionId: string,
   sequence: number,
-): Promise<boolean> => {
-  if (sequence === 0) return true;
-  const page = await store.readEvents({ runId, afterSequence: sequence - 1, limit: 1 });
-  const event = page.events[0];
-  return event?.sequence === sequence && await decodeAndAuthorizePublicEvent(store, localPrincipalId, sessionId, event) !== null;
+): Promise<PublicCursorValidation> => {
+  if (sequence === 0) return { kind: "origin" };
+  const page = await store.readEventLogPage({ runId, afterSequence: sequence - 1, limit: 1 });
+  if (page.kind !== "found") return { kind: "invalid" };
+  const storedEvent = page.events[0];
+  if (storedEvent?.sequence !== sequence) return { kind: "invalid" };
+  const event = await decodeAndAuthorizePublicEvent(store, localPrincipalId, sessionId, storedEvent);
+  if (event === null) return { kind: "invalid" };
+  if (!isTerminalPublicEvent(event)) return { kind: "event", event };
+  return page.nextSequence === null
+    ? { kind: "terminal_complete", event }
+    : { kind: "terminal_tail" };
 };
 
 type PublicResumeReadResult =
@@ -300,7 +320,6 @@ export const readPublicRunResumeSnapshot = async (
 const handleRequest = async (options: MelioraServerOptions, request: IncomingMessage, response: ServerResponse): Promise<void> => {
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
-  const isTerminalEvent = options.isTerminalEvent ?? isTerminalPublicEvent;
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
 
   if (request.method === "GET" && url.pathname === "/api/health") {
@@ -372,11 +391,20 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
     writeJsonError(response, 404, { error: "run_not_found" });
     return;
   }
-  if (!(await validatePublicCursor(options.store, runId, localPrincipalId, sessionId, lastSequence))) {
+  const cursorValidation = await validatePublicCursor(options.store, runId, localPrincipalId, sessionId, lastSequence);
+  if (cursorValidation.kind === "invalid" || cursorValidation.kind === "terminal_tail") {
     writeJsonError(response, 409, {
       error: "event_cursor_conflict",
       message: "Last-Event-ID is unavailable or is not a public event sequence.",
     });
+    return;
+  }
+  // A native EventSource reconnects after a terminal close with the last
+  // delivered id.  There is no new public event to stream in a complete fixed
+  // raw view, so explicitly end the protocol without a body or heartbeat.
+  if (cursorValidation.kind === "terminal_complete") {
+    response.writeHead(204, { "cache-control": "no-store" });
+    response.end();
     return;
   }
 
@@ -409,7 +437,7 @@ const handleRequest = async (options: MelioraServerOptions, request: IncomingMes
       const event = await decodeAndAuthorizePublicEvent(options.store, localPrincipalId, sessionId, storedEvent);
       if (event === null) continue;
       if (!(await writeWithBackpressure(response, encodeSseEvent(event)))) { stop(false); return; }
-      if (isTerminalEvent(event)) { stop(true); return; }
+      if (isTerminalPublicEvent(event)) { stop(true); return; }
     }
   };
   const poll = async (): Promise<void> => {

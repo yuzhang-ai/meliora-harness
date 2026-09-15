@@ -1,9 +1,9 @@
 # M0 真实纵向集成施工单
 
-> 状态：WP-1/WP-2 local implementation under review
-> 版本：v0.3
-> 最后更新：2026-09-12
-> Base：`main@9a212541`
+> 状态：WP-3D local implementation
+> 版本：v0.4
+> 最后更新：2026-09-15
+> Base：`main@cfecb4a7`
 > 权威范围：M0 首条真实只读 Run 的集成顺序、工作包、验收和交接边界
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md)、[当前阶段施工单](CURRENT_STAGE.md)、[Harness 链路](../architecture/HARNESS_CHAIN.md)、[持久化与事件](../architecture/PERSISTENCE_AND_EVENTS.md)、[意图与输出层](../architecture/INTENT_AND_OUTPUT.md)、[前端规范](../frontend/VISUAL_SYSTEM.md)
@@ -136,6 +136,13 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 - dispatcher 仅被明确生命周期调用、一次处理一个 Run；只接受 `[]`、`[preparing]`、`[preparing, model_streaming]`，并精确跳过已持久化前缀后才进入 checkpoint gate。
 - C.2a claim 后、worker 前的第二次崩溃，只能在 Store 完整复证且 #2 lease 已过期时重领 #2 lease。活 lease 拒绝，绝不创建 #3；GET/SSE/resume 均纯读。
 - 不在本包接入 Server scheduler、Provider/Host 通用 restart、snapshot/history continuation、旧 invocation adoption、SSE reset/restart 或 Web live。
+
+#### WP-3D：SSE terminal cursor restart（施工中）
+
+- PR #33 已合并至 `main@cfecb4a7`，C.2b 的 initial pre-dispatch 安全继续保持既有边界；本包只补 Server 的只读 SSE terminal cursor 语义，不调度或恢复任何 Run。
+- nonzero `Last-Event-ID` 必须解析为 exact authorized public event。SSE emission、cursor validation 与 resume 只使用固定 terminal predicate，不能由 Server option 分叉。若它是 terminal，Server 必须用 `readEventLogPage` 的 fixed raw watermark 证明没有 tail 才返回带 `Cache-Control: no-store`、无 body 的 `204 No Content`，阻止原生 EventSource 对完成 Run 自动重连；terminal 后的任何 raw tail（包括 private/unknown/malformed）必须 `409` fail closed。
+- 验收新增独立 SSE restart 测试：中途断开后跨 private/unknown gap 只补后续 public events；SQLite/Server 重开后纯读到 durable terminal；terminal cursor 的 `204` 无 body/heartbeat；raw tail `409`；全程不调用 Provider、Host、recovery 或 Store 写路径，且读前后语义状态不变。
+- 不做 retry、query cursor、`PublicRunEvent`/Store schema 修改、Web live、startup recovery、retention/reset 或 HTTP artifact。
 
 ### WP-4：Web live adapter
 
