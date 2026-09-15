@@ -130,6 +130,13 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 
 验收：Memory/SQLite 双 adapter 覆盖无 lease、已过期 lease、任意 Attempt 活 lease、NaN lease、允许/伪造 event prefix、invocation drift、故障 rollback 与并发单 winner；成功不产生 Provider/Host 调用、不追加 event、不将 Command dispatch。
 
+#### WP-3C.2b：initial pre-dispatch safe continuation（施工中）
+
+- 使用 C.2a 的 Attempt #2 + lease 作为唯一 `ExecutionAuthority`，不以 Command 初始 Attempt 字段进行任何 worker 写入。
+- dispatcher 仅被明确生命周期调用、一次处理一个 Run；只接受 `[]`、`[preparing]`、`[preparing, model_streaming]`，并精确跳过已持久化前缀后才进入 checkpoint gate。
+- C.2a claim 后、worker 前的第二次崩溃，只能在 Store 完整复证且 #2 lease 已过期时重领 #2 lease。活 lease 拒绝，绝不创建 #3；GET/SSE/resume 均纯读。
+- 不在本包接入 Server scheduler、Provider/Host 通用 restart、snapshot/history continuation、旧 invocation adoption、SSE reset/restart 或 Web live。
+
 ### WP-4：Web live adapter
 
 Owner：张子恒；后端提供已冻结 API 和本地 fixture server。

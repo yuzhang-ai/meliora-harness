@@ -12,6 +12,21 @@
 
 Harness 负责把一次用户请求推进为可恢复、可观察、可验证的 Run。它协调模型、上下文、工具、持久化和输出，但不亲自操作文件、不实现 Provider 私有协议、不把模型文本直接认定为完成事实。
 
+### C.2b 初始安全继续
+
+`Command.initialAttemptId`（兼容别名 `attemptId`）只标识最初命令；它不是
+worker 的权限。C.2b 的 `ExecutionAuthority = { attemptId, leaseToken }` 是唯一
+可以传入 Run Loop 的执行权，所有状态、事件、checkpoint、invocation、Receipt 与
+terminal 写入都使用它的 Attempt。只允许精确恢复当前 Loop 在 `startModelStep`
+之前的 `[]`、`[preparing]`、`[preparing, model_streaming]` 前缀，并跳过已写前缀，
+不得把它扩展为 snapshot/history 的通用续跑。
+
+安全继续由显式、单 Run、有界 dispatcher 调用，且复用正常 POST 的同一
+`runWorkerWithAuthority` 执行体；构造 Server、GET、SSE、resume 和其它只读路径
+绝不触发。C.2a 创建 Attempt #2 后若在 worker 前再次崩溃，Store
+只可在完整原始证明仍成立且 #2 lease 已过期时替换 #2 的 lease；未过期则拒绝，
+不得创建 Attempt #3 或重放 Provider/Host。
+
 ```text
 submit turn
   -> persist user intent

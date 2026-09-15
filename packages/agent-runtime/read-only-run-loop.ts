@@ -149,6 +149,19 @@ export type ReadOnlyRunLoopInput = Readonly<{
   precreated?: Readonly<{
     leaseToken: string;
   }>;
+  /**
+   * C.2b supplies the sole durable execution authority after the Store has
+   * claimed/reclaimed it. Command.attemptId remains only initial identity.
+   */
+  executionAuthority?: Readonly<{
+    attemptId: string;
+    leaseToken: string;
+  }>;
+  /** Exact, narrow pre-start prefix written by this loop before startModelStep. */
+  initialPreDispatchContinuation?: Readonly<{
+    status: "created" | "preparing" | "model_streaming";
+    sequence: number;
+  }>;
 }>;
 
 export type ReadOnlyRunLoopResult = Readonly<{
@@ -204,9 +217,28 @@ export class ReadOnlyRunLoop {
   async run(input: ReadOnlyRunLoopInput): Promise<ReadOnlyRunLoopResult> {
     const signal = input.signal ?? new AbortController().signal;
     const publicEvents: PublicRunEvent[] = [];
-    let sequence = 0;
-    let status: RunStatus = "created";
-    let leaseToken = "";
+    const executionAuthority = input.executionAuthority ?? {
+      attemptId: input.attemptId,
+      leaseToken: input.precreated?.leaseToken ?? "",
+    };
+    if (executionAuthority.attemptId.length === 0
+      || ((input.executionAuthority !== undefined || input.precreated !== undefined) && executionAuthority.leaseToken.length === 0)) {
+      throw new Error("run_execution_authority_missing");
+    }
+    if (input.precreated && input.precreated.leaseToken !== executionAuthority.leaseToken) {
+      throw new Error("run_execution_authority_conflict");
+    }
+    const authorityAttemptId = executionAuthority.attemptId;
+    const continuation = input.initialPreDispatchContinuation;
+    if (continuation && (!Number.isSafeInteger(continuation.sequence) || continuation.sequence < 0
+      || (continuation.status === "created" && continuation.sequence !== 0)
+      || (continuation.status === "preparing" && continuation.sequence !== 1)
+      || (continuation.status === "model_streaming" && continuation.sequence !== 2))) {
+      throw new Error("initial_pre_dispatch_continuation_invalid");
+    }
+    let sequence = continuation?.sequence ?? 0;
+    let status: RunStatus = continuation?.status ?? "created";
+    let leaseToken = executionAuthority.leaseToken;
     const receipts: ToolReceipt[] = [];
     const verificationIds: string[] = [];
     const verificationEvidenceArtifactIds: string[] = [];
@@ -227,7 +259,7 @@ export class ReadOnlyRunLoop {
       try {
         const renewed = await this.dependencies.store.renewLease({
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           leaseToken,
           ttlMs: this.dependencies.leaseTtlMs,
           renewedAt: this.dependencies.now(),
@@ -266,7 +298,7 @@ export class ReadOnlyRunLoop {
       await renewLeaseOrThrow();
       const result = await this.dependencies.store.appendEvents({
         runId: input.runId,
-        attemptId: input.attemptId,
+        attemptId: authorityAttemptId,
         expectedSequence: sequence,
         leaseToken,
         events,
@@ -352,7 +384,7 @@ export class ReadOnlyRunLoop {
         sessionId: input.sessionId,
         turnId: input.turnId,
         runId: input.runId,
-        attemptId: input.attemptId,
+        attemptId: authorityAttemptId,
         status: terminalStatus,
         summary,
         deliverableRefs: [],
@@ -436,13 +468,14 @@ export class ReadOnlyRunLoop {
     ): Promise<boolean> => {
       const checkpoint = await this.dependencies.store.readModelStep({ runId: input.runId, modelStepId });
       return checkpoint?.status === "started"
-        && checkpoint.attemptId === input.attemptId
+        && checkpoint.attemptId === authorityAttemptId
         && (requestFingerprint === undefined || checkpoint.requestFingerprint === requestFingerprint);
     };
 
-    if (input.precreated) {
-      if (input.precreated.leaseToken.length === 0) throw new Error("run_lease_missing");
-      leaseToken = input.precreated.leaseToken;
+    if (input.executionAuthority || input.precreated) {
+      // The caller already owns the active Attempt and its lease.  In C.2b
+      // that authority was created/reclaimed atomically by Store.
+      leaseToken = executionAuthority.leaseToken;
     } else {
       await this.dependencies.store.createSession({ sessionId: input.sessionId, workspaceId: input.workspaceId, createdAt: this.dependencies.now() });
       await this.dependencies.store.createTurn({ sessionId: input.sessionId, turnId: input.turnId, intentRevision: input.intentRevision, createdAt: this.dependencies.now() });
@@ -450,14 +483,14 @@ export class ReadOnlyRunLoop {
         sessionId: input.sessionId,
         turnId: input.turnId,
         runId: input.runId,
-        initialAttemptId: input.attemptId,
+        initialAttemptId: authorityAttemptId,
         catalogHash: input.catalog.catalogHash,
         intentRevision: input.intentRevision,
         createdAt: this.dependencies.now(),
       });
       const lease = await this.dependencies.store.acquireLease({
         runId: input.runId,
-        attemptId: input.attemptId,
+        attemptId: authorityAttemptId,
         ownerId: this.dependencies.ownerId,
         ttlMs: this.dependencies.leaseTtlMs,
         requestedAt: this.dependencies.now(),
@@ -465,21 +498,21 @@ export class ReadOnlyRunLoop {
       if (lease.kind !== "acquired") throw new Error(`run_lease_${lease.kind}`);
       leaseToken = lease.leaseToken;
     }
-    await changeStatus("preparing");
+    if (status === "created") await changeStatus("preparing");
 
     if (signal.aborted) return terminal("cancelled", "任务已在执行前取消。", "cancelled_before_start");
 
     const maxModelSteps = input.maxModelSteps ?? 8;
     for (let step = 0; step < maxModelSteps; step += 1) {
       if (signal.aborted) return terminal("cancelled", "用户取消了当前任务。", "user_requested");
-      await changeStatus("model_streaming");
+      if (status !== "model_streaming") await changeStatus("model_streaming");
       const modelStepId = this.dependencies.ids.nextModelStepId();
       let requestFingerprint: string | undefined;
       let modelEvents: readonly CanonicalModelEvent[];
       try {
         const checkpoint = await this.dependencies.modelStepCheckpoint.start({
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           leaseToken,
           modelStepId,
           messages,
@@ -526,7 +559,7 @@ export class ReadOnlyRunLoop {
         try {
           finished = await this.dependencies.modelStepCheckpoint.finish({
             runId: input.runId,
-            attemptId: input.attemptId,
+            attemptId: authorityAttemptId,
             leaseToken,
             modelStepId,
             requestFingerprint,
@@ -613,7 +646,7 @@ export class ReadOnlyRunLoop {
           intentRevision: input.intentRevision,
           modelHistoryArtifact: terminalArtifact,
           terminalModelStepResult: {
-            attemptId: input.attemptId,
+            attemptId: authorityAttemptId,
             modelStepId,
             requestFingerprint: requestFingerprint!,
             artifact: terminalArtifact,
@@ -626,14 +659,14 @@ export class ReadOnlyRunLoop {
           schemaVersion: "meliora.run-snapshot.v1",
           snapshotId: `snapshot-${modelStepId}`,
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           throughSequence: sequence,
           state: snapshotState,
           createdAt: this.dependencies.now(),
         };
         const committed = await this.dependencies.store.commitTerminalModelStepResultAndSnapshot({
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           leaseToken,
           modelStepId,
           requestFingerprint: requestFingerprint!,
@@ -704,7 +737,7 @@ export class ReadOnlyRunLoop {
           principal: { id: this.dependencies.principalId, kind: "user" },
           workspaceId: input.workspaceId,
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           tool: { name: definition.name, version: definition.version },
           effectiveRisk: definition.risk,
           catalogHash: input.catalog.catalogHash,
@@ -720,13 +753,13 @@ export class ReadOnlyRunLoop {
           schemaVersion: "meliora.tool-invocation.v1",
           invocationId: call.invocationId,
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           toolName: definition.name,
           toolVersion: definition.version,
           arguments: argumentsValue,
           argumentsHash,
           catalogHash: input.catalog.catalogHash,
-          idempotencyKey: `${input.runId}:${input.attemptId}:${call.invocationId}:${argumentsHash}`,
+          idempotencyKey: `${input.runId}:${authorityAttemptId}:${call.invocationId}:${argumentsHash}`,
           status: "reserved",
         };
         await publish("tool_call_presented", {
@@ -752,7 +785,7 @@ export class ReadOnlyRunLoop {
           try {
             const executionGate = await this.dependencies.store.beginInvocationExecution({
               runId: input.runId,
-              attemptId: input.attemptId,
+              attemptId: authorityAttemptId,
               leaseToken,
               reservationId: reservation.reservationId,
             });
@@ -761,7 +794,7 @@ export class ReadOnlyRunLoop {
               // only the persisted receipt named by Store may be reused.
               replayReceipt = await this.dependencies.store.readReceipt({
                 runId: input.runId,
-                attemptId: input.attemptId,
+                attemptId: authorityAttemptId,
                 receiptId: executionGate.receiptId,
               });
               if (!replayReceipt) return terminalToolInvocationOutcomeUnknown();
@@ -819,7 +852,7 @@ export class ReadOnlyRunLoop {
           let staged: Awaited<ReturnType<SessionStorePort["stagePublicToolResultDerivative"]>>;
           try {
             staged = await withLeaseHeartbeat(() => this.dependencies.store.stagePublicToolResultDerivative({
-              runId: input.runId, sessionId: input.sessionId, attemptId: input.attemptId, leaseToken,
+              runId: input.runId, sessionId: input.sessionId, attemptId: authorityAttemptId, leaseToken,
               reservationId: reservation.reservationId, invocationId: invocation.invocationId,
               content, contentHash: hashBytes(content), mediaType: "text/plain",
             }));
@@ -846,7 +879,7 @@ export class ReadOnlyRunLoop {
           receiptId: this.dependencies.ids.nextReceiptId(),
           invocationId: invocation.invocationId,
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: authorityAttemptId,
           toolName: definition.name,
           toolVersion: definition.version,
           argumentsHash,
@@ -865,7 +898,7 @@ export class ReadOnlyRunLoop {
           committed = await (async () => {
             if (!replayReceipt) await renewLeaseOrThrow();
             return this.dependencies.store.commitReceiptWithPublicEvents({
-              runId: input.runId, attemptId: input.attemptId, leaseToken, reservationId: reservation.reservationId,
+              runId: input.runId, attemptId: authorityAttemptId, leaseToken, reservationId: reservation.reservationId,
               receipt: replayReceipt ?? newReceipt, expectedSequence: sequence,
             });
           })();
