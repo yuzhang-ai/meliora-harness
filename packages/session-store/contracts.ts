@@ -28,7 +28,9 @@ export type SessionStoreConflictCode =
   | "model_step_in_progress"
   | "snapshot_sequence_conflict"
   | "terminal_model_step_result_conflict"
-  | "invocation_execution_conflict";
+  | "invocation_execution_conflict"
+  /** The durable record cannot prove a pre-dispatch recovery is safe. */
+  | "initial_recovery_not_safe";
 
 export type SessionStoreErrorCode =
   | SessionStoreConflictCode
@@ -222,6 +224,37 @@ export type RecoverAndSettleRunCommandWithTerminalEventResult =
   | Readonly<{
       kind: "conflict";
       code: "command_status_conflict" | "event_sequence_conflict" | "run_attempt_conflict" | "lease_held";
+      currentSequence?: number;
+    }>
+  | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
+
+/**
+ * C.2a's deliberately narrow hand-off.  This is not a generic attempt
+ * creation primitive: it is only valid for Attempt #1 before any Provider or
+ * Host boundary can have been crossed.  It preserves the Command and prior
+ * event log, creates Attempt #2 and its lease together, and gives a later
+ * scheduler the sole authority to decide whether to dispatch it.
+ */
+export type ClaimInitialPreDispatchRunCommandForRecoveryInput = RunCommandScope & Readonly<{
+  runId: string;
+  /** Must equal both Command.initialAttemptId and Run.activeAttemptId. */
+  expectedInitialAttemptId: string;
+  expectedLatestAttemptNumber: 1;
+  expectedCommandStatus: "reserved" | "accepted";
+  expectedSequence: number;
+  recoveryAttempt: CreateRunAttemptInput;
+}>;
+
+export type ClaimInitialPreDispatchRunCommandForRecoveryResult =
+  | Readonly<{
+      kind: "claimed";
+      command: StoredRunCommand;
+      attempt: PersistedRunAttempt;
+      lease: Readonly<{ leaseToken: string; expiresAt: string }>;
+    }>
+  | Readonly<{
+      kind: "conflict";
+      code: "command_status_conflict" | "event_sequence_conflict" | "run_attempt_conflict" | "lease_held" | "initial_recovery_not_safe";
       currentSequence?: number;
     }>
   | Readonly<{ kind: "not_found"; code: "run_command_not_found" }>;
@@ -996,6 +1029,9 @@ export interface SessionStorePort extends RecoveryReadPort {
   recoverAndSettleRunCommandWithTerminalEvent(
     input: RecoverAndSettleRunCommandWithTerminalEventInput,
   ): Promise<RecoverAndSettleRunCommandWithTerminalEventResult>;
+  claimInitialPreDispatchRunCommandForRecovery(
+    input: ClaimInitialPreDispatchRunCommandForRecoveryInput,
+  ): Promise<ClaimInitialPreDispatchRunCommandForRecoveryResult>;
   readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null>;
   startModelStep(input: StartModelStepInput): Promise<StartModelStepResult>;
   /** B1b: only deterministic failed outcomes may use this; terminal requires atomic commit. */

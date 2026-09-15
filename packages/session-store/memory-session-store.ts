@@ -46,6 +46,8 @@ import type {
   RecoveryCommandScanInput,
   RecoverAndSettleRunCommandWithTerminalEventInput,
   RecoverAndSettleRunCommandWithTerminalEventResult,
+  ClaimInitialPreDispatchRunCommandForRecoveryInput,
+  ClaimInitialPreDispatchRunCommandForRecoveryResult,
   RecoverableCommandRef,
   ReservationResult,
   ReserveRunCommandInput,
@@ -96,6 +98,7 @@ import {
   assertValidSafeCode,
   assertValidWorkspaceId,
   canTransitionRunCommand,
+  canonicalRunCommandRequestHash,
   privateUserInputContentHash,
 } from "./run-command-contract";
 import { assertPersistableBytes, assertPersistableJson, assertPersistableText } from "./src/sensitive-data";
@@ -106,6 +109,40 @@ type Lease = Readonly<{ token: string; ownerId: string; expiresAt: string }>;
 const RECOVERY_TERMINAL_EVENT_KEYS = new Set([
   "schemaVersion", "eventId", "kind", "visibility", "payload", "createdAt",
 ]);
+const INITIAL_PRE_DISPATCH_STATUSES = ["preparing", "model_streaming"] as const;
+
+/**
+ * The only public log prefix the current ReadOnlyRunLoop can write after a
+ * Command becomes accepted but before it calls startModelStep().  Treat every
+ * other event as evidence we cannot prove the Provider boundary was not
+ * crossed.  A reserved Command has not entered the loop, so it has no prefix.
+ */
+const hasOnlyInitialPreDispatchPrefix = (
+  events: readonly StoredEvent[],
+  runId: string,
+  attemptId: string,
+  commandStatus: "reserved" | "accepted",
+  expectedSequence: number,
+): boolean => {
+  if (events.length !== expectedSequence || events.length > INITIAL_PRE_DISPATCH_STATUSES.length) return false;
+  if (commandStatus === "reserved" && events.length !== 0) return false;
+  return events.every((event, index) => {
+    const payload = event.payload;
+    return event.schemaVersion === "meliora.session-event.v1"
+      && event.runId === runId
+      && event.attemptId === attemptId
+      && event.sequence === index + 1
+      && event.kind === "run_status_changed"
+      && event.visibility === "public"
+      && event.causationId === undefined
+      && event.correlationId === undefined
+      && typeof payload === "object"
+      && payload !== null
+      && !Array.isArray(payload)
+      && Object.keys(payload).length === 1
+      && (payload as { status?: unknown }).status === INITIAL_PRE_DISPATCH_STATUSES[index];
+  });
+};
 const toStoredEvent = (event: NewEvent, runId: string, attemptId: string, sequence: number): StoredEvent => ({
   schemaVersion: event.schemaVersion,
   eventId: event.eventId,
@@ -132,7 +169,7 @@ type MemorySessionStoreOptions = Readonly<{
   /** Test-only adapter hook; validates Receipt/event all-or-nothing writes. */
   onReceiptPublicEventWrite?: (stage: "receipt" | "event" | "binding" | "invocation" | "attempt") => void;
   /** Test-only recovery boundary preflight; hooks run before its no-await commit. */
-  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command") => void;
+  onRecoveryAtomicWrite?: (stage: "attempt" | "lease" | "event" | "command" | "takeover_attempt" | "takeover_lease" | "takeover_run") => void;
 }>;
 
 type StagedPublicArtifactProvenance = Readonly<{
@@ -578,6 +615,127 @@ export class MemorySessionStore implements SessionStorePort {
     this.events.set(input.runId, [...(this.events.get(input.runId) ?? []), expectedEvent]);
     this.commands.set(key, settled);
     return { kind: "settled", command: settled, event: expectedEvent, attempt };
+  }
+
+  async claimInitialPreDispatchRunCommandForRecovery(
+    input: ClaimInitialPreDispatchRunCommandForRecoveryInput,
+  ): Promise<ClaimInitialPreDispatchRunCommandForRecoveryResult> {
+    assertValidLocalPrincipalId(input.localPrincipalId);
+    assertValidWorkspaceId(input.workspaceId);
+    assertValidIdempotencyKey(input.idempotencyKey);
+    assertValidGeneratedId(input.runId);
+    assertValidGeneratedId(input.expectedInitialAttemptId);
+    if (input.expectedLatestAttemptNumber !== 1 || (input.expectedCommandStatus !== "reserved" && input.expectedCommandStatus !== "accepted")) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    if (!Number.isInteger(input.expectedSequence) || input.expectedSequence < 0) {
+      return { kind: "conflict", code: "event_sequence_conflict" };
+    }
+    const recovery = input.recoveryAttempt;
+    assertValidGeneratedId(recovery.attemptId);
+    assertValidGeneratedId(recovery.ownerId);
+    assertPersistableText(recovery.attemptId, "recovery_attempt.attemptId");
+    assertPersistableText(recovery.ownerId, "recovery_attempt.ownerId");
+    assertValidCommandTimestamp(recovery.createdAt);
+    assertValidCommandTimestamp(recovery.requestedAt);
+    this.requireTtl(recovery.ttlMs);
+    if (recovery.runId !== input.runId
+      || recovery.expectedLatestAttemptNumber !== 1
+      || recovery.attemptId === input.expectedInitialAttemptId
+      || recovery.createdAt !== recovery.requestedAt) {
+      return { kind: "conflict", code: "run_attempt_conflict" };
+    }
+
+    const key = commandScopeKey(input);
+    const command = this.commands.get(key);
+    if (!command) return { kind: "not_found", code: "run_command_not_found" };
+    const run = this.runs.get(input.runId);
+    const initialAttempt = run ? this.attemptForRun(input.runId, run.activeAttemptId) : null;
+    const session = run ? this.sessions.get(run.sessionId) : undefined;
+    const turn = run ? this.turns.get(run.turnId) : undefined;
+    const privateInput = run ? this.privateUserInputs.get(run.turnId) : undefined;
+    const attemptsForRun = [...this.attempts.values()].filter((attempt) => attempt.runId === input.runId);
+    if (!run || !initialAttempt
+      || command.runId !== input.runId
+      || command.initialAttemptId !== input.expectedInitialAttemptId
+      || command.attemptId !== input.expectedInitialAttemptId
+      || run.activeAttemptId !== input.expectedInitialAttemptId
+      || run.latestAttemptNumber !== 1
+      || initialAttempt.attemptId !== input.expectedInitialAttemptId
+      || initialAttempt.attemptNumber !== 1
+      || initialAttempt.status !== "created" || initialAttempt.runtimeState !== null
+      || command.sessionId !== run.sessionId || command.turnId !== run.turnId
+      || initialAttempt.sessionId !== run.sessionId || initialAttempt.turnId !== run.turnId
+      || recovery.sessionId !== run.sessionId || recovery.turnId !== run.turnId
+      || recovery.catalogHash !== initialAttempt.catalogHash || recovery.intentRevision !== initialAttempt.intentRevision
+      || !session || session.sessionId !== run.sessionId || session.workspaceId !== command.workspaceId
+      || session.createdAt !== command.createdAt || session.updatedAt !== command.createdAt
+      || !turn || turn.turnId !== run.turnId || turn.sessionId !== run.sessionId || turn.intentRevision !== initialAttempt.intentRevision
+      || turn.createdAt !== command.createdAt || turn.updatedAt !== command.createdAt
+      || !privateInput || privateInput.schemaVersion !== "meliora.private-user-input.v1" || privateInput.sessionId !== run.sessionId || privateInput.turnId !== run.turnId
+      || privateInput.role !== "user" || privateInput.visibility !== "private"
+      || privateInput.createdAt !== command.createdAt || privateInput.contentHash !== privateUserInputContentHash(privateInput.content)
+      || command.canonicalRequestHash !== canonicalRunCommandRequestHash({ workspaceId: command.workspaceId, message: privateInput.content })
+      || run.createdAt !== command.createdAt || initialAttempt.createdAt !== command.createdAt
+      || this.attempts.has(attemptKey(input.runId, recovery.attemptId))) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    if (command.status !== input.expectedCommandStatus) return { kind: "conflict", code: "command_status_conflict" };
+    if (Date.parse(recovery.createdAt) < Date.parse(command.updatedAt)) return { kind: "conflict", code: "initial_recovery_not_safe" };
+
+    // The Server can crash after reservation but before its first lease
+    // acquisition, so an absent initial lease is a valid no-worker proof.
+    // Any malformed lease is drift, and any live lease for *any* Attempt of
+    // this Run remains an authority conflict.
+    const leasePrefix = `${input.runId}\u0000`;
+    for (const [leaseKey, lease] of this.leases) {
+      if (!leaseKey.startsWith(leasePrefix)) continue;
+      if (!Number.isFinite(Date.parse(lease.expiresAt))) {
+        return { kind: "conflict", code: "initial_recovery_not_safe" };
+      }
+      if (!this.isExpired(lease)) return { kind: "conflict", code: "lease_held" };
+    }
+    if (attemptsForRun.length !== 1 || attemptsForRun[0]!.attemptId !== input.expectedInitialAttemptId) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+    const events = this.events.get(input.runId) ?? [];
+    if (initialAttempt.lastEventSequence !== input.expectedSequence) {
+      return { kind: "conflict", code: "event_sequence_conflict", currentSequence: initialAttempt.lastEventSequence };
+    }
+    if (!hasOnlyInitialPreDispatchPrefix(events, input.runId, input.expectedInitialAttemptId, input.expectedCommandStatus, input.expectedSequence)
+      || [...this.modelSteps.values()].some((step) => step.runId === input.runId)
+      || this.snapshots.has(input.runId)
+      || [...this.terminalSnapshotHistory.values()].some((history) => history.snapshot.runId === input.runId)
+      || [...this.terminalModelStepResults.entries()].some(([resultKey]) => resultKey.startsWith(`${input.runId}\u0000`))
+      || [...this.invocations.values()].some((invocation) => invocation.runId === input.runId)
+      || [...this.receipts.values()].some((receipt) => receipt.runId === input.runId)
+      || [...this.receiptPublicEventBindings.values()].some((binding) => binding.events.some((event) => event.runId === input.runId))
+      || [...this.stagedPublicArtifacts.values()].some((artifact) => artifact.runId === input.runId)) {
+      return { kind: "conflict", code: "initial_recovery_not_safe" };
+    }
+
+    const attempt: PersistedRunAttempt = {
+      schemaVersion: "meliora.persisted-run-attempt.v1",
+      sessionId: run.sessionId, turnId: run.turnId, runId: input.runId, attemptId: recovery.attemptId,
+      attemptNumber: 2, status: "created", lastEventSequence: input.expectedSequence,
+      catalogHash: initialAttempt.catalogHash, intentRevision: initialAttempt.intentRevision, runtimeState: null,
+      createdAt: recovery.createdAt, updatedAt: recovery.createdAt,
+    };
+    const lease = this.newLease(recovery.ownerId, recovery.ttlMs);
+    // Validate every injectable point before mutating Maps: no await and no
+    // partial takeover exist in the Memory adapter.
+    this.onRecoveryAtomicWrite?.("takeover_attempt");
+    this.onRecoveryAtomicWrite?.("takeover_lease");
+    this.onRecoveryAtomicWrite?.("takeover_run");
+    this.attempts.set(attemptKey(input.runId, attempt.attemptId), attempt);
+    this.runs.set(input.runId, {
+      ...run,
+      activeAttemptId: attempt.attemptId,
+      latestAttemptNumber: attempt.attemptNumber,
+      updatedAt: recovery.createdAt,
+    });
+    this.leases.set(attemptKey(input.runId, attempt.attemptId), lease);
+    return { kind: "claimed", command: deepCopy(command), attempt: deepCopy(attempt), lease: { leaseToken: lease.token, expiresAt: lease.expiresAt } };
   }
 
   async readPrivateUserInput(input: ReadPrivateUserInputInput): Promise<StoredPrivateUserInput | null> {
