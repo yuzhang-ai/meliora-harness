@@ -208,7 +208,10 @@ test("cursor conflict falls back to public resume snapshot and never POSTs", asy
     }
     eventCalls += 1;
     if (eventCalls === 1) return new Response(sse(source.slice(0, 1)), { status: 200, headers: { "content-type": "text/event-stream" } });
-    if (eventCalls === 2) return Response.json({ error: "event_cursor_conflict" }, { status: 409 });
+    if (eventCalls === 2) return Response.json({
+      error: "event_cursor_conflict",
+      message: "Last-Event-ID is unavailable or is not a public event sequence.",
+    }, { status: 409 });
     return new Response(sse(source.slice(1)), { status: 200, headers: { "content-type": "text/event-stream" } });
   });
   const controller = new LiveRunController(adapter);
@@ -218,6 +221,11 @@ test("cursor conflict falls back to public resume snapshot and never POSTs", asy
   assert.equal(recovered.reconnectCount, 1);
   assert.equal(calls.some((call) => call.startsWith("POST ")), false);
   assert.deepEqual(calls.map((call) => call.endsWith("/resume") ? "resume" : "events"), ["resume", "events", "events", "resume", "events"]);
+  assert.deepEqual(calls.slice(-3).map((call) => call.replace(baseUrl, "")), [
+    `GET /api/runs/${identity.runId}/events`,
+    `GET /api/runs/${identity.runId}/resume`,
+    `GET /api/runs/${identity.runId}/events`,
+  ]);
 });
 
 test("a new turn POSTs once and follows only its returned run", async () => {

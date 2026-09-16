@@ -73,7 +73,9 @@ async function safeErrorCode(response: Response, fallback: string, allowCursorCo
     if (turnError) return turnError.error.code;
     if (allowCursorConflict && response.status === 409
       && typeof value === "object" && value !== null && !Array.isArray(value)
-      && Object.keys(value).length === 1 && (value as { error?: unknown }).error === "event_cursor_conflict") {
+      && Object.keys(value).sort().join("\u0000") === "error\u0000message"
+      && (value as { error?: unknown }).error === "event_cursor_conflict"
+      && typeof (value as { message?: unknown }).message === "string") {
       return "event_cursor_conflict";
     }
   } catch { /* fixed safe fallback */ }
