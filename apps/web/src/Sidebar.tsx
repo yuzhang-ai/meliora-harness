@@ -1,4 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Clock3,
+  Folder,
+  HelpCircle,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Search,
+  Settings,
+  Sparkles,
+  Sun,
+} from "lucide-react";
 import type { Library } from "./projects";
 
 interface SidebarProps {
@@ -64,28 +79,28 @@ export function Sidebar(props: SidebarProps) {
   return <>
       <div className="sidebar-user">
       <span className="user-avatar" role="img" aria-label={`${userName} 的头像`}>{props.userAvatar}</span>
-      <span className="user-copy"><strong>{userName}</strong><small>Meliora workspace</small></span>
-      <button className="icon-button" aria-label="打开用户菜单" onClick={props.onCustomize}>⌄</button>
-      <button className="icon-button collapse-button" aria-label={props.collapsed ? "展开侧栏" : "收起侧栏"} aria-expanded={!props.collapsed} onClick={props.onCollapse}>◧</button>
+      <span className="user-copy"><strong>{userName}</strong><small>本地工作区</small></span>
+      <button className="icon-button" aria-label="打开用户菜单" onClick={props.onCustomize}><ChevronDown /></button>
+      <button className="icon-button collapse-button" aria-label={props.collapsed ? "展开侧栏" : "收起侧栏"} aria-expanded={!props.collapsed} onClick={props.onCollapse}>{props.collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}</button>
     </div>
 
     <div className="sidebar-scroll">
-      <label className="search-field"><span aria-hidden="true">⌕</span><input ref={searchInput} aria-label="搜索项目和对话" placeholder="搜索" value={search} onChange={(event) => setSearch(event.target.value)}/><kbd title="Ctrl/⌘ + Shift + K">⇧⌘K</kbd></label>
+      <label className="search-field"><Search aria-hidden="true"/><input ref={searchInput} aria-label="搜索项目和对话" placeholder="搜索" value={search} onChange={(event) => setSearch(event.target.value)}/><kbd title="Ctrl/⌘ + Shift + K">⇧⌘K</kbd></label>
       <nav className="quick-actions" aria-label="快捷操作">
-        <button aria-label="新建对话" onClick={props.onNewAgent}><span>＋</span>新建</button>
-        <button onClick={props.onAutomations}><span>◷</span>自动化</button>
-        <button onClick={props.onCustomize}><span>✦</span>自定义</button>
+        <button aria-label="新建对话" onClick={props.onNewAgent}><Plus />新建</button>
+        <button onClick={props.onAutomations}><Clock3 />自动化</button>
+        <button onClick={props.onCustomize}><Sparkles />自定义</button>
       </nav>
 
       <section className="repository-list" aria-label="存储库" ref={libraryRegion} tabIndex={0}
         onContextMenu={(event) => { event.preventDefault(); openProjectMenu(event.clientX, event.clientY); }}
         onKeyDown={(event) => { if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); openProjectMenu(rect.left + 18, rect.top + 38); } }}>
-        <div className="section-title"><span>存储库</span><button className="icon-button" aria-label="添加存储库" onClick={props.onNewProject}>＋</button></div>
+        <div className="section-title"><span>存储库</span><button className="icon-button" aria-label="添加存储库" onClick={props.onNewProject}><Plus /></button></div>
         {visibleProjects.map((project) => {
           const expanded = !closedProjects.includes(project.id) || Boolean(query);
           return <div className="repository" key={project.id}>
             <button className="repository-title" aria-expanded={expanded} onClick={() => setClosedProjects((ids) => ids.includes(project.id) ? ids.filter((id) => id !== project.id) : [...ids, project.id])}>
-              <span className={`chevron ${expanded ? "expanded" : ""}`}>›</span><span aria-hidden="true">▱</span><strong>{project.name}</strong>
+              <span className={`chevron ${expanded ? "expanded" : ""}`}>{expanded ? <ChevronDown /> : <ChevronRight />}</span><Folder aria-hidden="true"/><strong>{project.name}</strong>
             </button>
             <div className={`chat-tree ${expanded ? "expanded" : ""}`}><nav aria-label={`${project.name} 的对话`}>
               {project.chats.filter((chat) => !query || project.name.toLocaleLowerCase().includes(query) || chat.title.toLocaleLowerCase().includes(query)).map((chat) =>
@@ -100,24 +115,23 @@ export function Sidebar(props: SidebarProps) {
       </section>
     </div>
 
-    <div className="sidebar-footer">
+      <div className="sidebar-footer">
       <div className="footer-tools">
-        <button className="icon-button" aria-label={props.theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} onClick={() => props.onTheme(props.theme === "dark" ? "light" : "dark")}>{props.theme === "dark" ? "☾" : "☼"}</button>
-        <button className="icon-button" aria-label="支持">?</button>
-        <button className="icon-button" aria-label="设置" onClick={props.onCustomize}>⚙</button>
+        <button className="icon-button" aria-label={props.theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} onClick={() => props.onTheme(props.theme === "dark" ? "light" : "dark")}>{props.theme === "dark" ? <Moon /> : <Sun />}</button>
+        <button className="icon-button" aria-label="支持"><HelpCircle /></button>
+        <button className="icon-button" aria-label="设置" onClick={props.onCustomize}><Settings /></button>
       </div>
       <nav className="collapsed-rail" aria-label="折叠导航">
-        <button aria-label="新建对话" title="新建对话" onClick={props.onNewAgent}>＋</button>
-        <button aria-label="存储库" title="存储库" onClick={props.onNewProject}>▱</button>
-        <button aria-label="自动化" title="自动化" onClick={props.onAutomations}>◷</button>
-        <button aria-label="设置" title="设置" onClick={props.onCustomize}>⚙</button>
+        <button aria-label="新建对话" title="新建对话" onClick={props.onNewAgent}><Plus /></button>
+        <button aria-label="存储库" title="存储库" onClick={props.onNewProject}><Folder /></button>
+        <button aria-label="自动化" title="自动化" onClick={props.onAutomations}><Clock3 /></button>
+        <button aria-label="设置" title="设置" onClick={props.onCustomize}><Settings /></button>
       </nav>
-      <div className="team-card"><span className="team-avatar">M</span><span><strong>Meliora Team</strong><small>Web Product Owner</small></span><button>升级</button></div>
-    </div>
+      </div>
 
     <dialog ref={projectMenu} className="project-menu" aria-label="存储库操作" style={{left: menuPosition.left, top: menuPosition.top}}
       onClick={(event) => { if (event.target === event.currentTarget) projectMenu.current?.close(); }} onClose={() => libraryRegion.current?.focus()}>
-      <button onClick={() => { projectMenu.current?.close(); props.onNewProject(); }}>＋ 创建项目</button>
+      <button onClick={() => { projectMenu.current?.close(); props.onNewProject(); }}><Plus /> 创建项目</button>
       <button onClick={() => projectMenu.current?.close()}>取消</button>
     </dialog>
   </>;

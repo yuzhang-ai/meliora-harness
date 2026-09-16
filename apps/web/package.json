@@ -9,6 +9,7 @@
     "test": "tsx --test tests/projects.test.ts tests/replay.test.ts tests/live-state.test.ts tests/live-adapter.test.ts"
   },
   "dependencies": {
+    "lucide-react": "1.46.0",
     "react": "19.2.1",
     "react-dom": "19.2.1"
   },

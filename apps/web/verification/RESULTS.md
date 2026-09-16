@@ -40,3 +40,13 @@
 - 最新构建通过；11 项单元/回放测试通过；npm audit 为 0 漏洞；浏览器无页面异常、console error、失败请求或错误资源响应。
 - 当前 fixtures 不含 Diff，右栏展示明确空态，不显示示例文件或虚构增删统计。
 - 项目入口只创建前端演示项目，不调用 `showDirectoryPicker()`；工作区选择等待 Runtime/Server 提供 capability。
+
+## 桌面视觉集成（2026-09-16）
+
+Base：`origin/main@4ec5207a`（PR #35 Live Adapter 已在基线中）；未改动 `live-*`、共享契约、后端或 Harmony 范围。
+
+- 手工迁移三栏工作台的视觉价值，未 cherry-pick 旧视觉分支；图标统一为 `lucide-react@1.46.0`，不保留手写 SVG 图标组件。
+- 删除普通界面的 Cookie 展示提示、升级与 `Web Product Owner` 模板残留，并移除面向用户的 Fixture 工程文案；fixture 仍仅用于受测的回放数据层。
+- 收敛中心区：助手消息采用留白层级，工具与结果默认使用分隔线，仅审批保留有边界的决策面板。
+- Chrome headless 浏览器检查通过：1440/1280 为 248px 左栏 + 384px 右栏；1100 为 220px + 360px 三栏；1099 起右栏为 Drawer；768/390 无横向溢出。检查同时覆盖键盘 Drawer/Tab、五类 PublicRunEvent 回放、HTML 文本转义与无页面/控制台/资源错误。
+- `npm test` 27/27、`npm run build`、`npm audit`（0 vulnerabilities）通过。构建中 Vite 对 `lucide-react` 的 `use client` 指令给出已忽略提示，不影响产物或浏览器检查。
