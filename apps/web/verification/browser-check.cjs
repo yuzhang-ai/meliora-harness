@@ -71,8 +71,10 @@ const path = require("node:path");
   assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), false);
   await page.getByRole("button", { name: "新建对话", exact: true }).click();
   await page.getByRole("heading", { name: "开始一个新任务", exact: true }).waitFor();
-  await page.evaluate(() => sessionStorage.removeItem("meliora-project-library-v2"));
-  await page.reload();
+  await page.evaluate(() => {
+    sessionStorage.removeItem("meliora-project-library-v2");
+    location.reload();
+  });
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   await page.getByRole("button", { name: /待处理审批演示/ }).click();
   await page.locator('[data-event="approval_requested"]').waitFor();
@@ -80,8 +82,10 @@ const path = require("node:path");
   await page.getByRole("button", { name: "允许本次", exact: true }).click();
   await page.getByText("已记录允许选择，当前预览不会执行修改。", { exact: true }).waitFor();
 
-  await page.evaluate(() => sessionStorage.removeItem("meliora-project-library-v2"));
-  await page.reload();
+  await page.evaluate(() => {
+    sessionStorage.removeItem("meliora-project-library-v2");
+    location.reload();
+  });
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   await page.getByRole("button", { name: /待处理审批演示/ }).click();
   await page.locator('[data-event="approval_requested"]').waitFor();
