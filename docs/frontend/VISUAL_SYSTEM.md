@@ -1,7 +1,8 @@
 # 前端视觉与交互规范
 
 > 状态：Draft for M0
-> 版本：v0.1
+> 版本：v0.2
+> 最后更新：2026-09-15
 > 权威范围：Meliora Web 的视觉语言、布局、组件状态、交互和浏览器验收
 > 维护者：张子恒（建议初始 Owner）
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md)、[意图与输出层](../architecture/INTENT_AND_OUTPUT.md)、[持久化与事件](../architecture/PERSISTENCE_AND_EVENTS.md)
@@ -174,3 +175,25 @@ Toast 只用于短暂反馈。需要用户决策或影响恢复的错误必须�
 - 控制台无未处理错误，关键区域无明显布局偏移。
 
 实际页面实现后再做截图 A/B 与人工审美验收，仅代码通过不等于视觉完成。
+
+## 10. PC / 手机与 HarmonyOS API 26 基线
+
+Web 提供同一公开事件模型下的两种有意义形态，不按 UA 复制两套产品：
+
+- PC：1440px 保持 Workspace / Conversation / Inspector 三栏；1100px 及以下将 Inspector 降级为可关闭 Drawer。
+- 手机：768px、390px以及高度不超过 500px 的横屏使用单栏 Conversation；Workspace 与 Inspector 都通过独立 Drawer 打开。
+- 鸿蒙手机比例基线额外覆盖 360×780、390×844、432×960 的窄长竖屏，以及 780×360、844×390、960×432 的短横屏。抽屉宽度从实际 CSS viewport 和安全区计算；Composer 在 360–432px 宽度保留可输入空间，固定控件不挤压文本区。
+- 手机信息架构为单栏 Conversation、固定 Composer 和五项 Bottom Navigation。Workspace / More 打开不超过 320px 的左侧 Drawer；Code / Changes 打开独立全屏移动面板。软键盘出现时隐藏 Bottom Navigation，把可视高度优先留给输入与当前任务。
+- 形态选择只使用 CSS media query、`matchMedia` 和 Web capability detection，禁止根据 HarmonyOS、Android、iOS 或浏览器 UA 分支布局。
+
+系统浏览器与 ArkWeb 基线：
+
+- viewport 声明 `viewport-fit=cover`，安全区使用 `env(safe-area-inset-*, 0px)`；不支持时自然回退为 0。
+- 高度优先使用 `VisualViewport` 的实际可视高度，CSS 保留 `100vh` / `100dvh` 回退。软键盘覆盖布局时缩短工作台并保持 Composer 可见，不通过固定设备高度猜测键盘。
+- 页面缩放与软键盘必须区分：`VisualViewport.scale != 1` 的缩放不能误标记为键盘打开。
+- Composer 显式跟踪 `compositionstart` / `compositionend`；候选词组合期间不得由 Ctrl/Command + Enter 误发送。
+- `pointer: coarse` 环境的主要点击目标至少 44×44px；关键操作不依赖 hover 才能出现。
+- 长中文、无分隔路径、命令和 diff 使用局部换行或独立滚动，不允许扩大页面根宽度。
+- 200% zoom 下保持单栏可操作、焦点可见且无页面级横向滚动。
+
+HarmonyOS 7 / API 26.0.0 的兼容结论只能来自对应系统浏览器或 ArkWeb 真机/模拟器。桌面 Chrome 自动验收只建立 Web 基线；设备尚未执行时必须记录为 **Pending**，不得写“已兼容”。每次设备验收记录设备型号、系统/API 版本、实际 UA、被测 commit SHA、结果和截图或录屏链接。

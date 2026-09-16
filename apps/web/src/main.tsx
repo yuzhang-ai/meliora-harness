@@ -3,8 +3,10 @@ import { createRoot } from "react-dom/client";
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events";
 import { Sidebar } from "./Sidebar";
 import { RightPanel } from "./RightPanel";
+import { MobileBottomNav, type MobileDestination } from "./MobileBottomNav";
 import { addProject, defaultLibrary, newChat, parseLibrary, type Chat, type Library, type Project } from "./projects";
 import { labels, publicEvents, resumePoint, scenarios, statusOf, streamFor, type Scenario } from "./replay";
+import { installViewportEnvironment, SINGLE_PANE_MEDIA } from "./viewport";
 import "./dark-shell.css";
 
 function initialLibrary() {
@@ -30,6 +32,8 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"nav" | "code" | null>(null);
+  const [mobileHome, setMobileHome] = useState<"workspace" | "agent">("workspace");
+  const [inspectorTab, setInspectorTab] = useState<"changes" | "preview">("changes");
   const [notice, setNotice] = useState("");
   const [noticeVisible, setNoticeVisible] = useState(true);
   const [voiceActive, setVoiceActive] = useState(false);
@@ -44,6 +48,7 @@ function App() {
   const [profileAvatar, setProfileAvatar] = useState(userAvatar);
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const composerIsComposing = useRef(false);
 
   const projectList = library.projects;
   const activeProject = projectList.find((project) => project.chats.some((chat) => chat.id === library.activeId))!;
@@ -65,6 +70,8 @@ function App() {
     try { localStorage.setItem("meliora-theme-v2", theme); }
     catch { /* browser storage can be unavailable */ }
   }, [theme]);
+
+  useEffect(() => installViewportEnvironment(document.documentElement), []);
 
   useEffect(() => {
     try {
@@ -175,6 +182,22 @@ function App() {
     replay();
   }
 
+  function keepComposerVisible() {
+    window.requestAnimationFrame(() => composerInput.current?.scrollIntoView({ block: "nearest" }));
+  }
+
+  function selectMobileDestination(destination: MobileDestination) {
+    if (destination === "more") { setMobilePanel("nav"); return; }
+    if (destination === "code" || destination === "changes") {
+      setInspectorTab(destination === "code" ? "preview" : "changes");
+      setMobilePanel("code");
+      return;
+    }
+    setMobilePanel(null);
+    setMobileHome(destination);
+    if (destination === "agent") window.requestAnimationFrame(() => composerInput.current?.focus());
+  }
+
   function renderEvent(event: PublicRunEvent): React.ReactNode {
     switch (event.kind) {
       case "run_status_changed": return <p className="event-line">状态更新 · {labels[event.payload.status]} {event.payload.reason && <code>{event.payload.reason}</code>}</p>;
@@ -197,10 +220,10 @@ function App() {
   }
 
   return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
-    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.innerWidth <= 768 ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
+    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
 
     <main className="center-panel">
-      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}>☰</button><div><span>{activeProject.name}</span><b>›</b><strong>{activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => setMobilePanel("code")}>⌘</button><button aria-label="分享" onClick={() => setNotice("分享功能等待真实服务接入。")}>↥</button><button aria-label="更多操作" onClick={() => setNotice("更多操作将在下一版接入。")}>•••</button></nav></header>
+      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}>☰</button><div><span>{activeProject.name}</span><b>›</b><strong>{activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => setMobilePanel("code")}>⌘</button><button className="share-action" aria-label="分享" onClick={() => setNotice("分享功能等待真实服务接入。")}>↥</button><button className="more-action" aria-label="更多操作" onClick={() => setNotice("更多操作将在下一版接入。")}>•••</button></nav></header>
       <div className="run-bar"><span className={`run-status ${runStatus}`}>{playing ? "生成中" : labels[runStatus]}</span><span>固定公开事件</span><button onClick={replay}>重新回放</button><button disabled={playing || eventCount >= source.length} onClick={() => setEventCount((count) => count + 1)}>下一步</button></div>
 
       <section className="message-stream" aria-label="消息流">
@@ -219,15 +242,16 @@ function App() {
       <footer className="composer-area">{notice && <p className="notice" role="status">{notice}</p>}<form onSubmit={(event) => { event.preventDefault(); send(); }}>
         <button type="button" className="attachment-button" aria-label="添加附件" onClick={() => setNotice("附件功能等待文件服务接入。")}>＋</button>
         <label className="sr-only" htmlFor="composer">输入指令</label>
-        <textarea ref={composerInput} id="composer" maxLength={20_000} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入指令..." onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
+        <textarea ref={composerInput} id="composer" maxLength={20_000} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入指令..." onFocus={keepComposerVisible} onCompositionStart={() => { composerIsComposing.current = true; }} onCompositionEnd={() => { composerIsComposing.current = false; }} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing && !composerIsComposing.current) { event.preventDefault(); send(); } }}/>
         <button type="button" className={`voice-button ${voiceActive ? "active" : ""}`} aria-label="语音输入" aria-pressed={voiceActive} onClick={() => setVoiceActive((value) => !value)}>♩</button>
         <label className="model-picker"><span className="sr-only">模型</span><select value={modelName} onChange={(event) => setModelName(event.target.value)}><option>DeepSeek V3</option><option>Kimi K2</option><option>MiniMax M2</option></select></label>
         <button className="send-button" aria-label="发送" disabled={!draft.trim() || playing}>↑</button>
       </form><div className="composer-meta"><span>Agent · {activeProject.name}</span><span>{modelName} · 本地 Fixture · Ctrl/⌘ + Enter</span></div></footer>
+      <MobileBottomNav active={mobilePanel === "nav" ? "more" : mobilePanel === "code" ? (inspectorTab === "changes" ? "changes" : "code") : mobileHome} onSelect={selectMobileDestination}/>
     </main>
 
     <button className="mobile-backdrop" aria-label="关闭侧面板" onClick={() => setMobilePanel(null)}/>
-    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}>×</button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title} noticeVisible={noticeVisible} onCloseNotice={() => setNoticeVisible(false)}/></aside>
+    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}>×</button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title} activeTab={inspectorTab} onActiveTabChange={setInspectorTab} noticeVisible={noticeVisible} onCloseNotice={() => setNoticeVisible(false)}/></aside>
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" onClick={() => setDialogMode(null)}>×</button>

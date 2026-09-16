@@ -40,3 +40,48 @@
 - 最新构建通过；11 项单元/回放测试通过；npm audit 为 0 漏洞；浏览器无页面异常、console error、失败请求或错误资源响应。
 - 当前 fixtures 不含 Diff，右栏展示明确空态，不显示示例文件或虚构增删统计。
 - 项目入口只创建前端演示项目，不调用 `showDirectoryPicker()`；工作区选择等待 Runtime/Server 提供 capability。
+
+## Issue #28：PC / 手机与 HarmonyOS API 26 兼容基线（2026-09-15）
+
+工作树：`H:\harness-issue28`
+
+分支：`feat/web-harmony-api26-baseline`
+
+指定 Base / 当前未提交 HEAD：`5bbc65dcbf0fe85511762a42f466aba6a5d11713`
+
+### 自动验收结果
+
+- `npm.cmd test`：15/15 通过；新增 VisualViewport 缺失回退、覆盖式软键盘、顶部偏移与缩放误判测试。
+- `npm.cmd run build`：TypeScript 与 Vite production build 通过。
+- `npm.cmd run check:web`：通过。
+- Desktop Chrome fixture acceptance：通过。
+- 实际 UA：`Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36`。
+- 页面仍只读取固定 `PublicRunEvent` fixtures；没有 Server/SSE 请求，也未修改共享 contracts。
+
+覆盖项：
+
+- 1440px PC 三栏；1100px Inspector Drawer；768px、390px单栏双 Drawer。
+- 390×844 竖屏与 844×390 矮横屏；横屏快捷键可打开 Workspace Drawer。
+- 鸿蒙手机比例浏览器基线新增 360×780、432×960 竖屏与 960×432 横屏；窄屏 Composer、全高双 Drawer 和短横屏内容均无页面级横向溢出。
+- 手机信息架构重新组织为单栏 Agent 工作区、固定 Composer、五项 Bottom Navigation、80% Workspace Drawer 与全屏 Code / Changes 面板；键盘状态下 Bottom Navigation 隐藏。
+- `viewport-fit=cover`、四向 `safe-area-inset` 0 回退及注入安全区 fixture。
+- `VisualViewport` 能力检测、`100dvh/100vh` 回退与 390×520 软键盘缩放；Composer 保持可见、焦点与输入不丢失。
+- `compositionstart` / `compositionend` 中文 IME guard；组合期间 Ctrl+Enter 不发送，结束后正常发送。
+- 粗指针触摸 context，主要操作目标至少 44×44px，关键消息操作不依赖 hover。
+- 长中文、无分隔路径和长 diff fixture 不产生页面级横向滚动。
+- CDP 200% page scale 下不把缩放误判为软键盘，页面无横向溢出。
+- 五类 fixture replay、empty/loading/no-Diff、过期与未过期审批、键盘 Drawer/Tab 路径和浏览器错误捕获继续通过。
+
+截图证据：
+
+- `web-1440.png`、`web-1100.png`、`web-768.png`、`web-390.png`
+- `web-390-safe-area.png`、`web-390-keyboard.png`
+- `web-844x390-landscape.png`、`web-200-percent-zoom.png`
+- `web-harmony-360x780.png`、`web-harmony-432x960.png`、`web-harmony-960x432-landscape.png`
+- `web-harmony-mobile-workspace-drawer.png`、`web-harmony-mobile-code.png`、`web-harmony-mobile-changes.png`
+
+### HarmonyOS 设备状态
+
+**Pending — 尚未在 HarmonyOS 7 / API 26.0.0 系统浏览器或 ArkWeb 真机/模拟器执行。**
+
+桌面 Chrome 自动验收不能证明 HarmonyOS API 26 已兼容。设备型号、系统/API 版本、实际 UA、提交 SHA、结果与截图/录屏链接必须在设备执行后填写到 `HARMONY_API26_CHECKLIST.md`。
