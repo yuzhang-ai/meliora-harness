@@ -39,8 +39,7 @@ function collectBrowserErrors(page, errors) {
     await page.setViewportSize({ width, height });
     await page.waitForTimeout(350);
     assert.equal(await noHorizontalOverflow(page), true, `${width}x${height} overflowed horizontally`);
-    assert.equal(await page.getByRole("button", { name: "打开代码面板", exact: true }).isVisible(), width > 768 && width <= 1100, `${width}px inspector trigger adaptation was incorrect`);
-    assert.equal(await page.getByRole("navigation", { name: "手机主导航", exact: true }).isVisible(), width <= 768, `${width}px mobile navigation adaptation was incorrect`);
+    assert.equal(await page.getByRole("button", { name: "打开代码面板", exact: true }).isVisible(), width <= 1100, `${width}px inspector adaptation was incorrect`);
     await screenshot(page, `web-${width}.png`);
   }
 
@@ -161,40 +160,23 @@ function collectBrowserErrors(page, errors) {
   }
 
   await page.setViewportSize({ width: 360, height: 780 });
-  await page.getByRole("button", { name: "变更", exact: true }).click();
+  await page.getByRole("button", { name: "打开代码面板", exact: true }).click();
   await page.waitForTimeout(220);
   const mobileDrawer = await page.locator(".right-panel").evaluate((element) => {
     const rect = element.getBoundingClientRect();
     return { left: rect.left, right: rect.right, width: rect.width };
   });
   assert.ok(mobileDrawer.left >= 0 && mobileDrawer.right <= 360.5 && mobileDrawer.width >= 320, `360px drawer geometry was ${JSON.stringify(mobileDrawer)}`);
-  const closeNotice = page.getByRole("button", { name: "关闭通知", exact: true });
-  if (await closeNotice.isVisible()) await closeNotice.click();
-  await screenshot(page, "web-harmony-mobile-changes.png");
   await page.getByRole("button", { name: "关闭代码面板", exact: true }).click();
-  await page.getByRole("button", { name: "代码", exact: true }).click();
-  await page.waitForTimeout(220);
-  assert.equal(await page.getByRole("tab", { name: "预览", exact: true }).getAttribute("aria-selected"), "true");
-  await screenshot(page, "web-harmony-mobile-code.png");
-  await page.getByRole("button", { name: "关闭代码面板", exact: true }).click();
-  await page.getByRole("button", { name: "更多", exact: true }).click();
-  await page.waitForTimeout(220);
-  const workspaceDrawerWidth = await page.locator(".left-panel").evaluate((element) => element.getBoundingClientRect().width);
-  assert.ok(workspaceDrawerWidth <= 320 && workspaceDrawerWidth >= 280, `workspace drawer width was ${workspaceDrawerWidth}`);
-  await screenshot(page, "web-harmony-mobile-workspace-drawer.png");
-  await page.keyboard.press("Escape");
 
   await composer.focus();
   await composer.fill("软键盘缩放后输入仍然可见");
   await page.setViewportSize({ width: 390, height: 520 });
   await page.waitForTimeout(150);
-  await page.evaluate(() => document.documentElement.classList.add("virtual-keyboard-open"));
   assert.equal(await composer.evaluate((element) => element === document.activeElement), true);
   assert.equal(await composer.inputValue(), "软键盘缩放后输入仍然可见");
   assert.ok(await page.locator(".composer-area").evaluate((element) => element.getBoundingClientRect().bottom <= innerHeight + 1));
-  assert.equal(await page.getByRole("navigation", { name: "手机主导航", exact: true }).isVisible(), false);
   await screenshot(page, "web-390-keyboard.png");
-  await page.evaluate(() => document.documentElement.classList.remove("virtual-keyboard-open"));
 
   await page.setViewportSize({ width: 844, height: 390 });
   await page.waitForTimeout(150);
@@ -237,7 +219,7 @@ function collectBrowserErrors(page, errors) {
   });
   assert.ok(touchSize.width >= 44 && touchSize.height >= 44, `touch target was ${touchSize.width}x${touchSize.height}`);
   await touchPage.keyboard.press("Escape");
-  await touchPage.getByRole("button", { name: "变更", exact: true }).tap();
+  await touchPage.getByRole("button", { name: "打开代码面板", exact: true }).tap();
   assert.equal(await touchPage.getByRole("tab", { name: "变更", exact: true }).isVisible(), true);
   await touchPage.getByRole("button", { name: "关闭代码面板", exact: true }).tap();
   assert.deepEqual(touchErrors.page, []);

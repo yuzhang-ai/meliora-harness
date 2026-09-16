@@ -63,7 +63,6 @@
 - 1440px PC 三栏；1100px Inspector Drawer；768px、390px单栏双 Drawer。
 - 390×844 竖屏与 844×390 矮横屏；横屏快捷键可打开 Workspace Drawer。
 - 鸿蒙手机比例浏览器基线新增 360×780、432×960 竖屏与 960×432 横屏；窄屏 Composer、全高双 Drawer 和短横屏内容均无页面级横向溢出。
-- 手机信息架构重新组织为单栏 Agent 工作区、固定 Composer、五项 Bottom Navigation、80% Workspace Drawer 与全屏 Code / Changes 面板；键盘状态下 Bottom Navigation 隐藏。
 - `viewport-fit=cover`、四向 `safe-area-inset` 0 回退及注入安全区 fixture。
 - `VisualViewport` 能力检测、`100dvh/100vh` 回退与 390×520 软键盘缩放；Composer 保持可见、焦点与输入不丢失。
 - `compositionstart` / `compositionend` 中文 IME guard；组合期间 Ctrl+Enter 不发送，结束后正常发送。
@@ -78,7 +77,6 @@
 - `web-390-safe-area.png`、`web-390-keyboard.png`
 - `web-844x390-landscape.png`、`web-200-percent-zoom.png`
 - `web-harmony-360x780.png`、`web-harmony-432x960.png`、`web-harmony-960x432-landscape.png`
-- `web-harmony-mobile-workspace-drawer.png`、`web-harmony-mobile-code.png`、`web-harmony-mobile-changes.png`
 
 ### HarmonyOS 设备状态
 

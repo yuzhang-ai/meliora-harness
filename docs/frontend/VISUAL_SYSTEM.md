@@ -183,7 +183,6 @@ Web 提供同一公开事件模型下的两种有意义形态，不按 UA 复制
 - PC：1440px 保持 Workspace / Conversation / Inspector 三栏；1100px 及以下将 Inspector 降级为可关闭 Drawer。
 - 手机：768px、390px以及高度不超过 500px 的横屏使用单栏 Conversation；Workspace 与 Inspector 都通过独立 Drawer 打开。
 - 鸿蒙手机比例基线额外覆盖 360×780、390×844、432×960 的窄长竖屏，以及 780×360、844×390、960×432 的短横屏。抽屉宽度从实际 CSS viewport 和安全区计算；Composer 在 360–432px 宽度保留可输入空间，固定控件不挤压文本区。
-- 手机信息架构为单栏 Conversation、固定 Composer 和五项 Bottom Navigation。Workspace / More 打开不超过 320px 的左侧 Drawer；Code / Changes 打开独立全屏移动面板。软键盘出现时隐藏 Bottom Navigation，把可视高度优先留给输入与当前任务。
 - 形态选择只使用 CSS media query、`matchMedia` 和 Web capability detection，禁止根据 HarmonyOS、Android、iOS 或浏览器 UA 分支布局。
 
 系统浏览器与 ArkWeb 基线：
