@@ -27,3 +27,7 @@ npm.cmd run dev
 - BoardUI 仅依照可见信息架构参考；未复制商业模板源码。
 
 尚未接真实 HTTP/SSE、完整 RunSnapshot、ApprovalRequest 和 Artifact API；这里的重连是固定事件恢复演示。不要将演示通过表述为后端端到端验收。
+
+## WP-4A Live Adapter（尚未接入页面）
+
+`src/live-adapter.ts` 与 `src/live-state.ts` 提供独立的 POST、SSE、public resume snapshot adapter 和纯状态机。新 Turn 才调用 `POST /api/turns`；刷新先读取 `/resume`，普通断线从当前公开 cursor 续 SSE，只有 `event_cursor_conflict` 才回退到 public resume snapshot。刷新和重连路径没有 POST。现有 fixture replay 继续作为页面默认数据源，本切片不改变视觉页面。
