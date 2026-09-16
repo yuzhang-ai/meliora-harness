@@ -46,10 +46,21 @@ test("reconnect preserves the run identity and counts reconnect attempts", () =>
   assert.throws(() => reduceLiveRun(state, { type: "resume_requested", runId: "another-run" }), /runId changed/u);
 });
 
-test("event scope drift and non-advancing sequences fail closed", () => {
+test("event scope drift and sequence content drift fail closed while exact replay is idempotent", () => {
   let state = reduceLiveRun(initialLiveRunState(), { type: "resume_requested", runId: identity.runId });
   state = reduceLiveRun(state, { type: "resume_loaded", snapshot: snapshot(events.slice(0, 1)) });
   state = reduceLiveRun(state, { type: "stream_opened" });
-  assert.throws(() => reduceLiveRun(state, { type: "event_received", event: events[0]! }), /did not advance/u);
+  assert.equal(reduceLiveRun(state, { type: "event_received", event: events[0]! }), state);
+  assert.throws(() => reduceLiveRun(state, { type: "event_received", event: { ...events[0]!, timestamp: "2099-01-01T00:00:00.000Z" } }), /content changed/u);
   assert.throws(() => reduceLiveRun(state, { type: "event_received", event: { ...events[1]!, runId: "wrong-run" } }), /scope changed/u);
+});
+
+test("resume rejects a changed sessionId for an existing run identity", () => {
+  let state = reduceLiveRun(initialLiveRunState(), { type: "resume_requested", runId: identity.runId });
+  state = reduceLiveRun(state, { type: "resume_loaded", snapshot: snapshot(events.slice(0, 1)) });
+  state = reduceLiveRun(state, { type: "stream_opened" });
+  state = reduceLiveRun(state, { type: "stream_closed" });
+  state = reduceLiveRun(state, { type: "reconnect_requested" });
+  state = reduceLiveRun(state, { type: "resume_requested", runId: identity.runId });
+  assert.throws(() => reduceLiveRun(state, { type: "resume_loaded", snapshot: { ...snapshot(), sessionId: "other-session" } }), /identity changed/u);
 });

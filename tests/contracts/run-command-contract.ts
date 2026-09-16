@@ -11,11 +11,18 @@ import {
   startedModelStepFixture,
 } from "../../fixtures/contracts/v1/run-command";
 import {
+  decodeTurnCommandErrorResponse,
+  decodeTurnCommandResponse,
   TURN_COMMAND_REQUEST_SCHEMA_VERSION,
   parseTurnCommandRequest,
   turnCommandHttpStatus,
   type TurnCommandRequest,
 } from "../../apps/server/api-contracts/turn-command";
+import {
+  decodeTurnCommandErrorResponse as decodeBrowserTurnCommandErrorResponse,
+  decodeTurnCommandResponse as decodeBrowserTurnCommandResponse,
+  TURN_COMMAND_REQUEST_SCHEMA_VERSION as BROWSER_TURN_COMMAND_REQUEST_SCHEMA_VERSION,
+} from "../../packages/agent-runtime/turn-command-wire";
 import {
   RUN_COMMAND_USER_MESSAGE_MAX_UTF8_BYTES,
   RunCommandContractError,
@@ -27,6 +34,7 @@ import {
 } from "../../packages/session-store/run-command-contract";
 
 assert.equal(runCommandRequestFixture.schemaVersion, TURN_COMMAND_REQUEST_SCHEMA_VERSION);
+assert.equal(TURN_COMMAND_REQUEST_SCHEMA_VERSION, BROWSER_TURN_COMMAND_REQUEST_SCHEMA_VERSION);
 assert.deepEqual(Object.keys(runCommandRequestFixture).sort(), [
   "idempotencyKey",
   "message",
@@ -64,6 +72,9 @@ assert.equal(privateUserInputFixture.visibility, "private");
 assert.equal(privateUserInputFixture.role, "user");
 assert.equal(privateUserInputFixture.contentHash, privateUserInputContentHash(runCommandRequestFixture.message));
 assert.equal(acceptedRunCommandResponseFixture.commandStatus, "reserved");
+assert.deepEqual(decodeTurnCommandResponse(acceptedRunCommandResponseFixture), acceptedRunCommandResponseFixture);
+assert.deepEqual(decodeBrowserTurnCommandResponse(acceptedRunCommandResponseFixture), acceptedRunCommandResponseFixture);
+assert.equal(decodeBrowserTurnCommandResponse({ ...acceptedRunCommandResponseFixture, providerApiKey: "forbidden" }), null);
 assert.equal(turnCommandHttpStatus(acceptedRunCommandResponseFixture), 202);
 assert.equal(turnCommandHttpStatus({
   ...acceptedRunCommandResponseFixture,
@@ -73,6 +84,12 @@ assert.equal(turnCommandHttpStatus({
 }), 200);
 assert.deepEqual(Object.keys(idempotencyConflictResponseFixture.error).sort(), ["code", "retryable"]);
 assert.equal(idempotencyConflictResponseFixture.error.code, "idempotency_key_conflict");
+assert.deepEqual(decodeTurnCommandErrorResponse(idempotencyConflictResponseFixture), idempotencyConflictResponseFixture);
+assert.deepEqual(decodeBrowserTurnCommandErrorResponse(idempotencyConflictResponseFixture), idempotencyConflictResponseFixture);
+assert.equal(decodeBrowserTurnCommandErrorResponse({
+  ...idempotencyConflictResponseFixture,
+  error: { code: "raw_database_secret", retryable: false },
+}), null);
 assert.equal(JSON.stringify(idempotencyConflictResponseFixture).includes(runCommandRequestFixture.message), false);
 assert.equal(JSON.stringify(idempotencyConflictResponseFixture).includes(runCommandHashFixture), false);
 

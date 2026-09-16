@@ -57,6 +57,21 @@ const expectPhase = (state: LiveRunState, allowed: readonly LiveRunPhase[], acti
   if (!allowed.includes(state.phase)) throw new LiveRunStateError(`${action} is invalid while ${state.phase}.`);
 };
 
+const sameJsonValue = (left: unknown, right: unknown): boolean => {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right)
+      && left.length === right.length && left.every((value, index) => sameJsonValue(value, right[index]));
+  }
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index] && sameJsonValue(leftRecord[key], rightRecord[key]));
+};
+
 export function reduceLiveRun(state: LiveRunState, action: LiveRunAction): LiveRunState {
   switch (action.type) {
     case "submit_requested":
@@ -79,7 +94,9 @@ export function reduceLiveRun(state: LiveRunState, action: LiveRunAction): LiveR
       };
     case "resume_loaded": {
       expectPhase(state, ["resuming", "connecting"], action.type);
-      if (state.identity && state.identity.runId !== action.snapshot.runId) throw new LiveRunStateError("snapshot runId changed.");
+      if (state.identity && (state.identity.runId !== action.snapshot.runId || state.identity.sessionId !== action.snapshot.sessionId)) {
+        throw new LiveRunStateError("snapshot identity changed.");
+      }
       const last = action.snapshot.events.at(-1);
       return {
         ...state,
@@ -99,7 +116,12 @@ export function reduceLiveRun(state: LiveRunState, action: LiveRunAction): LiveR
       if (!state.identity || action.event.runId !== state.identity.runId || action.event.sessionId !== state.identity.sessionId) {
         throw new LiveRunStateError("event scope changed.");
       }
-      if (action.event.sequence <= state.cursor) throw new LiveRunStateError("event sequence did not advance.");
+      if (action.event.sequence < state.cursor) throw new LiveRunStateError("event sequence moved backwards.");
+      if (action.event.sequence === state.cursor) {
+        const prior = state.events.at(-1);
+        if (prior && sameJsonValue(prior, action.event)) return state;
+        throw new LiveRunStateError("event sequence content changed.");
+      }
       return {
         ...state,
         phase: isTerminalPublicEvent(action.event) ? "terminal" : "live",
