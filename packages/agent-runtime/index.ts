@@ -6,3 +6,4 @@ export * from "./read-only-run-loop";
 export * from "./recovery-coordinator";
 export * from "./safe-recovery-dispatcher";
 export * from "./run-state";
+export * from "./turn-command-wire";
