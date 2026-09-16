@@ -5,6 +5,19 @@ const path = require("node:path");
 (async () => {
   const browser = await chromium.launch({ channel: "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await page.addInitScript(() => {
+    if (sessionStorage.getItem("meliora-browser-check-reset") === "pending") {
+      sessionStorage.removeItem("meliora-project-library-v2");
+      sessionStorage.removeItem("meliora-browser-check-reset");
+    }
+  });
+  async function resetPreviewLibrary() {
+    await page.evaluate(() => {
+      sessionStorage.setItem("meliora-browser-check-reset", "pending");
+      location.reload();
+    });
+    await page.waitForLoadState("domcontentloaded");
+  }
   const pageErrors = [];
   const consoleErrors = [];
   const failedRequests = [];
@@ -54,6 +67,15 @@ const path = require("node:path");
   assert.ok(centerAfter > centerBefore + 150);
   await page.getByRole("button", { name: "新建对话", exact: true }).waitFor();
   await page.getByRole("button", { name: "展开侧栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  const centerBeforeRightCollapse = await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width);
+  await page.getByRole("button", { name: "收起右栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 56);
+  assert.ok(await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width) > centerBeforeRightCollapse + 250);
+  await page.getByRole("button", { name: "展开右栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 384);
   await page.getByRole("button", { name: "右键或点击添加项目", exact: true }).click();
   await page.getByRole("heading", { name: "添加项目", exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: /选择文件夹/ }).count(), 0);
@@ -71,10 +93,7 @@ const path = require("node:path");
   assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), false);
   await page.getByRole("button", { name: "新建对话", exact: true }).click();
   await page.getByRole("heading", { name: "开始一个新任务", exact: true }).waitFor();
-  await page.evaluate(() => {
-    sessionStorage.removeItem("meliora-project-library-v2");
-    location.reload();
-  });
+  await resetPreviewLibrary();
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   await page.getByRole("button", { name: /待处理审批演示/ }).click();
   await page.locator('[data-event="approval_requested"]').waitFor();
@@ -82,10 +101,7 @@ const path = require("node:path");
   await page.getByRole("button", { name: "允许本次", exact: true }).click();
   await page.getByText("已记录允许选择，当前预览不会执行修改。", { exact: true }).waitFor();
 
-  await page.evaluate(() => {
-    sessionStorage.removeItem("meliora-project-library-v2");
-    location.reload();
-  });
+  await resetPreviewLibrary();
   await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   await page.getByRole("button", { name: /待处理审批演示/ }).click();
   await page.locator('[data-event="approval_requested"]').waitFor();
@@ -150,6 +166,6 @@ const path = require("node:path");
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(failedRequests, []);
   assert.deepEqual(failedResponses, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1440/1280 248/384px and 1100 220/360px inline assertions plus 1099 drawer assertion, rAF-settled Chrome-safe Ctrl/Command+Shift+K search focus, light default, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, independent desktop left/right collapse, parsed gap-free width < 1100px breakpoint with 1440/1280 248/384px and 1100 220/360px inline assertions plus 1099 drawer assertion, atomic browser reset, rAF-settled Chrome-safe Ctrl/Command+Shift+K search focus, light default, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });

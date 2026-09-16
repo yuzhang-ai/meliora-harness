@@ -49,4 +49,6 @@ Base：`origin/main@4ec5207a`（PR #35 Live Adapter 已在基线中）；未改�
 - 删除普通界面的 Cookie 展示提示、升级与 `Web Product Owner` 模板残留，并移除面向用户的 Fixture 工程文案；fixture 仍仅用于受测的回放数据层。
 - 收敛中心区：助手消息采用留白层级，工具与结果默认使用分隔线，仅审批保留有边界的决策面板。
 - Chrome headless 浏览器检查通过：1440/1280 为 248px 左栏 + 384px 右栏；1100 为 220px + 360px 三栏；1099 起右栏为 Drawer；768/390 无横向溢出。检查同时覆盖键盘 Drawer/Tab、五类 PublicRunEvent 回放、HTML 文本转义与无页面/控制台/资源错误。
+- 桌面左右栏可独立折叠到 56px；折叠右栏时中间工作区同步扩宽，重新展开后恢复原宽度。左栏项目内对话保持独立滚动。
+- 中间 AI 输出、事件列表与左栏项目列表采用更紧凑的行距和垂直间距。
 - `npm test` 27/27、`npm run build`、`npm audit`（0 vulnerabilities）通过。构建中 Vite 对 `lucide-react` 的 `use client` 指令给出已忽略提示，不影响产物或浏览器检查。

@@ -30,6 +30,7 @@ function App() {
   const [decision, setDecision] = useState(initialChat.decision);
   const [playing, setPlaying] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"nav" | "code" | null>(null);
   const [notice, setNotice] = useState("");
   const [voiceActive, setVoiceActive] = useState(false);
@@ -196,11 +197,11 @@ function App() {
     }
   }
 
-  return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
+  return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
     <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.innerWidth <= 768 ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
 
     <main className="center-panel">
-      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{activeProject.name}</span><b>›</b><strong>{activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => setMobilePanel("code")}><PanelRightOpen /></button><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></nav></header>
+      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{activeProject.name}</span><b>›</b><strong>{activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></nav></header>
       <div className="run-bar"><span className={`run-status ${runStatus}`}>{playing ? "生成中" : labels[runStatus]}</span><span>界面预览</span><button onClick={replay}>重新回放</button><button disabled={playing || eventCount >= source.length} onClick={() => setEventCount((count) => count + 1)}>下一步</button></div>
 
       <section className="message-stream" aria-label="消息流">
@@ -227,7 +228,7 @@ function App() {
     </main>
 
     <button className="mobile-backdrop" aria-label="关闭侧面板" onClick={() => setMobilePanel(null)}/>
-    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title}/></aside>
+    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={activeProject.name} chatTitle={activeChat.title} collapsed={rightCollapsed} onCollapse={() => setRightCollapsed((value) => !value)}/></aside>
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" aria-label="关闭设置" onClick={() => setDialogMode(null)}><X /></button>
