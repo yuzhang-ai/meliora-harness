@@ -5,6 +5,19 @@ const path = require("node:path");
 (async () => {
   const browser = await chromium.launch({ channel: "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await page.addInitScript(() => {
+    if (sessionStorage.getItem("meliora-browser-check-reset") === "pending") {
+      sessionStorage.removeItem("meliora-project-library-v2");
+      sessionStorage.removeItem("meliora-browser-check-reset");
+    }
+  });
+  async function resetPreviewLibrary() {
+    await page.evaluate(() => {
+      sessionStorage.setItem("meliora-browser-check-reset", "pending");
+      location.reload();
+    });
+    await page.waitForLoadState("domcontentloaded");
+  }
   const pageErrors = [];
   const consoleErrors = [];
   const failedRequests = [];
@@ -22,13 +35,14 @@ const path = require("node:path");
     .map((rule) => rule.conditionText));
   assert.ok(responsiveConditions.includes("(width < 1100px)"), `missing gap-free desktop breakpoint: ${responsiveConditions.join(", ")}`);
 
-  for (const width of [1440, 1100, 1099, 1024, 768, 390]) {
+  for (const width of [1440, 1280, 1100, 1099, 768, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     await page.waitForTimeout(350);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.equal(await page.evaluate(() => matchMedia("(width < 1100px)").matches), width < 1100);
     if (width === 1100) {
       assert.equal(await page.getByRole("button", { name: "打开代码面板", exact: true }).isVisible(), false);
+      assert.equal(await page.locator(".left-panel").evaluate((element) => element.getBoundingClientRect().width), 220);
       assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 360);
     }
     if (width === 1099) {
@@ -44,8 +58,8 @@ const path = require("node:path");
   await page.waitForTimeout(320);
   const leftWidth = await page.locator(".left-panel").evaluate((element) => element.getBoundingClientRect().width);
   const rightWidth = await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width);
-  assert.equal(leftWidth, 220);
-  assert.equal(rightWidth, 360);
+  assert.equal(leftWidth, 248);
+  assert.equal(rightWidth, 384);
   const centerBefore = await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width);
   await page.getByRole("button", { name: "收起侧栏", exact: true }).click();
   await page.waitForTimeout(320);
@@ -53,10 +67,19 @@ const path = require("node:path");
   assert.ok(centerAfter > centerBefore + 150);
   await page.getByRole("button", { name: "新建对话", exact: true }).waitFor();
   await page.getByRole("button", { name: "展开侧栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  const centerBeforeRightCollapse = await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width);
+  await page.getByRole("button", { name: "收起右栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 56);
+  assert.ok(await page.locator(".center-panel").evaluate((element) => element.getBoundingClientRect().width) > centerBeforeRightCollapse + 250);
+  await page.getByRole("button", { name: "展开右栏", exact: true }).click();
+  await page.waitForTimeout(320);
+  assert.equal(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().width), 384);
   await page.getByRole("button", { name: "右键或点击添加项目", exact: true }).click();
   await page.getByRole("heading", { name: "添加项目", exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: /选择文件夹/ }).count(), 0);
-  await page.getByRole("button", { name: "×", exact: true }).click();
+  await page.getByRole("button", { name: "关闭设置", exact: true }).click();
 
   await page.getByRole("button", { name: /工作区检查/ }).click();
   await page.locator('[data-event="tool_call_presented"]').waitFor();
@@ -68,11 +91,22 @@ const path = require("node:path");
   await page.getByRole("button", { name: /修改文件审批/ }).click();
   await page.getByText("此历史审批已过期，当前仅供查看。", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), false);
+  await page.getByRole("button", { name: "新建对话", exact: true }).click();
+  await page.getByRole("heading", { name: "开始一个新任务", exact: true }).waitFor();
+  await resetPreviewLibrary();
+  await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
   await page.getByRole("button", { name: /待处理审批演示/ }).click();
   await page.locator('[data-event="approval_requested"]').waitFor();
   assert.equal(await page.getByRole("button", { name: "允许本次", exact: true }).isEnabled(), true);
   await page.getByRole("button", { name: "允许本次", exact: true }).click();
-  await page.getByText("已允许本次（演示，不会执行修改）。", { exact: true }).waitFor();
+  await page.getByText("已记录允许选择，当前预览不会执行修改。", { exact: true }).waitFor();
+
+  await resetPreviewLibrary();
+  await page.getByRole("heading", { name: "任务执行概览", exact: true }).waitFor();
+  await page.getByRole("button", { name: /待处理审批演示/ }).click();
+  await page.locator('[data-event="approval_requested"]').waitFor();
+  await page.getByRole("button", { name: "拒绝", exact: true }).click();
+  await page.getByText("已记录拒绝选择，当前预览不会执行修改。", { exact: true }).waitFor();
 
   assert.equal(await page.getByText("暂无文件变更", { exact: true }).isVisible(), true);
   assert.equal(await page.getByText("+156", { exact: true }).count(), 0);
@@ -80,6 +114,7 @@ const path = require("node:path");
   await page.getByRole("heading", { name: "开始一个新任务", exact: true }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "任务执行概览", exact: true }).count(), 0);
   await page.getByRole("button", { name: "重新回放", exact: true }).click();
+  await page.getByText("正在回放本地预览状态。", { exact: true }).waitFor();
   await page.locator(".timeline-loading").waitFor();
 
   const applicationUrl = page.url();
@@ -131,6 +166,6 @@ const path = require("node:path");
   assert.deepEqual(consoleErrors, []);
   assert.deepEqual(failedRequests, []);
   assert.deepEqual(failedResponses, []);
-  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, parsed gap-free width < 1100px breakpoint with 1100 inline/1099 drawer assertions, rAF-settled Chrome-safe Ctrl/Command+Shift+K search focus, light default, 220/360px desktop sidebars, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
+  console.log("PASS: five required PublicRunEvent replays, empty/loading/no-diff states, expired/live approvals, six responsive widths, independent desktop left/right collapse, parsed gap-free width < 1100px breakpoint with 1440/1280 248/384px and 1100 220/360px inline assertions plus 1099 drawer assertion, atomic browser reset, rAF-settled Chrome-safe Ctrl/Command+Shift+K search focus, light default, no browser directory picker, transition-settled screenshots, keyboard drawers/tabs, escaped input; no page, console, request, or HTTP resource errors.");
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
