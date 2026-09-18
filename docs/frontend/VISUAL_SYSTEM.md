@@ -166,6 +166,10 @@ Toast 只用于短暂反馈。需要用户决策或影响恢复的错误必须�
 ## 9. 浏览器验收
 
 - 1440px、1280px 与 1100px 三栏；1099px 起 Inspector 为 Drawer；768px 与 390px 为单栏，导航和 Inspector 分别进入 Drawer；
+- Web 兼容 overlay：meta 声明 `viewport-fit=cover, interactive-widget=resizes-content`；安全区 inset 必须与工作区外边距相加，不能覆盖或取消桌面间距。
+- 优先使用 `VisualViewport` 计算可见高度和键盘 inset；不可用时回退 layout viewport。仅在 scale 约等于 1 时把高度差判为软键盘，200% page zoom 不能触发键盘状态。
+- 纵向窄屏和 `(orientation: landscape) and (max-height: 500px)` 使用单栏抽屉；这一横屏兼容规则不改变 1100px 三栏 / 1099px Drawer 的宽度边界。
+- coarse touch 下主要导航、关闭和 Composer 操作目标至少 44×44px；IME composition 期间的 Enter/Ctrl/⌘+Enter 不得提交，compositionend 后才恢复快捷提交。
 - 中文输入法、多行粘贴、快捷键和停止；
 - read-only success、approval required、tool failure、cancelled、reconnecting 五类 fixture；
 - 侧栏与 Inspector 的键盘访问；
@@ -174,3 +178,5 @@ Toast 只用于短暂反馈。需要用户决策或影响恢复的错误必须�
 - 控制台无未处理错误，关键区域无明显布局偏移。
 
 实际页面实现后再做截图 A/B 与人工审美验收，仅代码通过不等于视觉完成。
+
+HarmonyOS 7 / API 26 真机或官方模拟器验收必须单独保留设备、系统/API、Web runtime、旋转、原生安全区、真实中文 IME 和人工缩放证据；桌面 Chrome 模拟只覆盖浏览器兼容回归，不能替代设备结论。

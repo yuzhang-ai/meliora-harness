@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "test": "tsx --test tests/projects.test.ts tests/replay.test.ts tests/live-state.test.ts tests/live-adapter.test.ts"
+    "test": "tsx --test tests/projects.test.ts tests/replay.test.ts tests/live-state.test.ts tests/live-adapter.test.ts tests/viewport.test.ts"
   },
   "dependencies": {
     "lucide-react": "1.46.0",

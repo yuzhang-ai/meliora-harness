@@ -1,5 +1,5 @@
 # 第一版浏览器验证
-日期：2026-09-12。Base：9a212541。验证环境为本地，未部署。
+日期：2026-09-12。验证环境为本地，未部署。
 
 ## 已执行
 - npm test：11 项项目状态与回放测试通过；Windows 使用显式测试文件路径，不依赖 shell glob 展开。
@@ -43,7 +43,7 @@
 
 ## 桌面视觉集成（2026-09-16）
 
-Base：`origin/main@4ec5207a`（PR #35 Live Adapter 已在基线中）；未改动 `live-*`、共享契约、后端或 Harmony 范围。
+PR #35 Live Adapter 已在集成基线中；未改动 `live-*`、共享契约、后端或 Harmony 范围。
 
 - 手工迁移三栏工作台的视觉价值，未 cherry-pick 旧视觉分支；图标统一为 `lucide-react@1.46.0`，不保留手写 SVG 图标组件。
 - 删除普通界面的 Cookie 展示提示、升级与 `Web Product Owner` 模板残留，并移除面向用户的 Fixture 工程文案；fixture 仍仅用于受测的回放数据层。
@@ -52,3 +52,14 @@ Base：`origin/main@4ec5207a`（PR #35 Live Adapter 已在基线中）；未改�
 - 桌面左右栏可独立折叠到 56px；折叠右栏时中间工作区同步扩宽，重新展开后恢复原宽度。左栏项目内对话保持独立滚动。
 - 中间 AI 输出、事件列表与左栏项目列表采用更紧凑的行距和垂直间距。
 - `npm test` 27/27、`npm run build`、`npm audit`（0 vulnerabilities）通过。构建中 Vite 对 `lucide-react` 的 `use client` 指令给出已忽略提示，不影响产物或浏览器检查。
+
+## HarmonyOS API 26 overlay（本地浏览器验证，2026-09-17）
+
+- 在当前桌面视觉基线上验证 `viewport-fit=cover`、`interactive-widget=resizes-content`、VisualViewport/fallback 标记、模拟安全区与键盘高度处理；安全区与 `--workspace-gap` 组合，不改变 1100px 三栏 / 1099px Drawer 分界或左栏独立滚动。
+- Chrome headless 覆盖 390/360/432 纵向、844×390 矮横屏 Drawer、模拟安全区、composition 中 Ctrl+Enter 不提交、compositionend 后提交、coarse-touch 44px 控件、CDP 200% page scale（不误判为软键盘）和全程无横向溢出。
+- `npm test` 31/31（含 `viewport.ts` 四项纯函数测试）及 `npm run build` 通过；浏览器检查同时保留 PublicRunEvent 回放、审批、键盘与桌面断点验收。
+- 新生成截图：`web-harmony-safe-area.png`、`web-harmony-virtual-keyboard.png`、`web-harmony-landscape.png`、`web-harmony-200-percent-zoom.png`。这些仅为本地 Chrome 证据，不是 HarmonyOS 真机或模拟器截图。
+
+## 未完成的目标设备验收
+
+HarmonyOS 7 / API 26 真实设备或官方模拟器尚无本次证据，状态为 Pending。待目标环境核验真实 IME 候选词、原生安全区、旋转恢复、触控滚动和人工 200% 缩放后，才可更新为设备验收通过。

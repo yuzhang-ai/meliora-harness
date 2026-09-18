@@ -128,7 +128,7 @@ WP-A read-only runtime + WP-C store
 | E3 独立闭包与回归 | 你 + Codex | Verified locally | typecheck + 5 组 characterization tests |
 | Contract-first PR | 你 + Codex | Merged | PR #3 已合并至 main `3f2e24f0`；CI、全量 check 与独立审查通过 |
 | Read-only Runtime | 你 + Codex | Merged | PR #5 已合并至 main `e3b8a1a1`；真实 Host/Store/Run loop、CI 与独立安全复审通过 |
-| Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；Web 11/11、四档响应式与真实 Chrome 验收、全量 check、CI 和独立复审通过；尚未接入真实 Server/SSE |
+| Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；随后 PR #35 保留 Live Adapter/共享契约，PR #36 完成桌面视觉与 1100px 三栏 / 1099px Drawer；HarmonyOS API 26 overlay 当前仅在隔离工作区完成 Chrome 兼容回归，目标设备验收 Pending；尚未将 fixture 页面接入真实 Server/SSE |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
 | M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`，WP-3B.1b 已由 PR #22 合并至 main `f72d2674`，WP-3B.2a 已由 PR #23 合并至 main `77fbf95a`，B2b.1 已由 PR #24 合并至 main `1055f7f8`，B2b.2 已由 PR #25 squash merge 至 main `b97588c5`，WP-3B.2c.1 已由 PR #26 合并至 main `5bbc65dc`，WP-3C.2b 已由 PR #33 合并至 main `cfecb4a7`。当前隔离施工 WP-3D：只读 SSE terminal cursor restart 语义（clean terminal `204`、terminal raw tail `409`）及断线/SQLite+Server 重开读回验收；不含 retry、query cursor、Store schema、Web live、startup recovery 或 retention/reset。 |
@@ -138,4 +138,4 @@ WP-A read-only runtime + WP-C store
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）、按需 public resume snapshot（PR #26，main `5bbc65dc`）及 WP-3C.2b（PR #33，main `cfecb4a7`）已合并到 `main`。当前隔离施工 WP-3D：只读 SSE terminal cursor restart 语义与断线/SQLite+Server 重开读回验收；不接 retry、query cursor、Store schema、Web live、startup recovery 或 retention/reset。
+Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）、按需 public resume snapshot（PR #26，main `5bbc65dc`）及 WP-3C.2b（PR #33，main `cfecb4a7`）已合并到 `main`。当前隔离施工 WP-3D：只读 SSE terminal cursor restart 语义与断线/SQLite+Server 重开读回验收；不接 retry、query cursor、Store schema、Web live、startup recovery 或 retention/reset。Web 侧另有 HarmonyOS API 26 兼容 overlay：本地 Chrome 验收完成后，下一步为目标真机或官方模拟器留证；不得把浏览器模拟表述为设备通过。
