@@ -31,3 +31,11 @@ npm.cmd run dev
 ## WP-4A Live Adapter（尚未接入页面）
 
 `src/live-adapter.ts` 与 `src/live-state.ts` 提供独立的 POST、SSE、public resume snapshot adapter 和纯状态机。新 Turn 才调用 `POST /api/turns`；刷新先读取 `/resume`，普通断线从当前公开 cursor 续 SSE，只有 `event_cursor_conflict` 才回退到 public resume snapshot。刷新和重连路径没有 POST。现有 fixture replay 继续作为页面默认数据源，本切片不改变视觉页面。
+
+## HarmonyOS API 26 Web compatibility overlay（本地浏览器验证）
+
+- viewport meta 声明 `viewport-fit=cover` 与 `interactive-widget=resizes-content`；页面通过 `VisualViewport`（不可用时回退 layout viewport）设置应用高度和键盘 inset，避免把 200% 页面缩放当作软键盘。
+- 安全区 inset 与桌面工作区间距叠加；1100px 三栏/1099px Inspector Drawer 的边界不变。触控单栏保障主要控件至少 44px；矮横屏（最大高度 500px）使用单栏导航 Drawer。
+- 自动验收覆盖 viewport meta、fallback 标志、模拟安全区、composition 期间不提交、390/360/432 纵向、844×390 横屏、CDP 200% page scale 及 coarse-touch 抽屉。它不是 HarmonyOS 真机或模拟器结论。
+
+HarmonyOS 7 / API 26 真机或官方模拟器仍为 Pending；设备型号、Web runtime 版本、真实 IME 候选词、刘海安全区和旋转后的恢复行为需要在目标环境单独留证。
