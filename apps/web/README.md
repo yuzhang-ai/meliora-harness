@@ -39,3 +39,11 @@ npm.cmd run dev
 真实模式模型由 Server 环境配置，网页的预览模型选择器不构成 Provider 切换。真实审批事件只读展示，不生成授权。无密钥的 `tests/live-server.test.ts` 使用真实 SQLite + Server + fake model 验证 POST/SSE/刷新 GET；它不能代替 WP-5 的真实 DeepSeek/Kimi canary。
 
 `apps/web` 的锁文件固定了 Playwright；安装 Chromium 后可运行 `npm.cmd --prefix apps/web run verify:live-browser`。独立 GitHub CI job 会安装 Chromium 并执行同一脚本。脚本在临时 Git 工作区启动真实 SQLite/Server 和无密钥 model fixture，通过浏览器验收 1440/1100/768/390px、一次 POST、SSE 终态、刷新 GET-only、未知提交保护、过期 Run 手动恢复和私有内容不回显。`PLAYWRIGHT_MODULE` 可指定本机已安装模块路径，`BROWSER_CHANNEL=msedge` 可改用 Edge。临时数据库位于系统临时目录，验证结束后删除。
+
+## HarmonyOS API 26 Web compatibility overlay（本地浏览器验证）
+
+- viewport meta 声明 `viewport-fit=cover` 与 `interactive-widget=resizes-content`；页面通过 `VisualViewport`（不可用时回退 layout viewport）设置应用高度和键盘 inset，避免把 200% 页面缩放当作软键盘。
+- 安全区 inset 与桌面工作区间距叠加；1100px 三栏/1099px Inspector Drawer 的边界不变。触控单栏保障主要控件至少 44px；矮横屏（最大高度 500px）使用单栏导航 Drawer。
+- 自动验收覆盖 viewport meta、fallback 标志、模拟安全区、composition 期间不提交、390/360/432 纵向、844×390 横屏、CDP 200% page scale 及 coarse-touch 抽屉。它不是 HarmonyOS 真机或模拟器结论。
+
+HarmonyOS 7 / API 26 真机或官方模拟器仍为 **待验收**；设备型号、Web runtime 版本、真实 IME 候选词、刘海安全区和旋转后的恢复行为需要在目标环境单独留证。

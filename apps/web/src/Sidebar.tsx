@@ -15,6 +15,7 @@ import {
   Sun,
 } from "lucide-react";
 import type { Library } from "./projects";
+import { SINGLE_PANE_MEDIA } from "./viewport";
 
 interface SidebarProps {
   library: Library;
@@ -53,7 +54,7 @@ export function Sidebar(props: SidebarProps) {
     const focusSearch = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLocaleLowerCase() === "k") {
         event.preventDefault();
-        if (window.innerWidth <= 768) props.onReveal();
+        if (window.matchMedia(SINGLE_PANE_MEDIA).matches) props.onReveal();
         window.requestAnimationFrame(() => searchInput.current?.focus());
       }
     };
