@@ -10,6 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  web-live-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm ci
+        working-directory: apps/web
+      - run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+      - run: npm run verify:live-browser
+        working-directory: apps/web
   e3-characterization:
     runs-on: ubuntu-latest
     timeout-minutes: 15

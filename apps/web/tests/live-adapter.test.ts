@@ -230,12 +230,15 @@ test("cursor conflict falls back to public resume snapshot and never POSTs", asy
 
 test("a new turn POSTs once and follows only its returned run", async () => {
   const methods: string[] = [];
+  const phases: string[] = [];
   const adapter = new WebLiveAdapter(baseUrl, async (input, init) => {
     methods.push(init?.method ?? "GET");
     if (String(input).endsWith("/api/turns")) return Response.json(command, { status: 202 });
     return new Response(sse(source), { status: 200, headers: { "content-type": "text/event-stream" } });
   });
-  const state = await new LiveRunController(adapter).start(request);
+  const state = await new LiveRunController(adapter, (next) => phases.push(next.phase)).start(request);
   assert.equal(state.phase, "terminal");
   assert.deepEqual(methods, ["POST", "GET"]);
+  assert.deepEqual(phases.slice(0, 3), ["submitting", "connecting", "live"]);
+  assert.equal(phases.at(-1), "terminal");
 });

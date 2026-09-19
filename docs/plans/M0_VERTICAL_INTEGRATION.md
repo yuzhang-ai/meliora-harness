@@ -146,9 +146,9 @@ Owner：你 + Codex；秦峻溥负责 Store/Server adapter；独立 Agent 验证
 
 ### WP-4：Web live adapter
 
-Owner：张子恒；后端提供已冻结 API 和本地 fixture server。
+Owner：你 + Codex 负责 WP-4B 页面真实接线与最终验收；张子恒已交付 WP-4A adapter 和独立视觉基线。
 
-- 保留 fixture replay 作为组件门禁，新增 EventSource/live source adapter。
+- 保留 fixture replay 作为组件门禁，新增基于 Fetch SSE 的 live source adapter；不要求原生 EventSource。
 - 发送成功后订阅返回的 `runId`；刷新先按 durable cursor 重放，retained event 不足时使用 WP-3 的 public snapshot + resume-point，不能重新 POST。
 - 真实 live E2E 首先覆盖 read-only success、retained-event reconnect、snapshot resume 和 recovery blocked。
 - cancelled、approval、tool failure 等未接入后端的状态先保持 fixture browser gate；相应 command/state slice 合入后再升级为 live E2E。

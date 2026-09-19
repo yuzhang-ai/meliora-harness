@@ -34,6 +34,8 @@ export interface MelioraServerOptions {
   maxJsonBodyBytes?: number;
   pollIntervalMs?: number;
   heartbeatMs?: number;
+  /** Optional local-server Host allowlist; reject DNS rebinding before any route or command work. */
+  allowedHosts?: readonly string[];
 }
 
 const isTerminalPublicEvent = (event: PublicRunEvent): boolean =>
@@ -318,6 +320,10 @@ export const readPublicRunResumeSnapshot = async (
 };
 
 const handleRequest = async (options: MelioraServerOptions, request: IncomingMessage, response: ServerResponse): Promise<void> => {
+  if (options.allowedHosts && !options.allowedHosts.includes(request.headers.host?.toLowerCase() ?? "")) {
+    writeJsonError(response, 403, { error: "forbidden_host" });
+    return;
+  }
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const url = new URL(request.url ?? "/", "http://127.0.0.1");

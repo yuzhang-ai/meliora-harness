@@ -361,3 +361,34 @@ test("SSE framing uses sequence ids and rejects kind line breaks", () => {
   assert.match(encodeSseEvent(event), /^id: 1$/mu);
   assert.throws(() => encodeSseEvent({ ...event, kind: "run_completed\nid: injected" } as unknown as PublicRunEvent), TypeError);
 });
+
+test("local Host allowlist rejects DNS-rebinding hosts before command submission", async () => {
+  let submissions = 0;
+  const server = createMelioraServer({
+    store: fakeStore([]),
+    resolveSessionId: () => null,
+    resolveLocalPrincipalId: () => null,
+    allowedHosts: ["127.0.0.1:8787", "localhost:8787"],
+    submitTurnCommand: async () => { submissions += 1; throw new Error("must not submit"); },
+  });
+  const port = await listenOnFetchSafeLoopbackPort(server);
+  const url = `http://127.0.0.1:${port}`;
+  try {
+    const rejectedRead = await rawGet(url, "/api/health", { Host: "attacker.example:8787" });
+    assert.equal(rejectedRead.statusCode, 403);
+    const rejectedPost = await new Promise<number | undefined>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: "127.0.0.1", port, path: "/api/turns", method: "POST",
+        headers: { Host: "attacker.example:8787", "content-type": "application/json" },
+      }, (response) => { response.resume(); response.on("end", () => resolve(response.statusCode)); });
+      request.on("error", reject);
+      request.end("{}");
+    });
+    assert.equal(rejectedPost, 403);
+    assert.equal(submissions, 0);
+    assert.equal((await rawGet(url, "/api/health", { Host: "127.0.0.1:8787" })).statusCode, 200);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
