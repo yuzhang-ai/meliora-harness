@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 
 (async () => {
-  const browser = await chromium.launch({ channel: "chrome", headless: true });
+  const browser = await chromium.launch({ channel: process.env.BROWSER_CHANNEL || "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await page.addInitScript(() => {
     if (sessionStorage.getItem("meliora-browser-check-reset") === "pending") {
@@ -50,7 +50,7 @@ const path = require("node:path");
       assert.ok(await page.locator(".right-panel").evaluate((element) => element.getBoundingClientRect().left >= innerWidth));
     }
     if ([1440, 1100, 768, 390].includes(width)) {
-      await page.screenshot({ path: path.join(__dirname, `web-${width}.png`), fullPage: true });
+      await page.screenshot({ path: path.join(process.env.BROWSER_SCREENSHOT_DIR || __dirname, `web-${width}.png`), fullPage: true });
     }
   }
 

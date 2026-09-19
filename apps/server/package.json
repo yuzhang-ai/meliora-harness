@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "tsx src/local-dev.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "tsx --test tests/*.test.ts"
   }

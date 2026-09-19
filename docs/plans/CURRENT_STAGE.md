@@ -1,9 +1,9 @@
 # 当前阶段施工单
 
 > 状态：Active
-> 里程碑：M0 - 基线与契约冻结
-> 版本：v0.4
-> 最后更新：2026-09-15
+> 里程碑：M0 - Web 真实只读闭环
+> 版本：v0.5
+> 最后更新：2026-09-19
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md) 及全部专项规范
@@ -12,20 +12,20 @@
 
 ## 1. 本阶段目标
 
-把“已经分析清楚的 E3 基线”变成三个人可以在同一仓库并行施工的干净起点。M0 不追求真实模型完整产品，也不先删除 UX Editor。退出时必须有独立 Meliora 编译闭包、冻结的公共契约、可回放 fixtures、CI 和三条互不踩脚的开发线。
+当前重点是让用户从 Web 页面输入任务，经本地 Server 的 durable command、Runtime、SQLite 和 SSE 得到可恢复的真实只读结果。已完成的基线/契约工作保留为回归门禁；前端产品级视觉打磨等链路验收后再做。真实 DeepSeek/Kimi 人工 canary 属 WP-5，不以无密钥 fixture 冒充。
 
 ## 2. 当前事实
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: main@cfecb4a7；PR #33 已通过攻击性复审并 squash merge
+Target repo state: remote main@b6c65055；PR #35/#36 已合并；Harmony PR #37 独立 Draft
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-CI: GitHub Actions run 34572069965 passed
-Team access: QinJunpu verified；张子恒 GitHub identity pending
-Blocked: none
+Current slice: WP-4B 页面真实输入/运行状态/刷新恢复与本地服务装配
+Validation: 本切片须独立核验 Web tests、Server/Store、浏览器真实路径及 GitHub CI
+Blocked: 真实 Provider canary 等待用户本机密钥与人工触发；不阻塞无密钥纵向验收
 ```
 
 ## 3. 决策冻结
@@ -131,11 +131,14 @@ WP-A read-only runtime + WP-C store
 | Web Shell | 张子恒 | Merged | Issue #1 / PR #18 已合并至 main `02b1e297`；Web 11/11、四档响应式与真实 Chrome 验收、全量 check、CI 和独立复审通过；尚未接入真实 Server/SSE |
 | Store/Server skeleton | 秦峻溥 | Merged | PR #8 已合并至 main `e56ed392`；Store 8/8、Server/SSE 13/13、Windows 全量 check、CI 与独立安全复审通过 |
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
-| M0 真实纵向集成 | 你 + Codex | In progress | Issue #15；WP-1/2 已经 PR #16/#19 合并，WP-3A 已经 PR #20 合并至 main `17f54dd1`，WP-3B.1a 已由 PR #21 合并至 main `80bfbf1f`，WP-3B.1b 已由 PR #22 合并至 main `f72d2674`，WP-3B.2a 已由 PR #23 合并至 main `77fbf95a`，B2b.1 已由 PR #24 合并至 main `1055f7f8`，B2b.2 已由 PR #25 squash merge 至 main `b97588c5`，WP-3B.2c.1 已由 PR #26 合并至 main `5bbc65dc`，WP-3C.2b 已由 PR #33 合并至 main `cfecb4a7`。当前隔离施工 WP-3D：只读 SSE terminal cursor restart 语义（clean terminal `204`、terminal raw tail `409`）及断线/SQLite+Server 重开读回验收；不含 retry、query cursor、Store schema、Web live、startup recovery 或 retention/reset。 |
+| M0 真实纵向集成 | 你 + Codex | Backend merged | WP-1/2/3 已合入 main；PR #34 完成 SSE restart、terminal `204`、raw-tail `409` 与 SQLite 重开只读恢复。Web 页面尚未完成真实链路验收。 |
+| WP-4A Web Live Adapter | 张子恒 | Merged | PR #35 合入 main；POST、SSE、public resume snapshot 与状态机已具备，页面默认仍是 fixture。 |
+| WP-4B 页面真实链路 | 你 + Codex | In progress | 独立分支 `codex/web-live-page-wp4b`，从 main `b6c65055` 开始；页面输入、真实状态、刷新恢复、本地 Server 入口与浏览器验收。 |
+| 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉合入 main；Harmony API 26 PR #37 独立评审，不与 WP-4B 混改。产品级视觉打磨排在真实闭环之后。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-Contract-first slice、只读 Runtime、Store/Server skeleton、Provider Transport、durable command、Server composition、纵向 fake Provider fixture、Recovery Read Contract、fixture-first Web Shell、WP-3B.1a、WP-3B.1b、WP-3B.2a、B2b.1、B2b.2（PR #25）、按需 public resume snapshot（PR #26，main `5bbc65dc`）及 WP-3C.2b（PR #33，main `cfecb4a7`）已合并到 `main`。当前隔离施工 WP-3D：只读 SSE terminal cursor restart 语义与断线/SQLite+Server 重开读回验收；不接 retry、query cursor、Store schema、Web live、startup recovery 或 retention/reset。
+完成 WP-4B：先让页面真正 POST → 接收 `runId` → SSE 呈现公开事件，刷新和断线只走 GET/resume/SSE；在真实 SQLite/Server 纵向测试和 Chrome 桌面/手机验收中核对无重复 POST、无 private 泄漏和终态。随后独立审查、CI、合并；再安排 WP-5 人工 DeepSeek/Kimi canary。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。

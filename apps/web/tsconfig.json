@@ -9,6 +9,7 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
+    "types": ["vite/client", "node"],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,

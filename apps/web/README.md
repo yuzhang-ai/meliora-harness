@@ -1,11 +1,10 @@
 # Meliora Web Shell 三栏版
 
-只使用公开事件 fixture 的 React 三栏工作台。修改范围限于 apps/web；不包含真实模型调用、数据库接入、文件写入或有效审批。
+React 三栏工作台。默认是公开事件 fixture 预览；手动切换「真实运行」后，页面会向本地 Server 发起只读 Turn、订阅 SSE，并在刷新时从 public resume snapshot 恢复。右栏 Diff、审批、附件和语音仍未接入，不可当作已执行能力。
 
 ## 启动
 在仓库根目录 PowerShell 执行：
 ```powershell
-$env:Path = "H:\harness\.local-tools\node-v22.14.0-win-x64;" + $env:Path
 cd apps/web
 npm.cmd ci
 npm.cmd run dev
@@ -19,15 +18,21 @@ npm.cmd run dev
 - 中间面包屑、用户/AI 消息、计划、工具、验证、Outcome 与多控件输入区。
 - 右侧 Changes/Preview 标签、无 Diff 空态和通知卡；没有真实 Diff 时不显示示例文件或虚构统计。
 - 逐事件/自动回放、侧栏折叠、项目与对话创建、主题切换、中文多行输入。
-- 刷新恢复本地演示项目、对话与进度；不发送 Run 或 Provider 请求。
+- 预览模式刷新恢复本地演示项目、对话与进度；真实模式刷新只读取 `/resume`，不重新 POST。
 - 新建对话和零事件状态分别展示真实 empty/loading 反馈，不沿用固定完成内容。
 - 同时保留过期审批只读态与未过期审批交互态；所有按钮都明确为前端演示，不会产生真实授权。
 - 首期默认使用浅色主题，也可在界面中切换深色主题。
-- 纯浏览器界面不申请工作区目录 capability；工作区选择等待 Runtime/Server 能力接入。
+- 纯浏览器界面不申请工作区目录 capability；真实模式只发送服务端预先配置的 workspace ID，不发送本地路径。
 - BoardUI 仅依照可见信息架构参考；未复制商业模板源码。
 
-尚未接真实 HTTP/SSE、完整 RunSnapshot、ApprovalRequest 和 Artifact API；这里的重连是固定事件恢复演示。不要将演示通过表述为后端端到端验收。
+预览模式的「重连」是固定事件演示；真实模式从服务端公开事件恢复。尚未接有效 ApprovalRequest/Artifact API，不得将预览通过表述为后端端到端验收。
 
-## WP-4A Live Adapter（尚未接入页面）
+## WP-4B 本地真实链路
 
-`src/live-adapter.ts` 与 `src/live-state.ts` 提供独立的 POST、SSE、public resume snapshot adapter 和纯状态机。新 Turn 才调用 `POST /api/turns`；刷新先读取 `/resume`，普通断线从当前公开 cursor 续 SSE，只有 `event_cursor_conflict` 才回退到 public resume snapshot。刷新和重连路径没有 POST。现有 fixture replay 继续作为页面默认数据源，本切片不改变视觉页面。
+先在可信本地 PowerShell 会话中设置 `MELIORA_WORKSPACE_ID`、`MELIORA_WORKSPACE_ROOT`（已存在的工作区目录）、`MELIORA_DATABASE_PATH`（工作区外的绝对路径）、`MELIORA_PROVIDER`（`deepseek` 或 `kimi`）、`MELIORA_MODEL` 和 `MELIORA_API_KEY`，然后从仓库根目录运行 `npm.cmd --prefix apps/server run dev`。密钥只进入本机 Server 进程环境；不要提交到仓库、输入网页或复制进截图。Server 固定监听 `127.0.0.1:8787`；Vite 开发服务器将同源 `/api` 代理过去。网页「工作区 ID」填写服务端配置的同一 ID，再切换真实运行并发送。
+
+新 Turn 才调用 `POST /api/turns`；刷新先 GET `/resume`，普通断线从公开 cursor 续 SSE，只有 `event_cursor_conflict` 才退到 public resume snapshot。浏览器仅保存 workspace/run ID 或待确认的幂等键，不保存密钥、输入原文或私有 Provider 内容。提交响应丢失且没有 run ID 时，页面保留提交锁，刷新也不会自动重发；须先人工核查服务端状态，才能明确解除锁。已知 Run 恢复失败时可手动「忘记此 Run」再开始新任务，不会自动删掉恢复记录。生产部署尚无反向代理/认证装配，不能将本地 API 监听到公网。
+
+真实模式模型由 Server 环境配置，网页的预览模型选择器不构成 Provider 切换。真实审批事件只读展示，不生成授权。无密钥的 `tests/live-server.test.ts` 使用真实 SQLite + Server + fake model 验证 POST/SSE/刷新 GET；它不能代替 WP-5 的真实 DeepSeek/Kimi canary。
+
+`apps/web` 的锁文件固定了 Playwright；安装 Chromium 后可运行 `npm.cmd --prefix apps/web run verify:live-browser`。独立 GitHub CI job 会安装 Chromium 并执行同一脚本。脚本在临时 Git 工作区启动真实 SQLite/Server 和无密钥 model fixture，通过浏览器验收 1440/1100/768/390px、一次 POST、SSE 终态、刷新 GET-only、未知提交保护、过期 Run 手动恢复和私有内容不回显。`PLAYWRIGHT_MODULE` 可指定本机已安装模块路径，`BROWSER_CHANNEL=msedge` 可改用 Edge。临时数据库位于系统临时目录，验证结束后删除。

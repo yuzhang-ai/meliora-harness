@@ -174,7 +174,7 @@ export type StreamResult = "closed" | "terminal";
 export class WebLiveAdapter {
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string, private readonly fetcher: FetchLike = fetch) {
+  constructor(baseUrl: string, private readonly fetcher: FetchLike = (input, init) => fetch(input, init)) {
     this.baseUrl = trustedBaseUrl(baseUrl);
   }
 
@@ -250,10 +250,14 @@ export class WebLiveAdapter {
 
 export class LiveRunController {
   state: LiveRunState = initialLiveRunState();
-  constructor(private readonly adapter: WebLiveAdapter) {}
+  constructor(
+    private readonly adapter: WebLiveAdapter,
+    private readonly onChange?: (state: LiveRunState) => void,
+  ) {}
 
   private dispatch(action: Parameters<typeof reduceLiveRun>[1]): void {
     this.state = reduceLiveRun(this.state, action);
+    this.onChange?.(this.state);
   }
 
   private async consume(signal?: AbortSignal): Promise<void> {
