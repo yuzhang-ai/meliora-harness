@@ -148,7 +148,7 @@ test("public resume point is not a raw throughSequence or SSE Last-Event-ID", as
 });
 
 test("public resume snapshot safely rejects source and response size limits", async () => {
-  const sourceOverflow = Array.from({ length: 501 }, (_, index) => ({
+  const sourceOverflow = Array.from({ length: 5_001 }, (_, index) => ({
     ...storedEvent(index + 1, "model.reasoning_delta"), visibility: "private" as const,
   }));
   const sourceApp = await startServer(fakeStore(sourceOverflow));
@@ -166,6 +166,25 @@ test("public resume snapshot safely rejects source and response size limits", as
     assert.equal(response.status, 413);
     assert.deepEqual(await response.json(), { error: "resume_snapshot_too_large" });
   } finally { await responseApp.close(); }
+});
+
+test("public resume reaches a terminal after a real-sized private reasoning prefix", async () => {
+  const privatePrefix = Array.from({ length: 1_329 }, (_, index) => ({
+    ...storedEvent(index + 1, "model.reasoning_delta"), visibility: "private" as const,
+  }));
+  const events = [
+    ...privatePrefix,
+    { ...storedEvent(1_330, "run_completed"), createdAt: "2026-09-11T00:00:00.000Z" },
+  ];
+  const app = await startServer(fakeStore(events));
+  try {
+    const response = await fetch(`${app.url}/api/runs/run-1/resume`);
+    assert.equal(response.status, 200);
+    const snapshot = await response.json() as { throughSequence: number; events: PublicRunEvent[] };
+    assert.equal(snapshot.throughSequence, 1_330);
+    assert.deepEqual(snapshot.events.map((event) => event.kind), ["run_completed"]);
+    assert.equal(snapshot.events[0]?.sequence, 1_330);
+  } finally { await app.close(); }
 });
 
 test("SSE resumes from numeric Last-Event-ID and filters private events", async () => {

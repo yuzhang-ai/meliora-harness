@@ -163,6 +163,7 @@ Owner：你 + Codex；用户提供本机临时密钥并人工触发。
 - DeepSeek 与 Kimi 各跑一个只读 Coding Run。
 - 密钥不落库、不进日志、不进前端、不进测试 fixture。
 - 分别记录 Provider 调用、Tool Receipt、验证、刷新恢复和最终 outcome 证据。
+- 用户可明确选择使用自有 OpenAI-compatible 网关凭证；此时只称为「指定网关真实模型链路验收」，不等同 DeepSeek/Kimi 官方 API 直连。凭证、网关 base URL 与 exact trusted origin 仅由本机 Server 注入，测试工作区必须是无敏感数据的临时 Git 仓库。一次 canary 若遇到结果未知，不自动重发新的付费 Command。
 
 真实密钥联调不能替代无密钥 fixture，也不能在 CI 中自动运行。
 

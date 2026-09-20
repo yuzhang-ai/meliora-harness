@@ -62,7 +62,9 @@ export const encodeSseEvent = (event: PublicRunEvent): string => {
 const json = (value: unknown): string => JSON.stringify(value);
 const canonicalPublicResumeJson = (snapshot: PublicRunResumeSnapshot): string => canonicalJson(snapshot as unknown as JsonValue);
 const DEFAULT_MAX_JSON_BODY_BYTES = 70 * 1024;
-const MAX_PUBLIC_RESUME_SOURCE_EVENTS = 500;
+// Thinking models can emit more than 1,000 private reasoning fragments before
+// a small public terminal. Keep the scan bounded without stranding the browser.
+const MAX_PUBLIC_RESUME_SOURCE_EVENTS = 5_000;
 const MAX_PUBLIC_RESUME_RESPONSE_BYTES = 256 * 1024;
 const PUBLIC_RESUME_PAGE_SIZE = 100;
 

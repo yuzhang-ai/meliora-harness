@@ -115,7 +115,9 @@ Codec 不执行工具、不审批、不写业务状态、不决定任务是否�
 
 - DeepSeek 与 Kimi 共用 OpenAI-compatible Chat Completions transport，但各自默认只向官方 origin 发送凭证。
 - 自定义 HTTPS 网关和本地 loopback 网关必须由服务端配置以 exact origin 显式加入 trusted list；浏览器输入、模型输出和请求参数不能决定 endpoint 或 trusted origin。
+- 本地 WP-5 网关 canary 通过成对的 Server-only `MELIORA_GATEWAY_BASE_URL` 与 `MELIORA_TRUSTED_PROVIDER_ORIGIN` 配置，二者必须是同一 HTTPS origin；Server 在受控 base path 后拼接 `/chat/completions`。未配置时仍仅使用官方默认 endpoint。网关测试结果只证明指定网关链路，不等同官方直连。
 - Transport 不读取 `process.env`、不记录 Authorization、URL、响应 body 或底层 Error 原文，也不在内部隐式重试。重试由拥有 durable Model Step 状态的 Runtime 决定。
+- Transport 解码完整模型流后、返回任何 canonical event 前，必须以其持有的实际 API Key 检查 Provider-originated 文本、reasoning、工具参数与 ID（含跨 delta 拼接）；命中即丢弃整批原始事件，仅返回固定安全失败。请求已发出，Runtime 保留 started checkpoint 并进入 outcome-unknown，不得自动重调。该精确值防线不声称识别改写、编码或加密后的凭证。
 - SSE reader 必须处理 UTF-8 字节分片、CRLF、注释、多行 `data`、`[DONE]`、显式 `finish_reason`、超时和调用方取消，并限制单事件、响应与总流大小。
 - `[DONE]` 只有在已收到合法 `finish_reason` 后才能结束成功；缺少终止语义、非法 JSON 或越界响应统一投影为安全的 `provider_malformed_stream`。
 - Tool history 回填使用 Runtime `invocationId` 作为关联 ID；Provider Tool Call ID 仅作协议元数据，缺失或重复时不能成为内部或重放主键。

@@ -143,6 +143,115 @@ test("transport failure events never contain the local endpoint, authorization, 
   }
 });
 
+test("a gateway echoing the exact operator credential never returns a persistable model event", async () => {
+  const apiKey = "opaquecredential1234567890";
+  const app = await startFixtureServer(async (_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(frame({
+      choices: [{ index: 0, delta: { content: `响应正文 ${apiKey}` }, finish_reason: "stop" }],
+    }));
+    response.end("data: [DONE]\n\n");
+  });
+  try {
+    const events = await createDeepSeekChatTransport({
+      endpoint: `${app.origin}/echo/chat/completions`, model: "fixture-model", apiKey,
+      ...trustFixtureOrigin(app.origin),
+    }).next({ messages: [{ role: "user", content: "只读任务" }], context: fixtureContext("deepseek", "echo-1", "2026-09-11T00:00:00") });
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.kind, "model_step_failed");
+    assert.equal(events[0]?.kind === "model_step_failed" && events[0].code, "provider_malformed_stream");
+    assert.equal(JSON.stringify(events).includes(apiKey), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test("exact credential echo fails closed across text, reasoning, tool arguments and Provider IDs", async () => {
+  const apiKey = "opaquecredential1234567890";
+  const argument = JSON.stringify({ probe: apiKey });
+  const chunk = (delta: Readonly<Record<string, unknown>>, finishReason?: string): Readonly<Record<string, unknown>> => ({
+    choices: [{ index: 0, delta, ...(finishReason === undefined ? {} : { finish_reason: finishReason }) }],
+  });
+  const tool = (id: string, argumentsPart: string): Readonly<Record<string, unknown>> => ({
+    tool_calls: [{ index: 0, id, function: { name: "git_status", arguments: argumentsPart } }],
+  });
+  const scenarios = [
+    { name: "split text", chunks: [chunk({ content: apiKey.slice(0, 9) }), chunk({ content: apiKey.slice(9) }, "stop")] },
+    { name: "split reasoning alias", chunks: [chunk({ reasoning: apiKey.slice(0, 9) }), chunk({ reasoning: apiKey.slice(9) }, "stop")] },
+    { name: "split tool arguments", chunks: [chunk(tool("call-safe", argument.slice(0, 13))), chunk(tool("call-safe", argument.slice(13)), "tool_calls")] },
+    { name: "tool call ID", chunks: [chunk(tool(apiKey, "{}"), "tool_calls")] },
+    { name: "response ID", chunks: [{ id: apiKey, ...chunk({ content: "safe response" }, "stop") }] },
+  ] as const;
+  for (const provider of ["deepseek", "kimi"] as const) {
+    for (const scenario of scenarios) {
+      const app = await startFixtureServer(async (_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        for (const entry of scenario.chunks) response.write(frame(entry));
+        response.end("data: [DONE]\n\n");
+      });
+      try {
+        const options = {
+          endpoint: `${app.origin}/echo/chat/completions`, model: "fixture-model", apiKey,
+          ...trustFixtureOrigin(app.origin),
+        };
+        const transport = provider === "deepseek" ? createDeepSeekChatTransport(options) : createKimiChatTransport(options);
+        const events = await transport.next({
+          messages: [{ role: "user", content: "只读任务" }], context: fixtureContext(provider, `echo-${scenario.name}`, "2026-09-11T00:00:00"),
+        });
+        assert.equal(events.length, 1, `${provider}: ${scenario.name}`);
+        assert.equal(events[0]?.kind === "model_step_failed" && events[0].code, "provider_malformed_stream", `${provider}: ${scenario.name}`);
+        assert.equal(JSON.stringify(events).includes(apiKey), false, `${provider}: ${scenario.name}`);
+      } finally {
+        await app.close();
+      }
+    }
+  }
+});
+
+test("a nonmatching prefix remains a normal Provider result", async () => {
+  const apiKey = "opaquecredential1234567890";
+  const app = await startFixtureServer(async (_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(frame({ choices: [{ index: 0, delta: { content: apiKey.slice(0, -1) }, finish_reason: "stop" }] }));
+    response.end("data: [DONE]\n\n");
+  });
+  try {
+    const events = await createKimiChatTransport({
+      endpoint: `${app.origin}/safe/chat/completions`, model: "fixture-model", apiKey,
+      ...trustFixtureOrigin(app.origin),
+    }).next({ messages: [{ role: "user", content: "只读任务" }], context: fixtureContext("kimi", "safe-prefix", "2026-09-11T00:00:00") });
+    assert.deepEqual(events.map((event) => event.kind), ["assistant_text_delta", "model_step_completed"]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("optional model output ceiling is sent per request and invalid ceilings fail before network", async () => {
+  let captured: unknown;
+  const app = await startFixtureServer(async (request, response) => {
+    captured = await readJson(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const chunk of deepseekStreamTextSingleToolFixture.rawChunks) response.write(frame(chunk));
+    response.end("data: [DONE]\n\n");
+  });
+  try {
+    const transport = createDeepSeekChatTransport({
+      endpoint: `${app.origin}/cap/chat/completions`, model: "fixture-model", apiKey: "local-token",
+      maxOutputTokens: 512, ...trustFixtureOrigin(app.origin),
+    });
+    await transport.next({ messages: [{ role: "user", content: "x" }], context: fixtureContext("deepseek", "cap-1", "2026-09-11T00:00:00") });
+    assert.equal((captured as { max_tokens?: unknown }).max_tokens, 512);
+    for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(() => createDeepSeekChatTransport({
+        endpoint: `${app.origin}/cap/chat/completions`, model: "fixture-model", apiKey: "local-token",
+        maxOutputTokens: invalid, ...trustFixtureOrigin(app.origin),
+      }), OpenAiCompatibleTransportConfigurationError);
+    }
+  } finally {
+    await app.close();
+  }
+});
+
 test("an explicit finish_reason is accepted as a terminal stream when a provider omits [DONE]", async () => {
   const app = await startFixtureServer(async (_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });

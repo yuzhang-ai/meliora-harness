@@ -9,6 +9,7 @@ import {
   createProviderBackedReadOnlyRunModel,
 } from "./turn-command-composition.js";
 import { createLocalMelioraServer } from "./persistence.js";
+import { resolveLocalProviderEndpoint } from "./local-provider-config.js";
 
 const required = (name: string): string => {
   const value = process.env[name];
@@ -41,12 +42,17 @@ async function main(): Promise<void> {
   if (provider !== "deepseek" && provider !== "kimi") throw new Error("Provider must be deepseek or kimi.");
   const modelName = required("MELIORA_MODEL");
   const apiKey = required("MELIORA_API_KEY");
-  const endpoint = provider === "deepseek"
-    ? "https://api.deepseek.com/chat/completions"
-    : "https://api.moonshot.cn/v1/chat/completions";
+  const maxOutputTokens = process.env.MELIORA_MAX_OUTPUT_TOKENS === undefined
+    ? undefined
+    : Number(required("MELIORA_MAX_OUTPUT_TOKENS"));
+  const { endpoint, trustedEndpointOrigins } = resolveLocalProviderEndpoint(
+    provider,
+    process.env.MELIORA_GATEWAY_BASE_URL,
+    process.env.MELIORA_TRUSTED_PROVIDER_ORIGIN,
+  );
   const transport = provider === "deepseek"
-    ? createDeepSeekChatTransport({ endpoint, model: modelName, apiKey })
-    : createKimiChatTransport({ endpoint, model: modelName, apiKey });
+    ? createDeepSeekChatTransport({ endpoint, model: modelName, apiKey, trustedEndpointOrigins, maxOutputTokens })
+    : createKimiChatTransport({ endpoint, model: modelName, apiKey, trustedEndpointOrigins, maxOutputTokens });
   const model = createProviderBackedReadOnlyRunModel({
     provider, transport, catalog: createFrozenReadOnlyWorkspaceCatalog(),
     now: () => new Date().toISOString(),

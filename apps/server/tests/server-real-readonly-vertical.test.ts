@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -709,6 +709,74 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
   assert.equal(capturedProvider.captured.length, 2);
 });
 }
+
+test("Server rejects an arbitrary-format credential echo before any private event or history artifact is durable", async () => {
+  const apiKey = "opaquecredential1234567890";
+  const parent = await mkdtemp(join(tmpdir(), "meliora-server-credential-echo-"));
+  const workspaceRoot = join(parent, "workspace");
+  const databasePath = join(parent, "meliora.sqlite");
+  const provider = await startFakeProvider(() => "unused follow-up", "", apiKey);
+  await mkdir(workspaceRoot, { recursive: true });
+  await initializeGitWorkspace(workspaceRoot);
+  const store = new SqliteSessionStore(databasePath, { clock: () => new Date(fixedNow) });
+  const transport = createDeepSeekChatTransport({
+    endpoint: `${provider.origin}/deepseek/chat/completions`, model: "fixture-model", apiKey,
+    trustedEndpointOrigins: [provider.origin],
+  });
+  const model = createProviderBackedReadOnlyRunModel({
+    provider: "deepseek", transport, catalog: createFrozenReadOnlyWorkspaceCatalog(), now: () => fixedNow,
+  });
+  const idempotencyKey = "credential-echo-key";
+  const app = await startApp(store, createTurnCommandSubmitter({
+    store, workspaceRoots: new Map([[workspaceId, workspaceRoot]]), model,
+    ids: deterministicIds(), now: () => fixedNow,
+  }));
+  try {
+    const create = await postTurn(app.url, "只读检查工作区状态", idempotencyKey);
+    assert.equal(create.status, 202);
+    const created = await create.json() as TurnCommandResponse;
+    const sse = await fetch(`${app.url}/api/runs/${created.runId}/events`);
+    assert.equal(sse.status, 200);
+    const publicBody = await sse.text();
+    assert.ok(sseEvents(publicBody).some((event) => event.kind === "run_blocked"));
+    assert.equal(publicBody.includes(apiKey), false);
+    const resume = await fetch(`${app.url}/api/runs/${created.runId}/resume`);
+    assert.equal(resume.status, 200);
+    assert.equal((await resume.text()).includes(apiKey), false);
+
+    const stored = await store.readEvents({ runId: created.runId, limit: 100 });
+    assert.equal(JSON.stringify(stored).includes(apiKey), false, "private events must not persist the echoed key");
+    assert.equal(stored.events.some((event) => event.kind === "model.assistant_text_delta"), false);
+    const snapshot = await store.readSnapshot(created.runId);
+    assert.equal(JSON.stringify(snapshot).includes(apiKey), false, "model history/snapshot must not persist the echoed key");
+    assert.equal(snapshot?.state.modelHistoryArtifact, undefined, "no model history artifact may be committed");
+    assert.equal(await store.getArtifact("model-result-model-step-1"), null, "no orphan terminal model-history artifact may be written");
+    assert.equal((await store.readLatestModelStep({ runId: created.runId }))?.status, "started");
+    const command = await store.readRunCommand({ localPrincipalId: "local-user", workspaceId, idempotencyKey });
+    assert.equal(command?.status === "terminal" ? command.terminalCode : null, "model_step_outcome_unknown");
+    assert.equal(provider.captured.length, 1, "an ambiguous result must not repeat the paid request");
+    const replay = await postTurn(app.url, "只读检查工作区状态", idempotencyKey);
+    assert.equal(replay.status, 200);
+    assert.equal(provider.captured.length, 1);
+
+    for (const suffix of ["", "-wal", "-shm"]) {
+      let bytes: Buffer;
+      try {
+        bytes = await readFile(`${databasePath}${suffix}`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && suffix !== "") continue;
+        throw error;
+      }
+      assert.equal(bytes.includes(Buffer.from(apiKey, "utf8")), false, `${suffix || "SQLite"} must not contain UTF-8 credential bytes`);
+      assert.equal(bytes.includes(Buffer.from(apiKey, "utf16le")), false, `${suffix || "SQLite"} must not contain UTF-16LE credential bytes`);
+    }
+  } finally {
+    await app.close();
+    store.close();
+    await provider.close();
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 for (const providerScenario of providerFailureScenarios) {
 test(`Server blocks ambiguous Provider ${providerScenario.name} without retry permission`, async () => {
