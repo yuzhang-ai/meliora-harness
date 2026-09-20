@@ -24,8 +24,8 @@ Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
 Current slice: WP-5 两个指定网关的真实只读 canary；不冒充官方直连
-Validation: WP-4B 全量 check、真实浏览器与 GitHub CI 已通过；WP-5 两个指定网关的合成仓库只读 Run、Receipt、SSE 与重启恢复已实测；本分支全量 check 与独立审查通过，CI 待验证
-Blocked: 无密钥阻塞；只允许使用用户指定网关和临时合成 Git 工作区
+Validation: WP-4B 全量 check、真实浏览器与 GitHub CI 已通过；WP-5 原两次 canary 完成，但 PR #39 凭证回显 P1 已复现，当前仅本地修复候选的定向门禁通过
+Blocked: PR #39 Request changes；本地全量 check/独立候选审查已过，仍需精确新 HEAD GitHub CI 与秦峻溥短复验，禁止以原 canary 扫描结果代替攻击验收
 ```
 
 ## 3. 决策冻结
@@ -134,7 +134,7 @@ WP-A read-only runtime + WP-C store
 | M0 真实纵向集成 | 你 + Codex | Backend merged | WP-1/2/3 已合入 main；PR #34 完成 SSE restart、terminal `204`、raw-tail `409` 与 SQLite 重开只读恢复。Web 页面尚未完成真实链路验收。 |
 | WP-4A Web Live Adapter | 张子恒 | Merged | PR #35 合入 main；POST、SSE、public resume snapshot 与状态机已具备，页面默认仍是 fixture。 |
 | WP-4B 页面真实链路 | 你 + Codex | Merged | PR #38 已合并至 main `8df42a72`；Web 30/30、Server 20/20、浏览器真实 SQLite/Server 路径和 GitHub CI 通过。 |
-| WP-5 指定网关 canary | 你 + Codex | Locally verified; CI pending | [脱敏验收记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：两个指定网关各 1 条合成 Git 仓库只读 Run，均 `run_completed` 且各 1 Receipt；公开 SSE 与重启 `/resume` 一致、终态 `204`、密钥未检出。Kimi 真实 1,331 条 raw event 暴露原 500 条 snapshot 上限，本分支修为有界 5,000 并以原 SQLite 复验通过。独立审查 PASS；未测试官方直连、未从浏览器新建真实模型 Run。 |
+| WP-5 指定网关 canary | 你 + Codex | P1 fix candidate; human review pending | [脱敏验收记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：两个指定网关的原只读 Run 完成，但 PR #39 人工攻击性复审发现任意格式 key 经模型回显落入 private Store。当前 transport 精确值拦截候选本地全量 check 与独立 Terra high 审查通过；未合并、未重调付费网关；秦峻溥短复验及新 HEAD CI 待完成。 |
 | 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉合入 main；Harmony API 26 PR #37 独立评审，不与 WP-4B 混改。产品级视觉打磨排在真实闭环之后。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
@@ -142,4 +142,4 @@ WP-A read-only runtime + WP-C store
 
 ## 9. 下一动作
 
-WP-4B 已合并。WP-5 两个指定网关的真实只读 canary 与重启恢复已通过；下一步验证本分支 CI/PR，并在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。
+WP-4B 已合并。PR #39 的凭证回显 P1 本地候选、合成凭证跨 delta 与 SQLite/WAL/SHM 短复验、全量 check 和独立审查已通过；等待秦峻溥复审与精确 HEAD CI，通过后再合并。随后在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。

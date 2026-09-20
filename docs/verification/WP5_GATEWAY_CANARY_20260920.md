@@ -1,6 +1,6 @@
 # WP-5 指定网关真实模型验收记录
 
-> 状态：本地实测通过；本记录不代替 GitHub CI 或 PR 复审
+> 状态：原 canary 本地实测通过；PR #39 凭证回显 P1 修复中，本记录不代替复审
 > 日期：2026-09-20
 > 事实基线：`main@8df42a7264dee91be56821962a04b12f4f9f7c1f`
 > 施工现场：独立 worktree `codex/wp5-gateway-canary`；原主工作区既有修改未改动
@@ -45,3 +45,20 @@ DeepSeek 首次测试请求因客户端 schema 不合规返回 `400 invalid_requ
 - 未从浏览器新建真实模型 Run；首次提交路径已有无密钥真实 SQLite/Server/浏览器验收，仍需在后续人工窗口补一次真实模型页面提交。
 - 本地服务均已停止。临时合成仓库与 SQLite 保留用于只读复核；不得把数据库、密钥文件、原始 Provider stream 或完整调试日志纳入 PR。
 - 下一步：对本分支做 diff/敏感信息检查与 CI；再按团队流程进行 PR 复审。产品级视觉打磨与 Harmony 分支保持独立。
+
+## P1 凭证回显整改执行卡
+
+- 事实源：PR #39 对 `ce2516c288f84283a75d8ff8abe6ec3df9007719` 的 Request changes；原两次 canary 的 SQLite 凭证扫描只证明**那两次响应**没有回显，不证明恶意或故障网关不能回显。
+- 安全不变量：Server 持有的实际 Provider API Key，无论自身格式如何，不能由模型输出进入 private event、model history Artifact、公开事件或 SQLite/WAL/SHM；命中后不得自动重新调用已发出的 Provider 请求。
+- 施工现场：独立 worktree `codex/wp5-gateway-canary`，原主工作区已有改动不碰；仅修改共享 OpenAI-compatible transport、聚焦测试和本报告。
+- 允许动作：使用合成密钥和本地 fake gateway 做回显、跨 delta、工具参数、推理字段、DB 原始字节验证；完成本地门禁与独立只读复审。禁止真实付费网关重调、读取或输出真实 key、部署及自动合并。
+- 验收矩阵：静态检查源到 sink；transport focused tests；真实 Runtime/SQLite Server 假网关验证；SQLite/WAL/SHM 字节扫描；正常 Provider fixture 与全仓 check；PR CI 与秦峻溥短复验分别单列。
+- 停机条件：任何合成凭证仍进入 durable state，或 fail-closed 破坏了正常 fixture/安全恢复语义；先定位根因，不用重试真实模型。
+
+### 本地候选验证（待独立复审与 PR CI）
+
+- 原回显攻击测试在修复前稳定失败（返回可持久化正文事件），修复后只返回无原文的 `provider_malformed_stream`；Runtime 将其作为已出站且结果不确定的步骤，保留 started checkpoint 并阻塞自动重试。
+- DeepSeek/Kimi 的正文跨 delta、reasoning alias 跨 delta、工具参数跨 delta、Provider tool-call ID 与 response ID 均在 transport 返回前整批拒绝；非匹配前缀保持普通模型输出。
+- 本地 fake gateway → 真实 Server/Runtime/SQLite：公开 SSE 和 `/resume`、private event、snapshot 与 terminal model-history Artifact 均无合成凭证；SQLite/WAL/SHM 可见文件的 UTF-8/UTF-16LE 字节扫描为零；同一 Command replay 未重调 Provider。
+- `npm.cmd run check` 全量通过（Provider 29/29、Server 87/87、Web 30/30、Contracts、Runtime、Store、E3、TypeScript 与 Web build）；`git diff --check` 通过。独立 Terra high 候选审查 PASS，未发现具体绕过或确定回归。秦峻溥短复验与精确新 HEAD GitHub CI 尚未完成。
+- 防线是**实际 key 的精确值**，不声称检测模型将 key 改写、编码、加密或散列后的派生形式；异常模型结果不被当作可自动重试的确定拒绝。

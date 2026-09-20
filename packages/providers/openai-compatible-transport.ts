@@ -402,6 +402,49 @@ function isFailure(value: unknown): value is { readonly kind: "http"; readonly s
   return value !== null && typeof value === "object" && "kind" in value;
 }
 
+/** Inspect only Provider-originated strings, before any canonical event reaches Runtime persistence. */
+function containsCredentialEcho(events: readonly CanonicalModelEvent[], credential: string): boolean {
+  const textDeltas: string[] = [];
+  const reasoningDeltas: string[] = [];
+  const allDeltas: string[] = [];
+  const argumentDeltas = new Map<string, string[]>();
+  for (const event of events) {
+    let providerValue: string | undefined;
+    switch (event.kind) {
+      case "assistant_text_delta":
+        textDeltas.push(event.delta);
+        allDeltas.push(event.delta);
+        providerValue = event.delta;
+        break;
+      case "reasoning_delta":
+        reasoningDeltas.push(event.delta);
+        allDeltas.push(event.delta);
+        providerValue = event.delta;
+        break;
+      case "tool_call_started":
+        if (event.toolName.includes(credential) || event.providerToolCallId?.includes(credential)) return true;
+        break;
+      case "tool_arguments_delta":
+        if (argumentDeltas.has(event.invocationId)) argumentDeltas.get(event.invocationId)!.push(event.delta);
+        else argumentDeltas.set(event.invocationId, [event.delta]);
+        allDeltas.push(event.delta);
+        providerValue = event.delta;
+        break;
+      case "tool_call_completed":
+        providerValue = event.rawArguments;
+        break;
+      case "model_step_completed":
+        providerValue = event.providerResponseId;
+        break;
+      default:
+        break;
+    }
+    if (providerValue?.includes(credential)) return true;
+  }
+  return [textDeltas, reasoningDeltas, allDeltas, ...argumentDeltas.values()]
+    .some((fragments) => fragments.join("").includes(credential));
+}
+
 export function createOpenAiCompatibleChatTransport(options: OpenAiCompatibleTransportOptions): OpenAiCompatibleTransport {
   const config = validateOptions(options);
   return {
@@ -436,7 +479,13 @@ export function createOpenAiCompatibleChatTransport(options: OpenAiCompatibleTra
           redirect: "error",
         }), request.signal);
         const chunks = await readOpenAiSse(response, config, request.signal);
-        return decodeOpenAiCompatibleChatCompletionChunks(config.provider, chunks, input.context);
+        const events = decodeOpenAiCompatibleChatCompletionChunks(config.provider, chunks, input.context);
+        if (containsCredentialEcho(events, config.apiKey)) {
+          // The request may already have executed. Discard the entire result
+          // and keep the existing ambiguous-failure/no-automatic-retry path.
+          return [createOpenAiCompatibleProviderFailureEvent(config.provider, { kind: "malformed_stream" }, input.context, 0)];
+        }
+        return events;
       } catch (error) {
         if (!timedOut && input.signal?.aborted) {
           return [cancelledEvent(input.context)];
