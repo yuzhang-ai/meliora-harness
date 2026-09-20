@@ -26,6 +26,8 @@ export type OpenAiCompatibleTransportOptions = Readonly<{
   endpoint: string;
   model: string;
   apiKey: string;
+  /** Optional operator-owned per-request cost ceiling. */
+  maxOutputTokens?: number;
   timeoutMs?: number;
   maxResponseBytes?: number;
   maxEventBytes?: number;
@@ -69,6 +71,7 @@ type ValidatedOptions = Readonly<{
   endpoint: string;
   model: string;
   apiKey: string;
+  maxOutputTokens?: number;
   timeoutMs: number;
   maxResponseBytes: number;
   maxEventBytes: number;
@@ -160,6 +163,7 @@ function validateOptions(options: OpenAiCompatibleTransportOptions): ValidatedOp
     endpoint: endpoint.toString(),
     model: options.model,
     apiKey: options.apiKey,
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: positiveSafeInteger(options.maxOutputTokens, 0) }),
     timeoutMs: positiveSafeInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS),
     maxResponseBytes,
     maxEventBytes,
@@ -407,6 +411,7 @@ export function createOpenAiCompatibleChatTransport(options: OpenAiCompatibleTra
         model: config.model,
         messages: mapMessages(input.messages),
         ...(input.tools === undefined ? {} : { tools: mapTools(input.tools) }),
+        ...(config.maxOutputTokens === undefined ? {} : { max_tokens: config.maxOutputTokens }),
         stream: true,
       });
       const request = new AbortController();

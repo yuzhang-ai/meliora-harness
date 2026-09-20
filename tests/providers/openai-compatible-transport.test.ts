@@ -143,6 +143,32 @@ test("transport failure events never contain the local endpoint, authorization, 
   }
 });
 
+test("optional model output ceiling is sent per request and invalid ceilings fail before network", async () => {
+  let captured: unknown;
+  const app = await startFixtureServer(async (request, response) => {
+    captured = await readJson(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const chunk of deepseekStreamTextSingleToolFixture.rawChunks) response.write(frame(chunk));
+    response.end("data: [DONE]\n\n");
+  });
+  try {
+    const transport = createDeepSeekChatTransport({
+      endpoint: `${app.origin}/cap/chat/completions`, model: "fixture-model", apiKey: "local-token",
+      maxOutputTokens: 512, ...trustFixtureOrigin(app.origin),
+    });
+    await transport.next({ messages: [{ role: "user", content: "x" }], context: fixtureContext("deepseek", "cap-1", "2026-09-11T00:00:00") });
+    assert.equal((captured as { max_tokens?: unknown }).max_tokens, 512);
+    for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(() => createDeepSeekChatTransport({
+        endpoint: `${app.origin}/cap/chat/completions`, model: "fixture-model", apiKey: "local-token",
+        maxOutputTokens: invalid, ...trustFixtureOrigin(app.origin),
+      }), OpenAiCompatibleTransportConfigurationError);
+    }
+  } finally {
+    await app.close();
+  }
+});
+
 test("an explicit finish_reason is accepted as a terminal stream when a provider omits [DONE]", async () => {
   const app = await startFixtureServer(async (_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });

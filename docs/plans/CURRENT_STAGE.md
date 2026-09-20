@@ -2,8 +2,8 @@
 
 > 状态：Active
 > 里程碑：M0 - Web 真实只读闭环
-> 版本：v0.5
-> 最后更新：2026-09-19
+> 版本：v0.6
+> 最后更新：2026-09-20
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md) 及全部专项规范
@@ -18,14 +18,14 @@
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: remote main@b6c65055；PR #35/#36 已合并；Harmony PR #37 独立 Draft
+Target repo state: remote main@8df42a72；PR #35/#36/#38 已合并；Harmony PR #37 独立 Draft
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-Current slice: WP-4B 页面真实输入/运行状态/刷新恢复与本地服务装配
-Validation: 本切片须独立核验 Web tests、Server/Store、浏览器真实路径及 GitHub CI
-Blocked: 真实 Provider canary 等待用户本机密钥与人工触发；不阻塞无密钥纵向验收
+Current slice: WP-5 两个指定网关的真实只读 canary；不冒充官方直连
+Validation: WP-4B 全量 check、真实浏览器与 GitHub CI 已通过；WP-5 两个指定网关的合成仓库只读 Run、Receipt、SSE 与重启恢复已实测；本分支全量 check 与独立审查通过，CI 待验证
+Blocked: 无密钥阻塞；只允许使用用户指定网关和临时合成 Git 工作区
 ```
 
 ## 3. 决策冻结
@@ -133,7 +133,8 @@ WP-A read-only runtime + WP-C store
 | Provider HTTP/SSE transport | 你 + Codex | Merged | PR #10 已合并至 main `45663fa0`；25 项无密钥 fixture、Windows 全量 check、CI、独立安全与契约复审通过 |
 | M0 真实纵向集成 | 你 + Codex | Backend merged | WP-1/2/3 已合入 main；PR #34 完成 SSE restart、terminal `204`、raw-tail `409` 与 SQLite 重开只读恢复。Web 页面尚未完成真实链路验收。 |
 | WP-4A Web Live Adapter | 张子恒 | Merged | PR #35 合入 main；POST、SSE、public resume snapshot 与状态机已具备，页面默认仍是 fixture。 |
-| WP-4B 页面真实链路 | 你 + Codex | In progress | 独立分支 `codex/web-live-page-wp4b`，从 main `b6c65055` 开始；页面输入、真实状态、刷新恢复、本地 Server 入口与浏览器验收。 |
+| WP-4B 页面真实链路 | 你 + Codex | Merged | PR #38 已合并至 main `8df42a72`；Web 30/30、Server 20/20、浏览器真实 SQLite/Server 路径和 GitHub CI 通过。 |
+| WP-5 指定网关 canary | 你 + Codex | Locally verified; CI pending | [脱敏验收记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：两个指定网关各 1 条合成 Git 仓库只读 Run，均 `run_completed` 且各 1 Receipt；公开 SSE 与重启 `/resume` 一致、终态 `204`、密钥未检出。Kimi 真实 1,331 条 raw event 暴露原 500 条 snapshot 上限，本分支修为有界 5,000 并以原 SQLite 复验通过。独立审查 PASS；未测试官方直连、未从浏览器新建真实模型 Run。 |
 | 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉合入 main；Harmony API 26 PR #37 独立评审，不与 WP-4B 混改。产品级视觉打磨排在真实闭环之后。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
@@ -141,4 +142,4 @@ WP-A read-only runtime + WP-C store
 
 ## 9. 下一动作
 
-完成 WP-4B：先让页面真正 POST → 接收 `runId` → SSE 呈现公开事件，刷新和断线只走 GET/resume/SSE；在真实 SQLite/Server 纵向测试和 Chrome 桌面/手机验收中核对无重复 POST、无 private 泄漏和终态。随后独立审查、CI、合并；再安排 WP-5 人工 DeepSeek/Kimi canary。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。
+WP-4B 已合并。WP-5 两个指定网关的真实只读 canary 与重启恢复已通过；下一步验证本分支 CI/PR，并在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。
