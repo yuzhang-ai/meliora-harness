@@ -2,7 +2,7 @@
 
 > 状态：Active
 > 里程碑：M0 - Web 真实只读闭环
-> 版本：v0.6
+> 版本：v0.7
 > 最后更新：2026-09-20
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
@@ -18,14 +18,14 @@
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: remote main@8df42a72；PR #35/#36/#38 已合并；Harmony PR #37 独立 Draft
+Target repo state: remote main@b9b07b73；PR #39 已合并；Harmony PR #37 独立 Draft
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-Current slice: WP-5 两个指定网关的真实只读 canary；不冒充官方直连
-Validation: WP-4B 全量 check、真实浏览器与 GitHub CI 已通过；WP-5 原两次 canary 完成，但 PR #39 凭证回显 P1 已复现，当前仅本地修复候选的定向门禁通过
-Blocked: PR #39 Request changes；本地全量 check/独立候选审查已过，仍需精确新 HEAD GitHub CI 与秦峻溥短复验，禁止以原 canary 扫描结果代替攻击验收
+Current slice: WP-5 指定网关 Web 首次真实提交验收收口；不冒充官方直连
+Validation: PR #39 凭证精确值防线合入 main；原 DeepSeek/Kimi HTTP 客户端 canary 完成；正确 `/v1` API base 的 DeepSeek 网关 Web Run 真实 completed、两个只读 Receipt、刷新未新增 POST 且观察到 `/resume`、凭证精确值扫描通过
+Known boundary: 最早两次浏览器诊断误用站点根 URL，落入 HTML 路由并安全 blocked / model_step_outcome_unknown；不重放、不改写历史。最终 canary 脚本的“恰好 1 Receipt”断言过严，修正后只做严格 TS 编译，未重新付费执行
 ```
 
 ## 3. 决策冻结
@@ -134,12 +134,12 @@ WP-A read-only runtime + WP-C store
 | M0 真实纵向集成 | 你 + Codex | Backend merged | WP-1/2/3 已合入 main；PR #34 完成 SSE restart、terminal `204`、raw-tail `409` 与 SQLite 重开只读恢复。Web 页面尚未完成真实链路验收。 |
 | WP-4A Web Live Adapter | 张子恒 | Merged | PR #35 合入 main；POST、SSE、public resume snapshot 与状态机已具备，页面默认仍是 fixture。 |
 | WP-4B 页面真实链路 | 你 + Codex | Merged | PR #38 已合并至 main `8df42a72`；Web 30/30、Server 20/20、浏览器真实 SQLite/Server 路径和 GitHub CI 通过。 |
-| WP-5 指定网关 canary | 你 + Codex | P1 fix candidate; human review pending | [脱敏验收记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：两个指定网关的原只读 Run 完成，但 PR #39 人工攻击性复审发现任意格式 key 经模型回显落入 private Store。当前 transport 精确值拦截候选本地全量 check 与独立 Terra high 审查通过；未合并、未重调付费网关；秦峻溥短复验及新 HEAD CI 待完成。 |
-| 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉与 PR #38 Web→Server `/api` 链路已合入 main；PR #37 正在最新 main 上复验 PC/手机 Web、SSE 与刷新恢复。HarmonyOS 7 / API 26 真机或官方模拟器仍为待验收。 |
+| WP-5 指定网关 canary | 你 + Codex | 指定网关真实 Web 只读 Run completed；冲突收口后短复验待办 | [原网关记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：PR #39 凭证 P1 关闭并合并，DeepSeek/Kimi HTTP 客户端 Run 完成。[浏览器首提记录](../verification/WP5_BROWSER_FIRST_SUBMIT_20260920.md)：前两次错误 base 安全 blocked；正确 `/v1` base 的全新 DeepSeek 网页 Run `completed`，`git_status`/`list_files` 各有 Receipt，刷新无新增 POST 且观察到 `/resume`，SQLite/WAL/SHM 精确值扫描通过。原精确 HEAD 已通过两人复审，冲突解决后不重跑付费模型，只做最终短复验。 |
+| 桌面视觉 / Harmony | 张子恒 | Web 双端基线 merged / API 26 Pending | PR #36 桌面视觉与 PR #37 PC/手机 Web、SSE、刷新恢复及 Harmony 兼容基线已合入 main；HarmonyOS 7 / API 26 真机或官方模拟器仍为待验收。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-WP-4B 已合并。PR #39 的凭证回显 P1 本地候选、合成凭证跨 delta 与 SQLite/WAL/SHM 短复验、全量 check 和独立审查已通过；等待秦峻溥复审与精确 HEAD CI，通过后再合并。随后在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 基于最新 main 复验 PC/手机 Web 与无密钥 fake-model 链路；目标真机或官方模拟器仍为待验收。
+WP-4B、PR #39 与 Harmony PR #37 已合并。WP-5 正确 API base 的真实网页只读闭环已完成；当前收口可复用的手动 canary 前置校验和脱敏记录，不重跑付费模型。PR #41 合并后转入老师演示部署准备，HarmonyOS 7 / API 26 目标设备验收继续单列 Pending，并保持网关兼容与官方直连分开表述。

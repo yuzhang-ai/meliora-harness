@@ -1,6 +1,6 @@
 # WP-5 指定网关真实模型验收记录
 
-> 状态：原 canary 本地实测通过；PR #39 凭证回显 P1 修复中，本记录不代替复审
+> 状态：原两个 HTTP 客户端 canary 通过；PR #39 已复审批准并合并；浏览器首提另见独立记录
 > 日期：2026-09-20
 > 事实基线：`main@8df42a7264dee91be56821962a04b12f4f9f7c1f`
 > 施工现场：独立 worktree `codex/wp5-gateway-canary`；原主工作区既有修改未改动
@@ -39,12 +39,16 @@ DeepSeek 首次测试请求因客户端 schema 不合规返回 `400 invalid_requ
 - Provider 26/26；Server/SSE 86/86；针对网关配置与大私有事件前缀的回归已纳入根 check。
 - 独立审查：`gpt-5.6-terra` high，只读复核，PASS，未发现 P0/P1/P2。审查未接触凭证，也未发起真实模型调用。
 
-## 未验收及下一步
+## PR #39 复审与合并
+
+秦峻溥对精确 HEAD `2f950b9d` 的短复验 Approve；原 API Key 原值回显 P1 关闭，Provider 聚焦测试 29/29、Store/公开 SSE/模型历史和 SQLite/WAL/SHM 检查通过，GitHub CI 通过。PR #39 已于 2026-09-20 合并为 `main@b9b07b73cfeaf2a1096bfc21235a2d03c881a02b`。防线只保证实际 key **精确原值**，不保证改写、编码或加密后的派生形式。
+
+## 验收边界与下一步
 
 - 未测试 DeepSeek/Kimi 官方 API 直连；当前结论只适用于用户批准的两个网关。
-- 未从浏览器新建真实模型 Run；首次提交路径已有无密钥真实 SQLite/Server/浏览器验收，仍需在后续人工窗口补一次真实模型页面提交。
+- 浏览器最初两个独立诊断 Turn 因站点根 URL 被误作 API base，安全停在 `model_step_outcome_unknown`，没有 Receipt，且不重放。第三个使用正确 `/v1` API base 的全新 DeepSeek 网页 Turn 已 `run_completed`，两个只读工具均有成功 Receipt；详见[独立浏览器验收记录](WP5_BROWSER_FIRST_SUBMIT_20260920.md)。不能把前两次失败改写成成功，也不能将此次网关通过写成官方直连通过。
 - 本地服务均已停止。临时合成仓库与 SQLite 保留用于只读复核；不得把数据库、密钥文件、原始 Provider stream 或完整调试日志纳入 PR。
-- 下一步：对本分支做 diff/敏感信息检查与 CI；再按团队流程进行 PR 复审。产品级视觉打磨与 Harmony 分支保持独立。
+- 下一步：对浏览器验收记录和手动脚本进行独立复审，再按阶段施工单推进。产品级视觉打磨与 Harmony 分支保持独立。
 
 ## P1 凭证回显整改执行卡
 
@@ -55,10 +59,10 @@ DeepSeek 首次测试请求因客户端 schema 不合规返回 `400 invalid_requ
 - 验收矩阵：静态检查源到 sink；transport focused tests；真实 Runtime/SQLite Server 假网关验证；SQLite/WAL/SHM 字节扫描；正常 Provider fixture 与全仓 check；PR CI 与秦峻溥短复验分别单列。
 - 停机条件：任何合成凭证仍进入 durable state，或 fail-closed 破坏了正常 fixture/安全恢复语义；先定位根因，不用重试真实模型。
 
-### 本地候选验证（待独立复审与 PR CI）
+### 本地候选验证与后续复审结果
 
 - 原回显攻击测试在修复前稳定失败（返回可持久化正文事件），修复后只返回无原文的 `provider_malformed_stream`；Runtime 将其作为已出站且结果不确定的步骤，保留 started checkpoint 并阻塞自动重试。
 - DeepSeek/Kimi 的正文跨 delta、reasoning alias 跨 delta、工具参数跨 delta、Provider tool-call ID 与 response ID 均在 transport 返回前整批拒绝；非匹配前缀保持普通模型输出。
 - 本地 fake gateway → 真实 Server/Runtime/SQLite：公开 SSE 和 `/resume`、private event、snapshot 与 terminal model-history Artifact 均无合成凭证；SQLite/WAL/SHM 可见文件的 UTF-8/UTF-16LE 字节扫描为零；同一 Command replay 未重调 Provider。
-- `npm.cmd run check` 全量通过（Provider 29/29、Server 87/87、Web 30/30、Contracts、Runtime、Store、E3、TypeScript 与 Web build）；`git diff --check` 通过。独立 Terra high 候选审查 PASS，未发现具体绕过或确定回归。秦峻溥短复验与精确新 HEAD GitHub CI 尚未完成。
+- `npm.cmd run check` 全量通过（Provider 29/29、Server 87/87、Web 30/30、Contracts、Runtime、Store、E3、TypeScript 与 Web build）；`git diff --check` 通过。独立 Terra high 候选审查 PASS；后续秦峻溥短复验 Approve、精确 HEAD GitHub CI 通过，PR #39 已合并。
 - 防线是**实际 key 的精确值**，不声称检测模型将 key 改写、编码、加密或散列后的派生形式；异常模型结果不被当作可自动重试的确定拒绝。
