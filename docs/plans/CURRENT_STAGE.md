@@ -135,11 +135,11 @@ WP-A read-only runtime + WP-C store
 | WP-4A Web Live Adapter | 张子恒 | Merged | PR #35 合入 main；POST、SSE、public resume snapshot 与状态机已具备，页面默认仍是 fixture。 |
 | WP-4B 页面真实链路 | 你 + Codex | Merged | PR #38 已合并至 main `8df42a72`；Web 30/30、Server 20/20、浏览器真实 SQLite/Server 路径和 GitHub CI 通过。 |
 | WP-5 指定网关 canary | 你 + Codex | P1 fix candidate; human review pending | [脱敏验收记录](../verification/WP5_GATEWAY_CANARY_20260920.md)：两个指定网关的原只读 Run 完成，但 PR #39 人工攻击性复审发现任意格式 key 经模型回显落入 private Store。当前 transport 精确值拦截候选本地全量 check 与独立 Terra high 审查通过；未合并、未重调付费网关；秦峻溥短复验及新 HEAD CI 待完成。 |
-| 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉合入 main；Harmony API 26 PR #37 独立评审，不与 WP-4B 混改。产品级视觉打磨排在真实闭环之后。 |
+| 桌面视觉 / Harmony | 张子恒 | Visual merged / Harmony Draft | PR #36 桌面视觉与 PR #38 Web→Server `/api` 链路已合入 main；PR #37 正在最新 main 上复验 PC/手机 Web、SSE 与刷新恢复。HarmonyOS 7 / API 26 真机或官方模拟器仍为待验收。 |
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 
 ## 9. 下一动作
 
-WP-4B 已合并。PR #39 的凭证回显 P1 本地候选、合成凭证跨 delta 与 SQLite/WAL/SHM 短复验、全量 check 和独立审查已通过；等待秦峻溥复审与精确 HEAD CI，通过后再合并。随后在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 保持独立，产品级视觉重做不阻塞主线。
+WP-4B 已合并。PR #39 的凭证回显 P1 本地候选、合成凭证跨 delta 与 SQLite/WAL/SHM 短复验、全量 check 和独立审查已通过；等待秦峻溥复审与精确 HEAD CI，通过后再合并。随后在独立人工窗口补浏览器首次提交真实模型 Run。网关兼容与官方直连分别表述。Harmony PR #37 基于最新 main 复验 PC/手机 Web 与无密钥 fake-model 链路；目标真机或官方模拟器仍为待验收。

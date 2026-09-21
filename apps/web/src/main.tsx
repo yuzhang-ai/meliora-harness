@@ -9,6 +9,7 @@ import { LiveRunController, TURN_COMMAND_REQUEST_SCHEMA_VERSION, WebLiveAdapter 
 import { initialLiveRunState, type LiveRunState } from "./live-state";
 import { LIVE_SESSION_KEY, readLiveSession, saveLiveSession } from "./live-session";
 import { labels, publicEvents, resumePoint, scenarios, statusOf, streamFor, type Scenario } from "./replay";
+import { installViewportEnvironment, SINGLE_PANE_MEDIA } from "./viewport";
 import "./dark-shell.css";
 
 function initialLibrary() {
@@ -65,6 +66,7 @@ function App() {
   const [profileAvatar, setProfileAvatar] = useState(userAvatar);
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const composerComposing = useRef(false);
   const liveWorkspaceIdRef = useRef(liveWorkspaceId);
   liveWorkspaceIdRef.current = liveWorkspaceId;
   if (!liveController.current) {
@@ -99,6 +101,8 @@ function App() {
   ];
   const showEmpty = liveMode ? liveState.phase === "idle" && !liveMessage : !message.trim() && events.length === 0 && !playing && scenarioId !== "reconnecting";
   const showLoading = liveMode ? ["submitting", "resuming", "connecting", "live"].includes(liveState.phase) && events.length === 0 : events.length === 0 && (playing || Boolean(message.trim()));
+
+  useEffect(() => installViewportEnvironment(document.documentElement), []);
 
   useEffect(() => {
     if (!initialSavedLiveSession || initialSavedLiveSession.kind !== "run") return;
@@ -270,7 +274,7 @@ function App() {
   }
 
   return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
-    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.innerWidth <= 768 ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
+    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
 
     <main className="center-panel">
       <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><b>›</b><strong>{liveMode ? "真实只读任务" : activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></nav></header>
@@ -294,7 +298,7 @@ function App() {
       <footer className="composer-area">{notice && <p className="notice" role="status">{notice}</p>}<form className={playing || (liveMode && ["submitting", "resuming", "connecting", "live"].includes(liveState.phase)) ? "is-thinking" : undefined} onSubmit={(event) => { event.preventDefault(); send(); }}>
         <button type="button" className="attachment-button" aria-label="添加附件" onClick={() => setNotice("附件将在文件服务连接后可用。")}><Plus /></button>
         <label className="sr-only" htmlFor="composer">输入指令</label>
-        <textarea ref={composerInput} id="composer" maxLength={20_000} value={liveMode ? liveDraft : draft} onChange={(event) => liveMode ? setLiveDraft(event.target.value) : setDraft(event.target.value)} placeholder="输入指令..." onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
+        <textarea ref={composerInput} id="composer" maxLength={20_000} value={liveMode ? liveDraft : draft} onChange={(event) => liveMode ? setLiveDraft(event.target.value) : setDraft(event.target.value)} placeholder="输入指令..." onCompositionStart={() => { composerComposing.current = true; }} onCompositionEnd={() => { composerComposing.current = false; }} onFocus={() => { requestAnimationFrame(() => composerInput.current?.scrollIntoView({ block: "nearest" })); }} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !composerComposing.current && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
         <button type="button" className={`voice-button ${voiceActive ? "active" : ""}`} aria-label="语音输入" aria-pressed={voiceActive} onClick={() => setVoiceActive((value) => !value)}><Mic /></button>
         {!liveMode && <label className="model-picker"><span className="sr-only">模型</span><select value={modelName} onChange={(event) => setModelName(event.target.value)}><option>DeepSeek V3</option><option>Kimi K2</option><option>MiniMax M2</option></select></label>}
         <button className="send-button" aria-label="发送" disabled={liveMode ? !liveDraft.trim() || !liveWorkspaceId || !["idle", "terminal"].includes(liveState.phase) : !draft.trim() || playing}><ArrowUp /></button>
