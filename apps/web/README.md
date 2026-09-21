@@ -32,6 +32,7 @@ npm.cmd run dev
 先在可信本地 PowerShell 会话中设置 `MELIORA_WORKSPACE_ID`、`MELIORA_WORKSPACE_ROOT`（已存在的工作区目录）、`MELIORA_DATABASE_PATH`（工作区外的绝对路径）、`MELIORA_PROVIDER`（`deepseek` 或 `kimi`）、`MELIORA_MODEL` 和 `MELIORA_API_KEY`，然后从仓库根目录运行 `npm.cmd --prefix apps/server run dev`。密钥只进入本机 Server 进程环境；不要提交到仓库、输入网页或复制进截图。Server 固定监听 `127.0.0.1:8787`；Vite 开发服务器将同源 `/api` 代理过去。网页「工作区 ID」填写服务端配置的同一 ID，再切换真实运行并发送。
 
 若使用经操作者确认的 OpenAI-compatible HTTPS 网关，在同一 Server 进程环境里**同时**设置 `MELIORA_GATEWAY_BASE_URL`（如 `https://gateway.example/v1`）和 `MELIORA_TRUSTED_PROVIDER_ORIGIN`（如 `https://gateway.example`）。两者 origin 必须完全相同；只接受无凭证、查询串、fragment 的 HTTPS base URL，并由 Server 拼接 `/chat/completions`。只设置其中一项会启动失败。网关配置不得来自浏览器、用户消息或模型输出；网关验收不能写成官方直连验收。
+凭证文件里的 `url` 可能只是网关**网站根地址**；它不等于 API base。实际配置前应由操作者核对 API path（本次批准的 DeepSeek 网关为 `/v1`），不得把站点根地址直接作为 `MELIORA_GATEWAY_BASE_URL`，否则可能收到 HTTP 200 的 HTML 页面并安全阻塞。手动真实网页 canary 的路径前置校验和脱敏运行记录见 [WP-5 浏览器首次提交验收](../../docs/verification/WP5_BROWSER_FIRST_SUBMIT_20260920.md)。
 可选 `MELIORA_MAX_OUTPUT_TOKENS` 为每次 Provider 请求设置正整数输出上限，供小样本付费验收控制成本；它是 Server-only 配置，不接受浏览器覆盖。
 
 新 Turn 才调用 `POST /api/turns`；刷新先 GET `/resume`，普通断线从公开 cursor 续 SSE，只有 `event_cursor_conflict` 才退到 public resume snapshot。浏览器仅保存 workspace/run ID 或待确认的幂等键，不保存密钥、输入原文或私有 Provider 内容。提交响应丢失且没有 run ID 时，页面保留提交锁，刷新也不会自动重发；须先人工核查服务端状态，才能明确解除锁。已知 Run 恢复失败时可手动「忘记此 Run」再开始新任务，不会自动删掉恢复记录。生产部署尚无反向代理/认证装配，不能将本地 API 监听到公网。
