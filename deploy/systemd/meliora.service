@@ -1,0 +1,29 @@
+[Unit]
+Description=Meliora single-user teacher demonstration API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meliora
+Group=meliora
+WorkingDirectory=/srv/meliora/app/current
+EnvironmentFile=/etc/meliora/server.env
+ExecStart=/usr/bin/node --import tsx apps/server/src/deploy-server.ts
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+# The application only needs its release tree, a fixed read-only workspace,
+# and an out-of-workspace SQLite/log directory. Provision these directories
+# before enabling this unit; this template does not create them implicitly.
+ReadOnlyPaths=/srv/meliora/app/current /srv/meliora/demo-workspace
+ReadWritePaths=/var/lib/meliora /var/log/meliora
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

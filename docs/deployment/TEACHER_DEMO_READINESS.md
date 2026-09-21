@@ -2,8 +2,8 @@
 
 > 状态：Candidate，准备中；**未部署、未开放公网**
 > 日期：2026-09-21
-> 基线：`origin/main@69a24d8375e0e1a13a5c526f46852dbee8759566`
-> 施工现场：独立工作树 `codex/demo-deploy-prep`；不修改主工作区的未提交文件
+> 基线：`origin/main@f8d85bc264c92a2693ebce2cf73844bbf5177c6d`
+> 施工现场：独立工作树 `codex/wp6a-deploy-candidate`；不修改主工作区的未提交文件
 > 权威范围：演示环境的准备事实、验收门禁、发布/回滚顺序；不改变 M0 产品或 Server/Store 契约
 > 上游：[开发总纲](../../MELIORA_MASTER_PLAN.md)、[当前阶段](../plans/CURRENT_STAGE.md)、[持久化与事件](../architecture/PERSISTENCE_AND_EVENTS.md)、[前端规范](../frontend/VISUAL_SYSTEM.md)
 > 更新触发：部署入口、域名、认证、PR 门禁或外部验收状态变化
@@ -22,7 +22,7 @@
 | 云服务器 | 前次交互式只读观察为 `meliora-demo`、Node 22.23.2、Nginx 1.24.0，应用/Nginx 未启用且仅 SSH 监听；本卡未附服务器证据快照 | 这些值只作为待复核输入；产物门开始前必须重新采集脱敏的版本、服务状态和监听端口证据 |
 | 预置 unit | 前次只读观察显示 ExecStart 指向尚不存在的 `/srv/meliora/app/current/server.mjs`；本部署切片尚未重新核验 | **不得**通过创建占位文件让服务“变绿”；先冻结真实发布入口，并在服务器 read-back 后更新本卡 |
 | Web | `apps/web` 的 Vite build 输出静态 `dist`；Live Adapter 默认使用页面同源 `/api` | 可准备静态产物；生产站点必须把 `/api` 代理到回环 Server，不能写浏览器可见 Provider Key |
-| Server | 目前只有 `apps/server/src/local-dev.ts` 启动脚本，固定监听 `127.0.0.1:8787`、本地主体和 Host allowlist | 尚无经过验收的生产装配；不能直接改为公网监听或把开发入口当作正式入口 |
+| Server | WP-6A 候选新增 fail-closed 的 `deploy-server.ts` 与独立无密钥 `demo-fixture-server.ts`，二者固定监听 `127.0.0.1:8787` | Windows 聚焦测试已覆盖 fixture POST/SSE 与重启 GET-only 恢复；Ubuntu systemd/原生依赖仍待验收，不能直接改为公网监听 |
 | 持久化 | SQLite 文件由 `MELIORA_DATABASE_PATH` 指定，必须在工作区外 | 单机演示足够；部署与回滚都必须保留 DB，不能因代码回滚重放付费调用 |
 | 安全审查 | PR #41 已在精确 HEAD 完成双人复审并合并；Issue #42 / PR #44 的 Server Git 子进程最小环境已完成安全差异审查并合并 | 源码侧凭证门已关闭；发布侧仍必须验证环境文件权限及 dist、日志、DB/WAL/SHM 无原值 |
 | 双端适配 | PR #37 已合并；PC/手机 Web、SSE、刷新恢复、IME、软键盘与响应式回归通过 | HarmonyOS 7 / API 26 真机或官方模拟器仍是独立待验项，不能由 Chromium 结果代替 |
@@ -51,8 +51,8 @@
 
 ## 分阶段门禁
 
-1. **源码门（已通过）**：PR #37、#41、#44 已合入 `main@69a24d8375e0e1a13a5c526f46852dbee8759566`；PR #41 在冲突收口后的精确 HEAD 有正式批准记录。该 SHA 是部署入口施工基线；后续若 main 变化必须重新冻结，不从分支临时拼包。
-2. **产物门**：干净发布目录执行 `npm ci`、`npm --prefix apps/web ci`、`npm --prefix apps/web run build` 与根 `npm run check`；记录产物 SHA、Node/SQLite ABI、启动入口。当前 `server.mjs` 缺失属于阻断，不允许跳过。
+1. **源码门（已通过）**：PR #37、#41、#43、#44 已合入 `main@f8d85bc264c92a2693ebce2cf73844bbf5177c6d`；PR #41 在冲突收口后的精确 HEAD 有正式批准记录。该 SHA 是部署入口施工基线；后续若 main 变化必须重新冻结，不从分支临时拼包。
+2. **产物门**：干净发布目录执行 `npm ci`、`npm --prefix apps/web ci`、`npm --prefix apps/web run build` 与根 `npm run check`；记录产物 SHA、Node/SQLite ABI、`node --import tsx` 启动入口。WP-6A 不引入 bundle；Ubuntu 必须按锁文件安装，不能复制 Windows 依赖。
 3. **回环门**：仅在服务器回环启动候选。固定演示仓库，DB 在 `/var/lib/meliora`；验证 health、POST 一次、SSE 终态、刷新 GET `/resume` 且 POST 不增加、重启后读取恢复；扫描 Web dist、日志、SQLite/WAL/SHM 的凭证精确原值。
 4. **边缘门**：核实ICP备案的域名与接入状态；配置 A 记录、TLS、Nginx 静态资源和同源 `/api`，先只在回环/受限方式验收，再检查认证、速率限制、SSE 非缓冲和错误状态透传。证书与密码不进仓库。
 5. **公网门**：发布者确认后才启用站点与 80/443，外部 PC 和手机实际访问；至少演示一次只读 Run、刷新恢复和错误态。HarmonyOS API 26 只在目标设备实测并留证后标记通过。
@@ -74,7 +74,7 @@
 
 ## 下一步
 
-源码门已关闭。下一切片从上述冻结 SHA 实现经过测试的发布入口、systemd 与 Nginx/单人访问控制候选；先在服务器回环完成无密钥构建、原生依赖和 fake-model 验收，再进入 DNS/TLS。公网启用和真实 Provider Key 装载仍是独立发布步骤，不由本文或 PR 合并自动触发。
+WP-6A 已在隔离分支形成发布入口、systemd、Nginx/单人访问控制与无密钥重启恢复候选；当前等待全量门禁和独立复审。合并后先在服务器回环完成 Ubuntu 原生依赖和 fixture 验收，再进入 DNS/TLS。公网启用和真实 Provider Key 装载仍是独立发布步骤，不由本文或 PR 合并自动触发。
 
 ## 官方参考
 
