@@ -10,6 +10,7 @@ import {
 } from "./turn-command-composition.js";
 import { createLocalMelioraServer } from "./persistence.js";
 import { resolveLocalProviderEndpoint } from "./local-provider-config.js";
+import { localServerGitEnvironment } from "./local-git-environment.js";
 
 const required = (name: string): string => {
   const value = process.env[name];
@@ -23,7 +24,7 @@ async function main(): Promise<void> {
   const workspaceRoot = await realpath(required("MELIORA_WORKSPACE_ROOT"));
   if (!(await stat(workspaceRoot)).isDirectory()) throw new Error("Workspace root must be a directory.");
   const { stdout: gitRoot } = await promisify(execFile)("git", ["-C", workspaceRoot, "rev-parse", "--show-toplevel"], {
-    env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith("GIT_"))),
+    env: localServerGitEnvironment(),
     windowsHide: true,
   });
   const expectedGitRoot = resolve(workspaceRoot);
