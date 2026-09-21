@@ -3,7 +3,7 @@
 > 状态：Active
 > 里程碑：M0 - Web 真实只读闭环
 > 版本：v0.7
-> 最后更新：2026-09-20
+> 最后更新：2026-09-21
 > 权威范围：当前阶段目标、工作包、依赖、验收和进度
 > 维护者：产品 / 后端 / 架构负责人
 > 上游依赖：[开发总纲](../../MELIORA_MASTER_PLAN.md) 及全部专项规范
@@ -18,12 +18,12 @@
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: remote main@f8d85bc2；PR #37、#41、#43、#44 已合并
+Target repo state: remote main@0536104d；PR #46（WP-6A）已合并
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-Current slice: WP-6A 老师演示可部署候选；只准备入口与模板，不改 DNS/服务器或调用真实 Provider
+Current slice: WP-6B Ubuntu 回环验收已通过；下一步为 DNS/备案只读核验与边缘门
 Validation: PR #39 凭证精确值防线合入 main；原 DeepSeek/Kimi HTTP 客户端 canary 完成；正确 `/v1` API base 的 DeepSeek 网关 Web Run 真实 completed、两个只读 Receipt、刷新未新增 POST 且观察到 `/resume`、凭证精确值扫描通过
 Known boundary: 最早两次浏览器诊断误用站点根 URL，落入 HTML 路由并安全 blocked / model_step_outcome_unknown；不重放、不改写历史。最终 canary 脚本的“恰好 1 Receipt”断言过严，修正后只做严格 TS 编译，未重新付费执行
 ```
@@ -139,8 +139,9 @@ WP-A read-only runtime + WP-C store
 | Durable command + Model Step checkpoint | 你 + Codex；秦峻溥 | Merged | Issue #13 / PR #14 已合并至 main `ab8485f1`；Store 24/24、全量 CI 与独立复审通过 |
 | Store/SSE security follow-up | 秦峻溥 | Backlog | Windows ACL；Server 对非 loopback 暴露前补 principal/session 授权。snapshot + resume-point 已并入 M0 纵向集成 WP-3 |
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
-| WP-6A 可部署候选 | 你 + Codex | Implementation candidate | Issue #45；正式 Provider 入口、独立无密钥 fixture、systemd/Nginx/env 模板与重启恢复测试已在隔离分支实现；尚未部署、公网开放或完成 Ubuntu 验收。 |
+| WP-6A 可部署候选 | 你 + Codex | Merged | Issue #45 / PR #46 合入 main `0536104d`；正式 Provider 入口、独立无密钥 fixture、systemd/Nginx/env 模板与重启恢复测试通过。 |
+| WP-6B Ubuntu 回环门 | 你 + Codex | Passed | Issue #47；服务器原生 `npm run check`、deploy 2/2、transient systemd、loopback 8787 与 health 通过；探针已停止，公网未开放。 |
 
 ## 9. 下一动作
 
-WP-4B、WP-5、Harmony Web 基线和浏览器验收已合并。当前推进 Issue #45 / WP-6A：先让正式入口、无密钥 fixture 回环、systemd/Nginx 候选和恢复测试通过独立复审；之后才进入 Ubuntu 回环门。DNS/TLS、公网启用、真实 Provider Key 与 HarmonyOS 7 / API 26 目标设备验收继续单列 Pending。
+WP-6A 已合并，WP-6B Ubuntu 回环门已通过。下一步先只读核验 `melioracode.com` DNS 与备案接入事实，再进入 TLS、Basic Auth 和 Nginx 边缘验收。公网启用、真实 Provider Key 与 HarmonyOS 7 / API 26 目标设备验收继续单列 Pending。
