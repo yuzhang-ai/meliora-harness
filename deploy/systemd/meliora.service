@@ -13,6 +13,9 @@ ExecStart=/usr/bin/node --import tsx apps/server/src/deploy-server.ts
 Restart=on-failure
 RestartSec=3
 UMask=0077
+TasksMax=128
+MemoryMax=1G
+LimitNOFILE=4096
 
 # The application only needs its release tree, a fixed read-only workspace,
 # and an out-of-workspace SQLite/log directory. Provision these directories

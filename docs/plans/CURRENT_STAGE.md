@@ -18,12 +18,12 @@
 
 ```text
 Target repo: https://github.com/yuzhang-ai/meliora-harness
-Target repo state: remote main@0536104d；PR #46（WP-6A）已合并
+Target repo state: remote main@c873a83f；PR #48（WP-6B）已合并
 Source tag: ai-landing-page-harness-e3-minimum-integration-go-20260906
 Baseline commit: 455c7aebe0ba644f9096e872ce7c8275cfa45281
 E3 noEmit: passed
 Meliora extraction: 109 TypeScript files in an isolated migration closure
-Current slice: WP-6B Ubuntu 回环验收已通过；下一步为 DNS/备案只读核验与边缘门
+Current slice: WP-6C DNS/TLS/Nginx 边缘候选；只准备可回滚配置，不修改 DNS、开放端口或装载 Provider Key
 Validation: PR #39 凭证精确值防线合入 main；原 DeepSeek/Kimi HTTP 客户端 canary 完成；正确 `/v1` API base 的 DeepSeek 网关 Web Run 真实 completed、两个只读 Receipt、刷新未新增 POST 且观察到 `/resume`、凭证精确值扫描通过
 Known boundary: 最早两次浏览器诊断误用站点根 URL，落入 HTML 路由并安全 blocked / model_step_outcome_unknown；不重放、不改写历史。最终 canary 脚本的“恰好 1 Receipt”断言过严，修正后只做严格 TS 编译，未重新付费执行
 ```
@@ -141,7 +141,8 @@ WP-A read-only runtime + WP-C store
 | GitHub access / CODEOWNERS | 全员 | Backlog | 用户名齐全后处理 |
 | WP-6A 可部署候选 | 你 + Codex | Merged | Issue #45 / PR #46 合入 main `0536104d`；正式 Provider 入口、独立无密钥 fixture、systemd/Nginx/env 模板与重启恢复测试通过。 |
 | WP-6B Ubuntu 回环门 | 你 + Codex | Passed | Issue #47；服务器原生 `npm run check`、deploy 2/2、transient systemd、loopback 8787 与 health 通过；探针已停止，公网未开放。 |
+| WP-6C 边缘接入候选 | 你 + Codex | Candidate | Issue #49；ACME-only bootstrap、TLS/Basic Auth、未知 Host 拒绝、API 限流与 Ubuntu `nginx -t` 已完成；DNS/证书/端口/公网均未启用。 |
 
 ## 9. 下一动作
 
-WP-6A 已合并，WP-6B Ubuntu 回环门已通过。下一步先只读核验 `melioracode.com` DNS 与备案接入事实，再进入 TLS、Basic Auth 和 Nginx 边缘验收。公网启用、真实 Provider Key 与 HarmonyOS 7 / API 26 目标设备验收继续单列 Pending。
+WP-6A/WP-6B 已合并并通过。当前收口 WP-6C 边缘候选的全仓 CI 与独立复审；合并后由发布者执行 DNS A 记录，再进入证书、Basic Auth 和受控公网验收。真实 Provider Key 与 HarmonyOS 7 / API 26 目标设备验收继续单列 Pending。

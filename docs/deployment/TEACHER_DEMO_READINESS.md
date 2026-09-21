@@ -18,8 +18,8 @@
 
 | 项目 | 2026-09-21 核验 | 对发布的含义 |
 |---|---|---|
-| 域名 | 用户告知 `melioracode.com` ICP 备案已通过；前次观察为根域名及 `www` 尚未解析，本部署切片尚未重新 read-back | DNS、备案接入状态及解析目标都必须在边缘门重新核验，当前不宣称已有可访问网址 |
-| 云服务器 | 2026-09-21 已 read-back：`meliora-demo`、Node 22.23.2、npm 10.9.8、Nginx 1.24.0；回环探针停止后持久 Meliora/Nginx 均 inactive，本机无 80/443/8787 监听 | Ubuntu 原生依赖与进程监听边界已验证；云防火墙、UFW 与外部可达性仍须在边缘门核验 |
+| 域名 | 用户告知 `melioracode.com` ICP 备案已通过；2026-09-21 向 AliDNS 权威服务器 read-back，根域名及 `www` 的 A/AAAA 均为空 | 当前没有可访问网址；下一门由发布者配置 DNS 后再次 read-back |
+| 云服务器 | 2026-09-21 已 read-back：`meliora-demo`、Node 22.23.2、npm 10.9.8、Nginx 1.24.0；UFW active/default deny incoming 且只允许 SSH；持久 Meliora/Nginx 均 inactive，本机无 80/443/8787 监听 | Ubuntu 原生依赖、UFW 与进程监听边界已验证；阿里云安全组与外部可达性仍须在边缘门核验 |
 | 预置 unit | 2026-09-21 再次 read-back：旧持久 unit 的 ExecStart 仍指向发布产物中不存在的 `/srv/meliora/app/current/server.mjs`，且保持 disabled/inactive | **不得**通过创建占位文件让服务“变绿”；启用前须由 WP-6A 候选 unit 替换并再次验证 |
 | Web | `apps/web` 的 Vite build 输出静态 `dist`；Live Adapter 默认使用页面同源 `/api` | 可准备静态产物；生产站点必须把 `/api` 代理到回环 Server，不能写浏览器可见 Provider Key |
 | Server | WP-6A 新增 fail-closed 的 `deploy-server.ts` 与独立无密钥 `demo-fixture-server.ts`，二者固定监听 `127.0.0.1:8787` | Windows 与 Ubuntu 均已覆盖 fixture POST/SSE 与重启 GET-only 恢复；不得改为公网监听 |
@@ -75,7 +75,7 @@
 
 ## 下一步
 
-WP-6A 已合并，WP-6B Ubuntu 回环门已通过。下一步只读核验 DNS/备案接入，再单独进入 TLS、Basic Auth 与 Nginx 边缘门。公网启用和真实 Provider Key 装载仍是独立发布步骤，不由本文或 PR 合并自动触发。
+WP-6A 已合并，WP-6B Ubuntu 回环门已通过。WP-6C 已形成 ACME bootstrap、最终 TLS/Basic Auth/Nginx 和限流候选，并在 Ubuntu 用临时材料通过 `nginx -t`；当前等待全量门禁与独立复审。DNS mutation、公网启用和真实 Provider Key 装载仍是独立发布步骤，不由本文或 PR 合并自动触发。
 
 ## 官方参考
 
