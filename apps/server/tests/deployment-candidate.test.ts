@@ -96,22 +96,42 @@ const submitAndReadTerminal = async (idempotencyKey: string): Promise<string> =>
 };
 
 test("deployment templates preserve loopback, whole-site auth, SSE, and no-upstream-retry policy", async () => {
-  const [unit, nginx, environment, deploySource, fixtureSource] = await Promise.all([
+  const [unit, nginx, bootstrap, environment, deploySource, fixtureSource, runbook] = await Promise.all([
     readFile(join(repositoryRoot, "deploy", "systemd", "meliora.service"), "utf8"),
     readFile(join(repositoryRoot, "deploy", "nginx", "meliora.conf"), "utf8"),
+    readFile(join(repositoryRoot, "deploy", "nginx", "meliora-acme-bootstrap.conf"), "utf8"),
     readFile(join(repositoryRoot, "deploy", "env", "meliora.env.example"), "utf8"),
     readFile(join(repositoryRoot, "apps", "server", "src", "deploy-server.ts"), "utf8"),
     readFile(join(repositoryRoot, "apps", "server", "src", "demo-fixture-server.ts"), "utf8"),
+    readFile(join(repositoryRoot, "docs", "deployment", "PORTFOLIO_SERVER.md"), "utf8"),
   ]);
   assert.match(unit, /^User=meliora$/m);
   assert.match(unit, /^EnvironmentFile=\/etc\/meliora\/server\.env$/m);
   assert.match(unit, /^NoNewPrivileges=yes$/m);
   assert.match(unit, /^ProtectSystem=strict$/m);
   assert.match(unit, /^ReadWritePaths=\/var\/lib\/meliora \/var\/log\/meliora$/m);
+  assert.match(unit, /^TasksMax=128$/m);
+  assert.match(unit, /^MemoryMax=1G$/m);
+  assert.match(unit, /^LimitNOFILE=4096$/m);
   assert.match(nginx, /^\s*auth_basic /m);
   assert.match(nginx, /^\s*auth_basic_user_file \/etc\/nginx\/\.htpasswd-meliora;/m);
   assert.match(nginx, /^\s*ssl_certificate \/etc\/letsencrypt\/live\/melioracode\.com\/fullchain\.pem;/m);
   assert.match(nginx, /^\s*ssl_certificate_key \/etc\/letsencrypt\/live\/melioracode\.com\/privkey\.pem;/m);
+  assert.match(nginx, /^limit_req_zone \$binary_remote_addr zone=meliora_api_per_ip:10m rate=30r\/m;$/m);
+  assert.match(nginx, /^limit_conn_zone \$binary_remote_addr zone=meliora_api_connections:10m;$/m);
+  assert.match(nginx, /^\s*limit_req zone=meliora_api_per_ip burst=10 nodelay;$/m);
+  assert.match(nginx, /^\s*limit_conn meliora_api_connections 8;$/m);
+  assert.match(nginx, /^\s*limit_req_status 429;$/m);
+  assert.match(nginx, /^\s*limit_conn_status 429;$/m);
+  assert.match(nginx, /^\s*return 308 https:\/\/\$host\$request_uri;$/m);
+  assert.match(nginx, /location \^~ \/\.well-known\/acme-challenge\//u);
+  assert.match(nginx, /^\s*listen 80 default_server;$/m);
+  assert.match(nginx, /^\s*listen 443 ssl default_server;$/m);
+  assert.match(nginx, /^\s*ssl_protocols TLSv1\.2 TLSv1\.3;$/m);
+  assert.match(nginx, /^\s*ssl_session_tickets off;$/m);
+  assert.match(nginx, /^\s*add_header Strict-Transport-Security "max-age=31536000" always;$/m);
+  assert.equal(nginx.match(/add_header Strict-Transport-Security "max-age=31536000" always;/gu)?.length, 2,
+    "both static and API responses must carry HSTS despite add_header inheritance rules");
   assert.match(nginx, /^\s*proxy_pass http:\/\/127\.0\.0\.1:8787;/m);
   assert.match(nginx, /^\s*proxy_set_header Host 127\.0\.0\.1:8787;/m);
   assert.match(nginx, /^\s*proxy_set_header X-Forwarded-Host \$host;/m);
@@ -119,11 +139,23 @@ test("deployment templates preserve loopback, whole-site auth, SSE, and no-upstr
   assert.match(nginx, /^\s*proxy_intercept_errors off;/m);
   assert.match(nginx, /^\s*proxy_next_upstream off;/m);
   assert.doesNotMatch(nginx, /proxy_pass http:\/\/0\.0\.0\.0/u);
+  assert.match(bootstrap, /^\s*listen 80;$/m);
+  assert.match(bootstrap, /location \^~ \/\.well-known\/acme-challenge\//u);
+  assert.match(bootstrap, /^\s*try_files \$uri =404;$/m);
+  assert.match(bootstrap, /^\s*return 404;$/m);
+  assert.match(bootstrap, /^\s*listen 80 default_server;$/m);
+  assert.match(bootstrap, /^\s*server_name _;$/m);
+  assert.match(bootstrap, /^\s*return 444;$/m);
+  assert.doesNotMatch(bootstrap, /proxy_pass|apps\/web\/dist|auth_basic|listen 443/u,
+    "bootstrap must expose only the ACME challenge path");
   assert.match(environment, /MELIORA_API_KEY=REPLACE_AT_SERVER_ONLY/u);
   assert.doesNotMatch(environment, /sk-[A-Za-z0-9]/u);
   assert.match(deploySource, /required\("MELIORA_API_KEY"\)/u, "production entry must fail closed without a key");
   assert.match(fixtureSource, /no paid request can be made/u);
   assert.doesNotMatch(fixtureSource, /createDeepSeekChatTransport|createKimiChatTransport/u);
+  assert.match(runbook, /\/etc\/nginx\/sites-available\/meliora/u);
+  assert.match(runbook, /\/etc\/nginx\/sites-enabled\/meliora/u);
+  assert.match(runbook, /禁止把该文件粘贴进现有 `server \{\}`/u);
 });
 
 test("no-key fixture supports independent runs and restart resumes by observed GET only", async () => {
