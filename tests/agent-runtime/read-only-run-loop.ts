@@ -154,6 +154,7 @@ function createLoop(
     hashArguments: (value) => `hash:${JSON.stringify(value)}`,
     projectToolResult: ({ execution }) => ({
       modelContent: execution.status === "succeeded" ? "入口文件存在，读取成功。" : "读取入口文件失败。",
+      privateObservationContent: execution.status === "succeeded" ? "入口文件存在，读取成功。" : null,
       publicSummary: execution.status === "succeeded" ? "入口文件存在，读取成功。" : "读取入口文件失败。",
       publicArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],
       publicVerificationArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],

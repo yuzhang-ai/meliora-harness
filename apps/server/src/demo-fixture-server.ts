@@ -3,6 +3,7 @@ import type { ReadOnlyRunModelPort } from "../../../packages/agent-runtime/index
 import { loadDeploymentFilesystemConfiguration, startLoopbackDeploymentServer } from "./deployment-runtime.js";
 
 const occurredAt = (): string => new Date().toISOString();
+const cleanGitStatusFact = "Git 工作区干净，没有未提交修改。";
 
 /**
  * This is deliberately not a provider emulator. It is an offline, deterministic
@@ -21,8 +22,10 @@ const createFixtureModel = (): ReadOnlyRunModelPort => {
         { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 3, occurredAt: occurredAt(), kind: "tool_call_completed", invocationId, rawArguments: "{}" },
         { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 4, occurredAt: occurredAt(), kind: "model_step_completed", finishReason: "tool_calls" },
       ];
+      const toolResult = messages.find((message) => message.role === "tool");
+      if (toolResult?.content !== cleanGitStatusFact) throw new Error("fixture_clean_git_status_fact_missing");
       return [
-        { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 0, occurredAt: occurredAt(), kind: "assistant_text_delta", delta: "固定演示流程已完成只读 Git 状态检查。" },
+        { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 0, occurredAt: occurredAt(), kind: "assistant_text_delta", delta: cleanGitStatusFact },
         { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 1, occurredAt: occurredAt(), kind: "model_step_completed", finishReason: "stop" },
       ];
     },

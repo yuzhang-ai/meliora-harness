@@ -69,6 +69,7 @@ export type ServerOwnedReadOnlyToolProjector = Readonly<{
     execution: ReadOnlyWorkspaceToolExecution;
   }>): Promise<Readonly<{
     modelContent: string;
+    privateObservationContent: string | null;
     publicSummary: string;
     publicArtifactIds: readonly string[];
     publicVerificationArtifactIds: readonly string[];

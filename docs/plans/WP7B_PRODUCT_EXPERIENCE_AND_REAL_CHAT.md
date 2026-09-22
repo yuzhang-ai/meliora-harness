@@ -1,11 +1,11 @@
 # WP-7B 产品体验与真实对话闭环施工卡
 
-> 状态：Candidate（本地全量门禁与独立复审通过，待 PR、部署与生产验收）
+> 状态：Production + follow-up Candidate（PR #52 已上线；clean Git status 语义修复待交付）
 > 日期：2026-09-22
 > 基线：`origin/main@d2728a9eed8164f55d7d315fda5f17d5cb8e0605`
-> 当前 HEAD：`0ba91a94`（仅迁移 WP-7A 公网部署记录）
+> 当前生产 release：`7e0cac8c1a3ede6cc556b418e5d03cf2a2e380ce`
 > 施工现场：`C:\codex-worktrees\meliora-product-experience-v2`
-> 分支：`codex/product-experience-v2`
+> follow-up 分支：`codex/wp7b-clean-git-status`
 
 ## 目标
 
@@ -86,7 +86,10 @@ VISUAL_DENSITY: 7
 - [x] 写出真实对话根因链并确定修复范围：部署链路健康；Runtime 固定隐藏 Provider 回答是主因，Web 已具备公开 assistant event 渲染能力。
 - [x] 完成视觉与交互 Candidate：正式工作区文案、任务起点、证据检查器、只读能力说明、移动 Drawer 焦点循环和 reduced-motion 处理。
 - [x] 完成全量门禁与独立复审：`npm run check` 通过；视觉、响应式/Harmony 代码面与公开输出契约复审均无剩余 P0/P1/P2。
-- [ ] 提交、推送、PR、合并、可回滚部署与生产 read-back。
+- [x] PR #52 合并并完成可回滚部署与生产 read-back：release `7e0cac8c`，旧 release `59dc1008` 保留；健康、回环监听、服务状态与公网五档首屏通过。
+- [x] 真实 Provider canary 完成 `POST -> Nginx -> Server -> Command -> Provider -> git_status -> SSE -> UI`；一次 POST、Receipt/verification/终态完整，未发生重复请求。
+- [x] 定位生产配置阻塞：网关模型目录只支持 `deepseek-v4-pro` / `deepseek-v4-flash`，旧 `deepseek-chat` 不受支持；已备份环境文件并切换 `deepseek-v4-pro`，服务健康。
+- [ ] 交付 clean Git status follow-up：空 porcelain 必须成为模型可理解的固定安全事实；不再追加付费 Provider 请求，以无密钥 fixture、CI 与生产只读 read-back 收口。
 
 ## 根因链与 Candidate 证据
 
@@ -97,6 +100,8 @@ Command/Provider/Tool：既有真实 Server + fake model 纵向测试可完成�
 公开投影：Runtime 将 Provider assistant text 固定替换为“内容已隐藏”，UI 虽能渲染 assistant_text_delta 但没有可用内容。
 修复：只在 stop 终止、已有私有工具观察且验证 ID 落盘后，调用服务端投影器发布一次最终回答；中间推理仍不公开。
 防线：长度、控制字符、persistable text、私有观察原文/行/token/压缩形式/URL 编码/base64 回显检查；失败时发布固定安全摘要。
+真实 canary 暴露的后续语义：clean `git status --porcelain` 的零字节 artifact 过去退化为通用私有摘要，模型无法判断工作区干净。
+follow-up：仅在工具成功、verification passed、artifact/content 均为零字节，且 metadata 精确为 git_status/UTF-8/bytesRead=0/non-truncated 时，生成固定 Server-owned clean fact；binary、截断、空白字节和非空 porcelain 均 fail closed。
 ```
 
 本地指定验证（2026-09-22）：

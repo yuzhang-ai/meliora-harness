@@ -102,6 +102,7 @@ try {
       });
       return {
         modelContent: safeProjection,
+        privateObservationContent: privateContent,
         publicSummary: safeProjection,
         publicArtifactIds: [publicArtifactId],
         publicVerificationArtifactIds: [publicArtifactId],
