@@ -223,12 +223,56 @@ const safeModelToolContent = (
   return projected.length === 0 ? fallback : projected;
 };
 
-const UNSAFE_ASSISTANT_TEXT_REDACTION = "模型输出包含无法安全公开的内容，已隐藏。";
+const UNSAFE_ASSISTANT_TEXT_REDACTION = "最终回答包含无法安全公开的内容，已隐藏；工具与验证记录仍可查看。";
+const MAX_PUBLIC_ASSISTANT_BYTES = 32 * 1024;
+const UNSAFE_CONTROL_CHARACTER = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
 
-export const projectServerOwnedAssistantText = (input: Readonly<{ content: string }>): string => {
+const compactComparableText = (value: string): string =>
+  value.normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+
+const privateObservationFragments = (observations: readonly string[]): readonly string[] => {
+  const fragments = new Set<string>();
+  for (const observation of observations) {
+    const normalized = observation.normalize("NFKC").trim();
+    if (normalized.length > 0) fragments.add(normalized);
+    for (const line of normalized.split(/\r?\n/gu)) {
+      const trimmed = line.trim();
+      if (trimmed.length > 0) fragments.add(trimmed);
+      for (const token of trimmed.match(/[\p{L}\p{N}_./:-]{12,}/gu) ?? []) fragments.add(token);
+    }
+  }
+  return [...fragments];
+};
+
+const echoesPrivateObservation = (candidate: string, observations: readonly string[]): boolean => {
+  const compactCandidate = compactComparableText(candidate);
+  for (const fragment of privateObservationFragments(observations)) {
+    if (candidate.includes(fragment)) return true;
+    const compactFragment = compactComparableText(fragment);
+    if (compactFragment.length > 0 && compactCandidate.includes(compactFragment)) return true;
+    if (candidate.includes(encodeURIComponent(fragment))) return true;
+    const base64 = Buffer.from(fragment, "utf8").toString("base64");
+    if (candidate.includes(base64)) return true;
+    const base64url = base64.replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+    if (candidate.includes(base64url)) return true;
+  }
+  return false;
+};
+
+export const projectServerOwnedAssistantText = (input: Readonly<{
+  content: string;
+  privateFinalAnswerObservations: readonly string[];
+}>): string => {
+  const normalized = input.content.replace(/\r\n?/gu, "\n").trim();
   try {
-    assertPersistableText(input.content, "assistant-public-text");
-    return input.content;
+    if (normalized.length === 0
+      || new TextEncoder().encode(normalized).byteLength > MAX_PUBLIC_ASSISTANT_BYTES
+      || UNSAFE_CONTROL_CHARACTER.test(normalized)
+      || echoesPrivateObservation(normalized, input.privateFinalAnswerObservations)) {
+      return UNSAFE_ASSISTANT_TEXT_REDACTION;
+    }
+    assertPersistableText(normalized, "assistant-public-final-answer");
+    return normalized;
   } catch {
     return UNSAFE_ASSISTANT_TEXT_REDACTION;
   }

@@ -97,7 +97,18 @@ visibility=public
 
 禁止进入公开事件：API Key、Authorization、完整环境变量、私有 reasoning、未脱敏原始日志、隐藏系统提示、超范围文件内容。
 
-M0 尚未冻结独立的 Server-owned assistant summary。因此任何 Provider assistant 原文（包括首次 Model Step、用户输入的逐字/片段/编码回显）都只能写入 private model events 与 private model-history artifact，绝不可直接成为 `assistant_text_delta` 的公开 payload。Runtime 可以发不含原文的固定安全提示；工具调用展示、Server-owned 工具结果投影和最终 Run outcome 按各自契约继续公开。未来若要公开助手内容，必须先在本层冻结来源独立、可审计的 summary 契约，不能复用 Provider raw text。
+### 5.1 Verified Final Answer Projection v1
+
+`assistant_text_delta` 在真实 Run 中只承载一次完整的、经过 Server-owned projector 的终态回答，不承载 Provider 实时流。以下条件必须全部满足：
+
+- 最终 Model Step 的 normalized result 与 private model history 已原子持久化；
+- 前序至少有一个只读工具结果，所需 Receipt durable 且 verification 为 `passed`；
+- 最终 Model Step 没有工具调用，且 `finishReason=stop`；
+- 只取 assistant content，不取 reasoning、usage、Provider ID、headers、错误体或中间 Model Step 文本；
+- Server projector 完成长度、控制字符与敏感信息检查，并拒绝对当前 Run 私有工具 observation 的原文、长 token、去标点/换行拼接、百分号编码或 Base64 回显；拒绝时只发布固定安全提示；
+- 公开事件仍经过统一 decoder、Session/Run scope、SSE 与 resume gate，不新增 artifact bytes 读取。
+
+该 v1 的目的，是让同一用户看到经只读工具验证后的最终回答；它不是 raw streaming，也不把模型文本升级为 Receipt、verification 或完成事实。首次/中间 assistant text、用户输入回显、private reasoning 与未验证的纯文本回答继续只写 private event/history。Runtime 必须把用户输入、此前 private reasoning、中间 assistant text 与 model-visible tool content 作为 `privateFinalAnswerObservations` 一并交给 projector；projector 对其原文、紧凑形式、percent encoding、Base64 与 Base64url 回显 fail closed。公网部署还必须只绑定已经确认可公开的固定工作区；projector 不能替代工作区内容治理。
 
 WP-3B.2a 的共享 `decodePublicStoredEvent`（从 `packages/agent-runtime` 正式导出）是唯一把持久化 `StoredEvent` 加上 Server 已解析的 `sessionId` 还原为 `PublicRunEvent` 的运行时 decoder。它是纯函数，只产生 `public / suppressed / invalid`：private 记录被 suppressed；public 记录必须逐 kind 满足本节已冻结的 envelope、payload exact keys、必填类型、枚举和嵌套 `PublicArtifactRef { artifactId, visibility: "public" }` 形状，并对最终公开 envelope（含 event/run/session identity 与 payload）再次经过敏感值扫描；未知、畸形、或敏感的 public 记录一律 invalid。它不修复、丢字段投影或补造 payload，也不在本切片新增字符串边界、ID 格式、时间精度、数组去重或数量限制。
 

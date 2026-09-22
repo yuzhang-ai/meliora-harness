@@ -122,6 +122,7 @@ Codec 不执行工具、不审批、不写业务状态、不决定任务是否�
 - `[DONE]` 只有在已收到合法 `finish_reason` 后才能结束成功；缺少终止语义、非法 JSON 或越界响应统一投影为安全的 `provider_malformed_stream`。
 - Tool history 回填使用 Runtime `invocationId` 作为关联 ID；Provider Tool Call ID 仅作协议元数据，缺失或重复时不能成为内部或重放主键。
 - M0 transport 先返回一次 Model Step 的完整 `CanonicalModelEvent[]`。逐 delta durable append 与 Public SSE 实时投影属于后续 Runtime 集成切片，不能在本阶段宣称已经完成。
+- Runtime 不把 Provider 流逐 delta 直接公开。只有最终 Model Step 已 durable、只读 Receipt 与 verification 已闭合且 `finishReason=stop` 时，才允许把完整 assistant answer 交给 [Verified Final Answer Projection v1](INTENT_AND_OUTPUT.md#51-verified-final-answer-projection-v1)；首次/中间文本和 reasoning 始终保持 private。
 
 ## 5. Context Engine
 

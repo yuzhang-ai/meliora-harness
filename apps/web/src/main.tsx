@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Copy, Menu, Mic, MoreHorizontal, PanelRightOpen, Plus, Share2, ShieldCheck, Sparkles, ThumbsDown, ThumbsUp, X } from "lucide-react";
+import { ArrowUp, CheckCircle2, Copy, Menu, Mic, MoreHorizontal, PanelRightOpen, Plus, SearchCode, Share2, ShieldCheck, Sparkles, ThumbsDown, ThumbsUp, Wrench, X } from "lucide-react";
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events";
 import { Sidebar } from "./Sidebar";
 import { RightPanel } from "./RightPanel";
@@ -82,6 +82,10 @@ function App() {
   const [profileAvatar, setProfileAvatar] = useState(userAvatar);
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
+  const leftPanel = useRef<HTMLElement>(null);
+  const rightPanel = useRef<HTMLElement>(null);
+  const mobileNavTrigger = useRef<HTMLButtonElement>(null);
+  const mobileCodeTrigger = useRef<HTMLButtonElement>(null);
   const composerComposing = useRef(false);
   const liveWorkspaceIdRef = useRef(liveWorkspaceId);
   liveWorkspaceIdRef.current = liveWorkspaceId;
@@ -174,11 +178,28 @@ function App() {
 
   useEffect(() => {
     if (!mobilePanel) return;
-    const closePanel = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMobilePanel(null);
+    const panel = mobilePanel === "nav" ? leftPanel.current : rightPanel.current;
+    const trigger = mobilePanel === "nav" ? mobileNavTrigger.current : mobileCodeTrigger.current;
+    if (!panel) return;
+    const focusableSelector = "button:not([disabled]),a[href],input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex='-1'])";
+    const focusable = () => Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector)).filter((item) => item.offsetParent !== null);
+    const frame = window.requestAnimationFrame(() => focusable()[0]?.focus());
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); setMobilePanel(null); return; }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
-    window.addEventListener("keydown", closePanel);
-    return () => window.removeEventListener("keydown", closePanel);
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", handleKey);
+      trigger?.focus();
+    };
   }, [mobilePanel]);
 
   function selectChat(chat: Chat) {
@@ -319,15 +340,15 @@ function App() {
   }
 
   return <div className={`app-shell ${productMode.enabled ? "product-mode" : ""} ${collapsed ? "sidebar-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
-    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} productMode={productMode.enabled} workspaceLabel={productMode.workspaceLabel} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { startNewTask(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => productMode.enabled ? setNotice("Meliora 当前仅开放受控只读演示。") : showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
+    <aside ref={leftPanel} className="left-panel" role={mobilePanel === "nav" ? "dialog" : undefined} aria-modal={mobilePanel === "nav" ? true : undefined} aria-label={mobilePanel === "nav" ? "导航" : undefined}><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} productMode={productMode.enabled} workspaceLabel={productMode.workspaceLabel} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { startNewTask(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => productMode.enabled ? setNotice("Meliora 当前仅开放受控只读工作区。") : showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
 
     <main className="center-panel">
-      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><b>›</b><strong>{productMode.enabled ? liveMessage ? "任务执行" : "新任务" : liveMode ? "真实只读任务" : activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label={productMode.enabled ? "打开运行面板" : "打开代码面板"} onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button>{!productMode.enabled && <><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></>}</nav></header>
+      <header className="conversation-header"><button ref={mobileNavTrigger} className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" aria-expanded={mobilePanel === "nav"} onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><b>›</b><strong>{productMode.enabled ? liveMessage ? "任务执行" : "新任务" : liveMode ? "真实只读任务" : activeChat.title}</strong></div><nav aria-label="对话操作"><button ref={mobileCodeTrigger} className="mobile-panel-button mobile-code-trigger" aria-label={productMode.enabled ? "打开运行面板" : "打开代码面板"} aria-expanded={mobilePanel === "code"} onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button>{!productMode.enabled && <><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></>}</nav></header>
       <div className="run-bar"><span className={`run-status ${runStatus}`}>{liveMode ? livePhaseLabel[liveState.phase] : playing ? "生成中" : labels[runStatus as keyof typeof labels]}</span>{productMode.enabled ? <><span className="run-scope"><ShieldCheck aria-hidden="true"/>只读运行</span>{liveState.identity && <span className="run-progress">公开事件 {liveState.cursor}</span>}{liveState.identity && ["disconnected", "error"].includes(liveState.phase) && <button onClick={() => { void liveController.current!.reconnect(); }}>重新连接</button>}</> : <><button className="mode-switch" onClick={() => setLiveMode((value) => !value)}>{liveMode ? "真实运行" : "界面预览"} · 切换</button>{liveMode ? <><label className="workspace-field">工作区 ID <input aria-label="工作区 ID" value={liveWorkspaceId} maxLength={200} onChange={(event) => setLiveWorkspaceId(event.target.value)} disabled={Boolean(liveState.identity) && liveState.phase !== "terminal"}/></label><button disabled={!liveState.identity || !["disconnected", "error"].includes(liveState.phase)} onClick={() => { void liveController.current!.reconnect(); }}>重新连接</button></> : <><button onClick={replay}>重新回放</button><button disabled={playing || eventCount >= source.length} onClick={() => setEventCount((count) => count + 1)}>下一步</button></>}</>}</div>
 
       <section className="message-stream" aria-label="消息流">
         <div className="message-column">
-          {showEmpty && (productMode.enabled ? <section className="product-empty" aria-labelledby="empty-title"><span className="product-mark" aria-hidden="true">M</span><h1 id="empty-title">想先检查什么？</h1><p>描述一个代码问题，Meliora 会在受控工作区里只读分析，并把工具过程与验证结果留在这里。</p>{productMode.workspaceId ? <div className="suggestion-list" aria-label="任务建议">{suggestedTasks.map((task) => <button key={task} onClick={() => prepareSuggestedTask(task)}>{task}</button>)}</div> : <aside className="configuration-error" role="alert">演示工作区尚未配置，请联系项目维护者。</aside>}<div className="empty-boundary"><ShieldCheck aria-hidden="true"/><span>只读模式，不修改文件，不执行写命令。</span></div></section> : <section className="timeline-empty" aria-labelledby="empty-title"><span aria-hidden="true"><Sparkles /></span><h2 id="empty-title">开始一个新任务</h2><p>输入目标后，任务状态会在这里逐步呈现。</p><button onClick={() => composerInput.current?.focus()}>在输入框中开始</button></section>)}
+          {showEmpty && (productMode.enabled ? <section className="product-empty" aria-labelledby="empty-title"><div className="product-kicker"><span className="product-mark" aria-hidden="true">M</span><span>只读 Coding Agent</span></div><h1 id="empty-title">把代码问题交给 Meliora</h1><p>描述你想了解的代码问题。Meliora 会在受控工作区中检查真实文件，并把模型回答、工具过程和验证状态留在同一条任务流里。</p>{productMode.workspaceId ? <div className="suggestion-list" aria-label="任务建议">{suggestedTasks.map((task) => <button key={task} onClick={() => prepareSuggestedTask(task)}>{task}</button>)}</div> : <aside className="configuration-error" role="alert">公网工作区尚未配置，请联系项目维护者。</aside>}<div className="product-flow" aria-label="运行方式"><span><SearchCode aria-hidden="true"/><small>提出问题</small></span><i aria-hidden="true"/><span><Wrench aria-hidden="true"/><small>只读检查</small></span><i aria-hidden="true"/><span><CheckCircle2 aria-hidden="true"/><small>回答与验证</small></span></div><div className="empty-boundary"><ShieldCheck aria-hidden="true"/><span>只读模式，不修改文件，不执行写命令。</span></div></section> : <section className="timeline-empty" aria-labelledby="empty-title"><span aria-hidden="true"><Sparkles /></span><h2 id="empty-title">开始一个新任务</h2><p>输入目标后，任务状态会在这里逐步呈现。</p><button onClick={() => composerInput.current?.focus()}>在输入框中开始</button></section>)}
           {messages.map((item) => <article className={`message ${item.role}`} key={item.id}>
             <span className="message-author">{item.role === "assistant" ? "M" : userAvatar}</span>
             <div className="message-body">{item.role === "assistant" ? <><h2>任务执行概览</h2><p>{item.content}</p><h3>当前计划</h3><ul><li>读取任务状态</li><li>展示工具与验证状态</li><li>生成可检查的最终结果</li></ul><div className="message-actions"><button onClick={() => setNotice("已复制消息摘要。")}><Copy />复制</button><button aria-pressed={reaction === "like"} onClick={() => setReaction("like")}><ThumbsUp />点赞</button><button aria-pressed={reaction === "dislike"} onClick={() => setReaction("dislike")}><ThumbsDown />点踩</button></div></> : <p>{item.content} <a href="#composer">查看执行输入</a></p>}</div>
@@ -351,7 +372,7 @@ function App() {
     </main>
 
     <button className="mobile-backdrop" aria-label="关闭侧面板" onClick={() => setMobilePanel(null)}/>
-    <aside className="right-panel"><button className="mobile-close" aria-label={productMode.enabled ? "关闭运行面板" : "关闭代码面板"} onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name} chatTitle={liveMode ? "真实只读任务" : activeChat.title} collapsed={rightCollapsed} productMode={productMode.enabled} events={events} statusLabel={liveMode ? livePhaseLabel[liveState.phase] : labels[runStatus as keyof typeof labels]} onCollapse={() => setRightCollapsed((value) => !value)}/></aside>
+    <aside ref={rightPanel} className="right-panel" role={mobilePanel === "code" ? "dialog" : undefined} aria-modal={mobilePanel === "code" ? true : undefined} aria-label={mobilePanel === "code" ? (productMode.enabled ? "运行证据" : "代码面板") : undefined}><button className="mobile-close" aria-label={productMode.enabled ? "关闭运行面板" : "关闭代码面板"} onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name} chatTitle={liveMode ? "真实只读任务" : activeChat.title} collapsed={rightCollapsed} productMode={productMode.enabled} events={events} statusLabel={liveMode ? livePhaseLabel[liveState.phase] : labels[runStatus as keyof typeof labels]} onCollapse={() => setRightCollapsed((value) => !value)}/></aside>
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" aria-label="关闭设置" onClick={() => setDialogMode(null)}><X /></button>

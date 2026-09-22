@@ -92,7 +92,7 @@ export function Sidebar(props: SidebarProps) {
       </nav>
       <section className="product-workspace" aria-label="当前工作区">
         <div className="section-title"><span>当前项目</span></div>
-        <div className="workspace-summary"><Folder aria-hidden="true"/><span><strong>{props.workspaceLabel || "演示项目"}</strong><small>服务端受控工作区</small></span></div>
+        <div className="workspace-summary"><Folder aria-hidden="true"/><span><strong>{props.workspaceLabel || "Meliora 源码工作区"}</strong><small>服务端受控工作区</small></span></div>
         <div className="workspace-boundary"><ShieldCheck aria-hidden="true"/><span><strong>只读模式</strong><small>可以检查文件与 Git 状态，不会修改项目。</small></span></div>
       </section>
     </div>
