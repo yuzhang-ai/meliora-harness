@@ -1,6 +1,6 @@
 # Meliora Web Shell 三栏版
 
-React 三栏工作台。默认是公开事件 fixture 预览；手动切换「真实运行」后，页面会向本地 Server 发起只读 Turn、订阅 SSE，并在刷新时从 public resume snapshot 恢复。右栏 Diff、审批、附件和语音仍未接入，不可当作已执行能力。
+React 三栏工作台。本地开发默认保留公开事件 fixture 预览；公网构建使用 product mode，直接进入服务端固定工作区的真实只读任务，不向用户暴露 fixture、工作区 ID 或未实现控件。页面向 Server 发起只读 Turn、订阅 SSE，并在刷新时从 public resume snapshot 恢复。
 
 ## 启动
 在仓库根目录 PowerShell 执行：
@@ -10,6 +10,19 @@ npm.cmd ci
 npm.cmd run dev
 ```
 打开终端输出的本地地址。构建：npm.cmd run build；测试：npm.cmd test。
+
+## 公网产品模式
+
+公网构建必须在构建进程中设置以下公开配置，工作区根路径与模型凭证仍只属于 Server：
+
+```powershell
+$env:VITE_MELIORA_PRODUCT_MODE='public'
+$env:VITE_MELIORA_WORKSPACE_ID='portfolio-demo'
+$env:VITE_MELIORA_WORKSPACE_LABEL='Meliora 演示项目'
+npm.cmd --prefix apps/web run build
+```
+
+product mode 的首次进入页提供三个只读任务建议；点击建议只填入输入框，不会自动 POST。右栏只展示来自 `PublicRunEvent` 的运行状态、工具摘要、验证结果和公开证据数量。未接入的分享、附件、语音、自动化、文件 Diff 与 Provider 选择器不会在公网界面出现。
 
 ## 本版
 - 五组共享 fixtures：正常、审批、失败、取消、重连。
@@ -40,6 +53,8 @@ npm.cmd run dev
 真实模式模型由 Server 环境配置，网页的预览模型选择器不构成 Provider 切换。真实审批事件只读展示，不生成授权。无密钥的 `tests/live-server.test.ts` 使用真实 SQLite + Server + fake model 验证 POST/SSE/刷新 GET；它不能代替 WP-5 的真实 DeepSeek/Kimi canary。
 
 `apps/web` 的锁文件固定了 Playwright；安装 Chromium 后可运行 `npm.cmd --prefix apps/web run verify:live-browser`。独立 GitHub CI job 会安装 Chromium 并执行同一脚本。脚本在临时 Git 工作区启动真实 SQLite/Server 和无密钥 model fixture，通过浏览器验收 1440/1100/768/390px、一次 POST、SSE 终态、刷新 GET-only、未知提交保护、过期 Run 手动恢复和私有内容不回显。`PLAYWRIGHT_MODULE` 可指定本机已安装模块路径，`BROWSER_CHANNEL=msedge` 可改用 Edge。临时数据库位于系统临时目录，验证结束后删除。
+
+公网首次进入与响应式外壳可在 product mode 的 Vite 服务启动后运行 `npm.cmd --prefix apps/web run verify:product-browser`。该检查覆盖老师首次打开、固定工作区、未实现控件隐藏、任务建议仅预填、零 POST，以及 1440/1100/1099/768/390px 无横向溢出。
 
 ## HarmonyOS API 26 Web compatibility overlay（本地浏览器验证）
 

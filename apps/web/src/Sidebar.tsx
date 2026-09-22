@@ -11,6 +11,7 @@ import {
   Plus,
   Search,
   Settings,
+  ShieldCheck,
   Sparkles,
   Sun,
 } from "lucide-react";
@@ -31,6 +32,8 @@ interface SidebarProps {
   onAutomations: () => void;
   onCustomize: () => void;
   onReveal: () => void;
+  productMode?: boolean;
+  workspaceLabel?: string;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -76,6 +79,34 @@ export function Sidebar(props: SidebarProps) {
       project.name.toLocaleLowerCase().includes(query) ||
       project.chats.some((chat) => chat.title.toLocaleLowerCase().includes(query)),
   );
+
+  if (props.productMode) return <>
+    <div className="sidebar-user product-brand">
+      <span className="user-avatar" aria-hidden="true">M</span>
+      <span className="user-copy"><strong>Meliora</strong><small>只读 Coding Agent</small></span>
+      <button className="icon-button collapse-button" aria-label={props.collapsed ? "展开侧栏" : "收起侧栏"} aria-expanded={!props.collapsed} onClick={props.onCollapse}>{props.collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}</button>
+    </div>
+    <div className="sidebar-scroll product-sidebar">
+      <nav className="quick-actions" aria-label="任务操作">
+        <button className="new-task-button" onClick={props.onNewAgent}><Plus />新建任务</button>
+      </nav>
+      <section className="product-workspace" aria-label="当前工作区">
+        <div className="section-title"><span>当前项目</span></div>
+        <div className="workspace-summary"><Folder aria-hidden="true"/><span><strong>{props.workspaceLabel || "演示项目"}</strong><small>服务端受控工作区</small></span></div>
+        <div className="workspace-boundary"><ShieldCheck aria-hidden="true"/><span><strong>只读模式</strong><small>可以检查文件与 Git 状态，不会修改项目。</small></span></div>
+      </section>
+    </div>
+    <div className="sidebar-footer">
+      <div className="footer-tools">
+        <button className="icon-button" aria-label={props.theme === "dark" ? "切换到浅色主题" : "切换到深色主题"} onClick={() => props.onTheme(props.theme === "dark" ? "light" : "dark")}>{props.theme === "dark" ? <Moon /> : <Sun />}</button>
+        <button className="icon-button" aria-label="使用说明" onClick={props.onCustomize}><HelpCircle /></button>
+      </div>
+      <nav className="collapsed-rail" aria-label="折叠导航">
+        <button aria-label="新建任务" title="新建任务" onClick={props.onNewAgent}><Plus /></button>
+        <button aria-label="当前项目" title={props.workspaceLabel || "当前项目"}><Folder /></button>
+      </nav>
+    </div>
+  </>;
 
   return <>
       <div className="sidebar-user">

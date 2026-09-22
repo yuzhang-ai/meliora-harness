@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Copy, Menu, Mic, MoreHorizontal, PanelRightOpen, Plus, Share2, Sparkles, ThumbsDown, ThumbsUp, X } from "lucide-react";
+import { ArrowUp, Copy, Menu, Mic, MoreHorizontal, PanelRightOpen, Plus, Share2, ShieldCheck, Sparkles, ThumbsDown, ThumbsUp, X } from "lucide-react";
 import type { PublicRunEvent } from "../../../packages/agent-runtime/public-events";
 import { Sidebar } from "./Sidebar";
 import { RightPanel } from "./RightPanel";
@@ -10,7 +10,16 @@ import { initialLiveRunState, type LiveRunState } from "./live-state";
 import { LIVE_SESSION_KEY, readLiveSession, saveLiveSession } from "./live-session";
 import { labels, publicEvents, resumePoint, scenarios, statusOf, streamFor, type Scenario } from "./replay";
 import { installViewportEnvironment, SINGLE_PANE_MEDIA } from "./viewport";
+import { projectTimeline } from "./event-projection";
+import { resolveProductMode } from "./product-mode";
 import "./dark-shell.css";
+
+const productMode = resolveProductMode(import.meta.env as Readonly<Record<string, string | undefined>>);
+const suggestedTasks = [
+  "检查当前 Git 状态，并告诉我有没有未提交的修改。",
+  "概览这个项目的目录结构，并说明主要模块分别负责什么。",
+  "找到项目的测试入口，并告诉我应该怎样运行基础检查。",
+] as const;
 
 function initialLibrary() {
   try { return parseLibrary(sessionStorage.getItem("meliora-project-library-v2")); }
@@ -25,7 +34,14 @@ function savedPreference(key: string, fallback: string) {
 const initialProjectList = initialLibrary();
 const initialChat = initialProjectList.projects.flatMap((project) => project.chats).find((chat) => chat.id === initialProjectList.activeId)!;
 const liveStorage = (() => { try { return localStorage; } catch { return null; } })();
-const initialSavedLiveSession = liveStorage ? readLiveSession(liveStorage) : null;
+const storedLiveSession = liveStorage ? readLiveSession(liveStorage) : null;
+const initialSavedLiveSession = productMode.enabled && storedLiveSession?.workspaceId !== productMode.workspaceId
+  ? null
+  : storedLiveSession;
+if (productMode.enabled && storedLiveSession && !initialSavedLiveSession) {
+  try { liveStorage?.removeItem(LIVE_SESSION_KEY); }
+  catch { /* stale sessions from another deployment remain ignored */ }
+}
 
 const livePhaseLabel: Record<LiveRunState["phase"], string> = {
   idle: "准备就绪", submitting: "提交中", resuming: "恢复中", connecting: "连接中",
@@ -38,8 +54,8 @@ function App() {
   const [eventCount, setEventCount] = useState(initialChat.count);
   const [message, setMessage] = useState(initialChat.message);
   const [draft, setDraft] = useState(initialChat.draft);
-  const [liveMode, setLiveMode] = useState(Boolean(initialSavedLiveSession));
-  const [liveWorkspaceId, setLiveWorkspaceId] = useState(initialSavedLiveSession?.workspaceId ?? "");
+  const [liveMode, setLiveMode] = useState(Boolean(initialSavedLiveSession) || productMode.enabled);
+  const [liveWorkspaceId, setLiveWorkspaceId] = useState(initialSavedLiveSession?.workspaceId ?? productMode.workspaceId);
   const [liveDraft, setLiveDraft] = useState("");
   const [liveMessage, setLiveMessage] = useState("");
   const [liveState, setLiveState] = useState<LiveRunState>(() => initialSavedLiveSession?.kind === "pending"
@@ -58,8 +74,8 @@ function App() {
   const [modelName, setModelName] = useState("DeepSeek V3");
   const [reaction, setReaction] = useState<"like" | "dislike" | "">("");
   const [theme, setTheme] = useState<"light" | "dark">(() => savedPreference("meliora-theme-v2", "light") === "dark" ? "dark" : "light");
-  const [userName, setUserName] = useState(() => savedPreference("meliora-user-name", "张子恒"));
-  const [userAvatar, setUserAvatar] = useState(() => savedPreference("meliora-user-avatar", "张"));
+  const [userName, setUserName] = useState(() => productMode.enabled ? "访客" : savedPreference("meliora-user-name", "本地用户"));
+  const [userAvatar, setUserAvatar] = useState(() => productMode.enabled ? "你" : savedPreference("meliora-user-avatar", "我"));
   const [dialogMode, setDialogMode] = useState<"project" | "automations" | "customize" | null>(null);
   const [projectName, setProjectName] = useState("");
   const [profileName, setProfileName] = useState(userName);
@@ -90,6 +106,7 @@ function App() {
   const activeChat = activeProject.chats.find((chat) => chat.id === library.activeId)!;
   const source = streamFor(scenarioId);
   const events = liveMode ? liveState.events : publicEvents(source.slice(0, eventCount));
+  const timeline = projectTimeline(events);
   const runStatus = liveMode ? liveState.phase : statusOf(events, scenarioId === "reconnecting" ? "recovering" : "created");
   const scenario = scenarios.find((item) => item.id === scenarioId)!;
 
@@ -192,6 +209,34 @@ function App() {
     selectChat(chat);
   }
 
+  function resetLiveTask() {
+    if (!["idle", "terminal", "error"].includes(liveController.current!.state.phase)) {
+      setNotice("当前任务仍在运行，请等待它结束后再新建任务。");
+      return;
+    }
+    try { liveStorage?.removeItem(LIVE_SESSION_KEY); }
+    catch { /* a new task can still start in the current page */ }
+    liveController.current!.state = initialLiveRunState();
+    setLiveState(initialLiveRunState());
+    setPendingSubmission(false);
+    setKnownRunRecord(false);
+    setLiveMessage("");
+    setLiveDraft("");
+    setNotice("");
+    window.requestAnimationFrame(() => composerInput.current?.focus());
+  }
+
+  function startNewTask() {
+    if (productMode.enabled) resetLiveTask();
+    else createAgent();
+  }
+
+  function prepareSuggestedTask(task: string) {
+    setLiveDraft(task);
+    setNotice("任务已填入输入框，确认后再发送。");
+    window.requestAnimationFrame(() => composerInput.current?.focus());
+  }
+
   function showDialog(mode: "project" | "automations" | "customize") {
     setProfileName(userName);
     setProfileAvatar(userAvatar);
@@ -255,7 +300,7 @@ function App() {
   function renderEvent(event: PublicRunEvent): React.ReactNode {
     switch (event.kind) {
       case "run_status_changed": return <p className="event-line">状态更新 · {labels[event.payload.status]} {event.payload.reason && <code>{event.payload.reason}</code>}</p>;
-      case "assistant_text_delta": return <div className="event-card"><strong>Meliora</strong><p>{event.payload.delta}</p></div>;
+      case "assistant_text_delta": return null;
       case "plan_updated": return <section className="event-card"><h3>执行计划</h3><ul>{event.payload.steps.map((step) => <li key={step.id}><span className="pill">{labels[step.status]}</span>{step.title}</li>)}</ul></section>;
       case "tool_call_presented": return <section className="event-card tool-card"><div><code>{event.payload.toolName}</code><span className="pill">{event.payload.risk}</span></div><p>{event.payload.summary}</p><small>{event.payload.invocationId}</small></section>;
       case "tool_result_presented": return <section className={`event-card ${event.payload.status}`}><div><strong>工具结果</strong><span className="pill">{labels[event.payload.status]}</span></div><p>{event.payload.summary}</p><small>{event.payload.invocationId}</small></section>;
@@ -265,48 +310,48 @@ function App() {
       }
       case "verification_updated": return <p className="event-line success">验证 · {labels[event.payload.status]} · {event.payload.verificationId}</p>;
       case "context_compacted": return <section className="event-card"><h3>上下文已整理</h3><p>{event.payload.summary}</p></section>;
-      case "run_completed": return <section className="event-card completed"><small>FINAL OUTCOME</small><h3>任务已完成</h3><p>{event.payload.summary}</p></section>;
-      case "run_failed": return <section className="event-card failed"><h3>任务失败</h3><p>{event.payload.message}</p><code>{event.payload.code}</code></section>;
-      case "run_cancelled": return <section className="event-card"><h3>任务已取消</h3><p>{event.payload.reason}</p></section>;
-      case "run_blocked": return <section className="event-card approval"><h3>任务已阻塞</h3><p>{event.payload.message}</p><ul>{event.payload.userActions.map((action) => <li key={action}>{action}</li>)}</ul></section>;
+      case "run_completed": return <section className="event-card completed outcome-card"><small>最终结果</small><h3>任务已完成</h3><p>{event.payload.summary}</p>{productMode.enabled && <button onClick={resetLiveTask}>开始新任务</button>}</section>;
+      case "run_failed": return <section className="event-card failed outcome-card"><small>运行未完成</small><h3>任务失败</h3><p>{event.payload.message}</p><code>{event.payload.code}</code>{productMode.enabled && <button onClick={() => { const previous = liveMessage; resetLiveTask(); setLiveDraft(previous); }}>重新编辑任务</button>}</section>;
+      case "run_cancelled": return <section className="event-card outcome-card"><h3>任务已取消</h3><p>{event.payload.reason}</p>{productMode.enabled && <button onClick={resetLiveTask}>开始新任务</button>}</section>;
+      case "run_blocked": return <section className="event-card approval outcome-card"><small>需要人工处理</small><h3>任务已阻塞</h3><p>{event.payload.message}</p><ul>{event.payload.userActions.map((action) => <li key={action}>{action}</li>)}</ul>{productMode.enabled && <button onClick={resetLiveTask}>返回新任务</button>}</section>;
       default: { const neverEvent: never = event; return neverEvent; }
     }
   }
 
-  return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
-    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { createAgent(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
+  return <div className={`app-shell ${productMode.enabled ? "product-mode" : ""} ${collapsed ? "sidebar-collapsed" : ""} ${rightCollapsed ? "right-collapsed" : ""} ${mobilePanel === "nav" ? "mobile-nav-open" : ""} ${mobilePanel === "code" ? "mobile-code-open" : ""}`}>
+    <aside className="left-panel"><Sidebar library={library} collapsed={collapsed} theme={theme} userName={userName} userAvatar={userAvatar} productMode={productMode.enabled} workspaceLabel={productMode.workspaceLabel} onSelect={(id) => { openChat(id); setMobilePanel(null); }} onCollapse={() => window.matchMedia(SINGLE_PANE_MEDIA).matches ? setMobilePanel(null) : setCollapsed((value) => !value)} onNewAgent={() => { startNewTask(); setMobilePanel(null); }} onNewProject={() => showDialog("project")} onTheme={setTheme} onAutomations={() => showDialog("automations")} onCustomize={() => productMode.enabled ? setNotice("Meliora 当前仅开放受控只读演示。") : showDialog("customize")} onReveal={() => setMobilePanel("nav")}/></aside>
 
     <main className="center-panel">
-      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><b>›</b><strong>{liveMode ? "真实只读任务" : activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label="打开代码面板" onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></nav></header>
-      <div className="run-bar"><span className={`run-status ${runStatus}`}>{liveMode ? livePhaseLabel[liveState.phase] : playing ? "生成中" : labels[runStatus as keyof typeof labels]}</span><button className="mode-switch" onClick={() => setLiveMode((value) => !value)}>{liveMode ? "真实运行" : "界面预览"} · 切换</button>{liveMode ? <><label className="workspace-field">工作区 ID <input aria-label="工作区 ID" value={liveWorkspaceId} maxLength={200} onChange={(event) => setLiveWorkspaceId(event.target.value)} disabled={Boolean(liveState.identity) && liveState.phase !== "terminal"}/></label><button disabled={!liveState.identity || !["disconnected", "error"].includes(liveState.phase)} onClick={() => { void liveController.current!.reconnect(); }}>重新连接</button></> : <><button onClick={replay}>重新回放</button><button disabled={playing || eventCount >= source.length} onClick={() => setEventCount((count) => count + 1)}>下一步</button></>}</div>
+      <header className="conversation-header"><button className="mobile-panel-button mobile-nav-trigger" aria-label="打开导航" onClick={() => setMobilePanel("nav")}><Menu /></button><div><span>{productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><b>›</b><strong>{productMode.enabled ? liveMessage ? "任务执行" : "新任务" : liveMode ? "真实只读任务" : activeChat.title}</strong></div><nav aria-label="对话操作"><button className="mobile-panel-button mobile-code-trigger" aria-label={productMode.enabled ? "打开运行面板" : "打开代码面板"} onClick={() => { setRightCollapsed(false); setMobilePanel("code"); }}><PanelRightOpen /></button>{!productMode.enabled && <><button aria-label="分享" onClick={() => setNotice("分享将在连接协作服务后可用。")}><Share2 /></button><button aria-label="更多操作" onClick={() => setNotice("更多对话操作即将提供。")}><MoreHorizontal /></button></>}</nav></header>
+      <div className="run-bar"><span className={`run-status ${runStatus}`}>{liveMode ? livePhaseLabel[liveState.phase] : playing ? "生成中" : labels[runStatus as keyof typeof labels]}</span>{productMode.enabled ? <><span className="run-scope"><ShieldCheck aria-hidden="true"/>只读运行</span>{liveState.identity && <span className="run-progress">公开事件 {liveState.cursor}</span>}{liveState.identity && ["disconnected", "error"].includes(liveState.phase) && <button onClick={() => { void liveController.current!.reconnect(); }}>重新连接</button>}</> : <><button className="mode-switch" onClick={() => setLiveMode((value) => !value)}>{liveMode ? "真实运行" : "界面预览"} · 切换</button>{liveMode ? <><label className="workspace-field">工作区 ID <input aria-label="工作区 ID" value={liveWorkspaceId} maxLength={200} onChange={(event) => setLiveWorkspaceId(event.target.value)} disabled={Boolean(liveState.identity) && liveState.phase !== "terminal"}/></label><button disabled={!liveState.identity || !["disconnected", "error"].includes(liveState.phase)} onClick={() => { void liveController.current!.reconnect(); }}>重新连接</button></> : <><button onClick={replay}>重新回放</button><button disabled={playing || eventCount >= source.length} onClick={() => setEventCount((count) => count + 1)}>下一步</button></>}</>}</div>
 
       <section className="message-stream" aria-label="消息流">
         <div className="message-column">
-          {showEmpty && <section className="timeline-empty" aria-labelledby="empty-title"><span aria-hidden="true"><Sparkles /></span><h2 id="empty-title">开始一个新任务</h2><p>输入目标后，任务状态会在这里逐步呈现。</p><button onClick={() => composerInput.current?.focus()}>在输入框中开始</button></section>}
+          {showEmpty && (productMode.enabled ? <section className="product-empty" aria-labelledby="empty-title"><span className="product-mark" aria-hidden="true">M</span><h1 id="empty-title">想先检查什么？</h1><p>描述一个代码问题，Meliora 会在受控工作区里只读分析，并把工具过程与验证结果留在这里。</p>{productMode.workspaceId ? <div className="suggestion-list" aria-label="任务建议">{suggestedTasks.map((task) => <button key={task} onClick={() => prepareSuggestedTask(task)}>{task}</button>)}</div> : <aside className="configuration-error" role="alert">演示工作区尚未配置，请联系项目维护者。</aside>}<div className="empty-boundary"><ShieldCheck aria-hidden="true"/><span>只读模式，不修改文件，不执行写命令。</span></div></section> : <section className="timeline-empty" aria-labelledby="empty-title"><span aria-hidden="true"><Sparkles /></span><h2 id="empty-title">开始一个新任务</h2><p>输入目标后，任务状态会在这里逐步呈现。</p><button onClick={() => composerInput.current?.focus()}>在输入框中开始</button></section>)}
           {messages.map((item) => <article className={`message ${item.role}`} key={item.id}>
             <span className="message-author">{item.role === "assistant" ? "M" : userAvatar}</span>
             <div className="message-body">{item.role === "assistant" ? <><h2>任务执行概览</h2><p>{item.content}</p><h3>当前计划</h3><ul><li>读取任务状态</li><li>展示工具与验证状态</li><li>生成可检查的最终结果</li></ul><div className="message-actions"><button onClick={() => setNotice("已复制消息摘要。")}><Copy />复制</button><button aria-pressed={reaction === "like"} onClick={() => setReaction("like")}><ThumbsUp />点赞</button><button aria-pressed={reaction === "dislike"} onClick={() => setReaction("dislike")}><ThumbsDown />点踩</button></div></> : <p>{item.content} <a href="#composer">查看执行输入</a></p>}</div>
           </article>)}
-          {liveMode && liveState.identity && <aside className="reconnect-banner"><strong>真实任务</strong><span>Run {liveState.identity.runId} · 公开事件 #{liveState.cursor}。刷新仅 GET /resume，不重新提交。</span></aside>}
+          {liveMode && liveState.identity && !productMode.enabled && <aside className="reconnect-banner"><strong>真实任务</strong><span>Run {liveState.identity.runId} · 公开事件 #{liveState.cursor}。刷新仅 GET /resume，不重新提交。</span></aside>}
           {liveMode && liveState.phase === "error" && <aside className="reconnect-banner" role="alert"><strong>连接异常</strong><span>{liveState.errorCode}。若提交结果未知，请勿新建相同任务；可检查服务端或尝试恢复。</span>{pendingSubmission && <button onClick={() => { try { liveStorage?.removeItem(LIVE_SESSION_KEY); } catch { return; } liveController.current!.state = initialLiveRunState(); setLiveState(initialLiveRunState()); setPendingSubmission(false); }}>我已核查，解除提交锁</button>}{knownRunRecord && !pendingSubmission && <button onClick={() => { try { liveStorage?.removeItem(LIVE_SESSION_KEY); } catch { return; } liveController.current!.state = initialLiveRunState(); setLiveState(initialLiveRunState()); setKnownRunRecord(false); setLiveMessage(""); }}>忘记此 Run，开始新任务</button>}</aside>}
           {!liveMode && scenarioId === "reconnecting" && <aside className="reconnect-banner"><strong>连接恢复</strong><span>从事件序号 {resumePoint(scenarioId)} 之后继续，不创建新任务。</span></aside>}
           {showLoading && <section className="timeline-loading" aria-live="polite" aria-busy="true"><span className="loading-avatar"/><div><span/><span/><span/></div><p>{liveMode ? "正在等待服务端公开事件…" : playing ? "正在读取公开事件…" : "等待公开事件…"}</p></section>}
-          <div className="event-flow">{events.map((event) => <article key={event.eventId} data-event={event.kind}>{renderEvent(event)}</article>)}</div>
+          <div className="event-flow">{timeline.map((item) => item.kind === "assistant" ? <article className="assistant-output" key={item.id} data-event="assistant_text"><span className="message-author">M</span><div><strong>Meliora</strong><p>{item.text}</p></div></article> : <article key={item.event.eventId} data-event={item.event.kind}>{renderEvent(item.event)}</article>)}</div>
         </div>
       </section>
 
-      <footer className="composer-area">{notice && <p className="notice" role="status">{notice}</p>}<form className={playing || (liveMode && ["submitting", "resuming", "connecting", "live"].includes(liveState.phase)) ? "is-thinking" : undefined} onSubmit={(event) => { event.preventDefault(); send(); }}>
-        <button type="button" className="attachment-button" aria-label="添加附件" onClick={() => setNotice("附件将在文件服务连接后可用。")}><Plus /></button>
+      <footer className="composer-area">{notice && <p className="notice" role="status">{notice}</p>}<form className={`${productMode.enabled ? "product-composer" : ""} ${playing || (liveMode && ["submitting", "resuming", "connecting", "live"].includes(liveState.phase)) ? "is-thinking" : ""}`} onSubmit={(event) => { event.preventDefault(); send(); }}>
+        {!productMode.enabled && <button type="button" className="attachment-button" aria-label="添加附件" onClick={() => setNotice("附件将在文件服务连接后可用。")}><Plus /></button>}
         <label className="sr-only" htmlFor="composer">输入指令</label>
-        <textarea ref={composerInput} id="composer" maxLength={20_000} value={liveMode ? liveDraft : draft} onChange={(event) => liveMode ? setLiveDraft(event.target.value) : setDraft(event.target.value)} placeholder="输入指令..." onCompositionStart={() => { composerComposing.current = true; }} onCompositionEnd={() => { composerComposing.current = false; }} onFocus={() => { requestAnimationFrame(() => composerInput.current?.scrollIntoView({ block: "nearest" })); }} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !composerComposing.current && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
-        <button type="button" className={`voice-button ${voiceActive ? "active" : ""}`} aria-label="语音输入" aria-pressed={voiceActive} onClick={() => setVoiceActive((value) => !value)}><Mic /></button>
-        {!liveMode && <label className="model-picker"><span className="sr-only">模型</span><select value={modelName} onChange={(event) => setModelName(event.target.value)}><option>DeepSeek V3</option><option>Kimi K2</option><option>MiniMax M2</option></select></label>}
+        <textarea ref={composerInput} id="composer" maxLength={20_000} value={liveMode ? liveDraft : draft} onChange={(event) => liveMode ? setLiveDraft(event.target.value) : setDraft(event.target.value)} placeholder={productMode.enabled ? "描述你想检查的问题" : "输入指令..."} onCompositionStart={() => { composerComposing.current = true; }} onCompositionEnd={() => { composerComposing.current = false; }} onFocus={() => { requestAnimationFrame(() => composerInput.current?.scrollIntoView({ block: "nearest" })); }} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !composerComposing.current && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }}/>
+        {!productMode.enabled && <button type="button" className={`voice-button ${voiceActive ? "active" : ""}`} aria-label="语音输入" aria-pressed={voiceActive} onClick={() => setVoiceActive((value) => !value)}><Mic /></button>}
+        {!liveMode && !productMode.enabled && <label className="model-picker"><span className="sr-only">模型</span><select value={modelName} onChange={(event) => setModelName(event.target.value)}><option>DeepSeek V3</option><option>Kimi K2</option><option>MiniMax M2</option></select></label>}
         <button className="send-button" aria-label="发送" disabled={liveMode ? !liveDraft.trim() || !liveWorkspaceId || !["idle", "terminal"].includes(liveState.phase) : !draft.trim() || playing}><ArrowUp /></button>
-      </form><div className="composer-meta"><span>Agent · {liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}</span><span>{liveMode ? "模型由本地服务端配置 · 只读任务 · Ctrl/⌘ + Enter" : `${modelName} · 本地预览 · Ctrl/⌘ + Enter`}</span></div></footer>
+      </form><div className="composer-meta"><span>{productMode.enabled ? productMode.workspaceLabel : `Agent · ${liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name}`}</span><span>{productMode.enabled ? "服务端模型 · 只读任务 · Ctrl/⌘ + Enter" : liveMode ? "模型由本地服务端配置 · 只读任务 · Ctrl/⌘ + Enter" : `${modelName} · 本地预览 · Ctrl/⌘ + Enter`}</span></div></footer>
     </main>
 
     <button className="mobile-backdrop" aria-label="关闭侧面板" onClick={() => setMobilePanel(null)}/>
-    <aside className="right-panel"><button className="mobile-close" aria-label="关闭代码面板" onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name} chatTitle={liveMode ? "真实只读任务" : activeChat.title} collapsed={rightCollapsed} onCollapse={() => setRightCollapsed((value) => !value)}/></aside>
+    <aside className="right-panel"><button className="mobile-close" aria-label={productMode.enabled ? "关闭运行面板" : "关闭代码面板"} onClick={() => setMobilePanel(null)}><X /></button><RightPanel projectName={productMode.enabled ? productMode.workspaceLabel : liveMode ? liveWorkspaceId || "本地工作区" : activeProject.name} chatTitle={liveMode ? "真实只读任务" : activeChat.title} collapsed={rightCollapsed} productMode={productMode.enabled} events={events} statusLabel={liveMode ? livePhaseLabel[liveState.phase] : labels[runStatus as keyof typeof labels]} onCollapse={() => setRightCollapsed((value) => !value)}/></aside>
 
     <dialog ref={settingsDialog} className="settings-dialog" onCancel={() => setDialogMode(null)}>
       <button className="dialog-close" aria-label="关闭设置" onClick={() => setDialogMode(null)}><X /></button>
