@@ -89,9 +89,10 @@ const submitAndReadTerminal = async (idempotencyKey: string): Promise<string> =>
   assert.equal(eventsResponse.status, 200);
   const events = await eventsResponse.text();
   assert.match(events, /"kind":"run_completed"/u);
-  assert.match(events, /只读工具 git_status 已成功执行/u);
-  assert.match(events, /固定演示流程已完成只读 Git 状态检查/u,
-    "verified final fixture text must cross the server-owned public projection");
+  assert.match(events, /Git 工作区干净，没有未提交修改/u,
+    "an empty verified git status must become an explicit server-owned public fact");
+  assert.doesNotMatch(events, /无法安全公开/u,
+    "the verified clean-status fact must remain repeatable in the final answer");
   return created.runId;
 };
 

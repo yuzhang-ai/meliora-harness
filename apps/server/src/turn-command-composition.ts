@@ -201,16 +201,24 @@ const safeToolSummary = (
   return `只读工具 ${definition.name} 执行失败，未公开原始输出。`;
 };
 
+type SafeModelToolContent = Readonly<{
+  content: string;
+  privateObservationContent: string | null;
+  verifiedEmptyText: boolean;
+}>;
+
 const safeModelToolContent = (
   artifact: Awaited<ReturnType<SessionStorePort["getArtifact"]>>,
   fallback: string,
-): string => {
-  if (!artifact || artifact.visibility !== "private" || artifact.mediaType !== "text/plain") return fallback;
+): SafeModelToolContent => {
+  if (!artifact || artifact.visibility !== "private" || artifact.mediaType !== "text/plain") {
+    return { content: fallback, privateObservationContent: null, verifiedEmptyText: false };
+  }
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(artifact.content);
   } catch {
-    return fallback;
+    return { content: fallback, privateObservationContent: null, verifiedEmptyText: false };
   }
   const projected = text.split(/\r?\n/u).map((line) => {
     try {
@@ -220,7 +228,29 @@ const safeModelToolContent = (
       return "[redacted sensitive line]";
     }
   }).join("\n").trim();
-  return projected.length === 0 ? fallback : projected;
+  return projected.length === 0
+    ? { content: fallback, privateObservationContent: null, verifiedEmptyText: true }
+    : { content: projected, privateObservationContent: projected, verifiedEmptyText: false };
+};
+
+const CLEAN_GIT_STATUS_FACT = "Git 工作区干净，没有未提交修改。";
+
+export const isVerifiedCleanGitStatusArtifact = (
+  artifact: Awaited<ReturnType<SessionStorePort["getArtifact"]>>,
+): boolean => {
+  if (!artifact
+    || artifact.visibility !== "private"
+    || artifact.mediaType !== "text/plain"
+    || artifact.byteLength !== 0
+    || artifact.content.byteLength !== 0
+    || typeof artifact.metadata !== "object"
+    || artifact.metadata === null
+    || Array.isArray(artifact.metadata)) return false;
+  const metadata = artifact.metadata as Record<string, unknown>;
+  return metadata.toolName === "git_status"
+    && metadata.encoding === "utf-8"
+    && metadata.bytesRead === 0
+    && metadata.truncated === false;
 };
 
 const UNSAFE_ASSISTANT_TEXT_REDACTION = "最终回答包含无法安全公开的内容，已隐藏；工具与验证记录仍可查看。";
@@ -288,6 +318,7 @@ const createServerOwnedToolProjector = (
   if (input.execution.status !== "succeeded") {
     return {
       modelContent: summary,
+      privateObservationContent: null,
       publicSummary: summary,
       publicArtifactIds: [],
       publicVerificationArtifactIds: [],
@@ -296,9 +327,15 @@ const createServerOwnedToolProjector = (
   const privateArtifact = input.execution.outputArtifactId
     ? await store.getArtifact(input.execution.outputArtifactId)
     : null;
+  const modelProjection = safeModelToolContent(privateArtifact, summary);
+  const cleanGitStatus = input.definition.name === "git_status"
+    && input.execution.verification?.status === "passed"
+    && modelProjection.verifiedEmptyText
+    && isVerifiedCleanGitStatusArtifact(privateArtifact);
   return {
-    modelContent: safeModelToolContent(privateArtifact, summary),
-    publicSummary: summary,
+    modelContent: cleanGitStatus ? CLEAN_GIT_STATUS_FACT : modelProjection.content,
+    privateObservationContent: cleanGitStatus ? null : modelProjection.privateObservationContent,
+    publicSummary: cleanGitStatus ? CLEAN_GIT_STATUS_FACT : summary,
     // Runtime stages the safe summary under the executing reservation, then
     // commits its alias atomically with the Receipt and public events.
     publicArtifactIds: [],

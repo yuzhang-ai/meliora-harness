@@ -26,6 +26,7 @@ import { createMelioraServer } from "../src/server.js";
 import {
   createFrozenReadOnlyWorkspaceCatalog,
   createProviderBackedReadOnlyRunModel,
+  isVerifiedCleanGitStatusArtifact,
   projectServerOwnedAssistantText,
   createTurnCommandSubmitter,
   type TurnCommandIds,
@@ -35,6 +36,38 @@ const fixedNow = "2026-09-12T04:00:00.000Z";
 const workspaceId = "workspace-provider-vertical";
 const privateMarker = "SERVER_VERTICAL_PRIVATE_MARKER";
 const execFileAsync = promisify(execFile);
+
+const cleanGitArtifact = (overrides: Readonly<Record<string, unknown>> = {}) => ({
+  artifactId: "artifact-clean-git",
+  contentHash: "hash-clean-git",
+  mediaType: "text/plain",
+  byteLength: 0,
+  visibility: "private",
+  createdAt: fixedNow,
+  content: new Uint8Array(),
+  metadata: { toolName: "git_status", toolVersion: "1", encoding: "utf-8", bytesRead: 0, truncated: false },
+  ...overrides,
+} as const);
+
+test("clean Git fact requires exact zero-byte UTF-8 artifact evidence", () => {
+  assert.equal(isVerifiedCleanGitStatusArtifact(cleanGitArtifact()), true);
+  assert.equal(isVerifiedCleanGitStatusArtifact(cleanGitArtifact({
+    metadata: { toolName: "git_status", toolVersion: "1", encoding: "binary", bytesRead: 7, truncated: false },
+  })), false, "binary output discarded by Host decoding is not evidence of a clean workspace");
+  assert.equal(isVerifiedCleanGitStatusArtifact(cleanGitArtifact({
+    metadata: { toolName: "git_status", toolVersion: "1", encoding: "utf-8", bytesRead: 0, truncated: true },
+  })), false, "truncated output is not evidence of a clean workspace");
+  assert.equal(isVerifiedCleanGitStatusArtifact(cleanGitArtifact({
+    byteLength: 1,
+    content: new TextEncoder().encode(" "),
+    metadata: { toolName: "git_status", toolVersion: "1", encoding: "utf-8", bytesRead: 1, truncated: false },
+  })), false, "nonzero whitespace is not evidence of a clean workspace");
+  assert.equal(isVerifiedCleanGitStatusArtifact(cleanGitArtifact({
+    byteLength: 13,
+    content: new TextEncoder().encode(" M README.md\n"),
+    metadata: { toolName: "git_status", toolVersion: "1", encoding: "utf-8", bytesRead: 13, truncated: false },
+  })), false, "nonempty porcelain output must remain private");
+});
 
 test("final answer projection rejects every private observation encoding", () => {
   const privateObservation = "短私密值";

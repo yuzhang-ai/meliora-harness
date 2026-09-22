@@ -57,6 +57,12 @@ export type ReadOnlyToolExecution = Readonly<{
 export type ReadOnlyToolProjection = Readonly<{
   /** Redacted content that may be sent back to the model provider. */
   modelContent: string;
+  /**
+   * Private artifact content represented by modelContent. Final answers may not
+   * echo this value. Omit it for server-owned, verification-bound facts that
+   * are safe to repeat publicly.
+   */
+  privateObservationContent: string | null;
   /** Redacted summary that may be persisted in receipts and public events. */
   publicSummary: string;
   /** Candidate refs; the loop still checks each ref with isPublicArtifact. */
@@ -249,7 +255,7 @@ export class ReadOnlyRunLoop {
     const verificationEvidenceArtifactIds: string[] = [];
     const publicEvidenceIds: string[] = [];
     const privateFinalAnswerObservations: string[] = [input.userMessage];
-    let hasPrivateToolResultObservation = false;
+    let hasVerifiedToolResultObservation = false;
     const messages: CanonicalInputMessage[] = [{ role: "user", content: input.userMessage }];
     const catalogByName = new Map(input.catalog.definitions.map((definition) => [definition.name, definition]));
 
@@ -716,7 +722,7 @@ export class ReadOnlyRunLoop {
         if (verificationIds.length === 0) {
           return terminal("blocked", "缺少可验证的只读工具证据。", "verification_missing", false, ["请让模型执行必要的只读检查。"]);
         }
-        if (assistantDeltas.length > 0 && hasPrivateToolResultObservation) {
+        if (assistantDeltas.length > 0 && hasVerifiedToolResultObservation) {
           const projected = await this.dependencies.projectAssistantText({
             content: assistantContent,
             privateFinalAnswerObservations,
@@ -847,6 +853,7 @@ export class ReadOnlyRunLoop {
           if (isLeaseLostError(error)) throw error;
           projection = {
             modelContent: "只读工具结果无法安全投影。",
+            privateObservationContent: null,
             publicSummary: "只读工具结果无法安全投影。",
             publicArtifactIds: [],
             publicVerificationArtifactIds: [],
@@ -932,9 +939,11 @@ export class ReadOnlyRunLoop {
         }
         if (committed.events.length > 0) sequence = committed.events.at(-1)!.sequence;
         publicEvidenceIds.push(...publicVerificationArtifactIds);
-        if ((execution.outputArtifactId !== undefined || projection.modelContent !== projection.publicSummary) && projection.modelContent.length > 0) {
-          hasPrivateToolResultObservation = true;
-          privateFinalAnswerObservations.push(projection.modelContent);
+        if (execution.outputArtifactId !== undefined || projection.modelContent !== projection.publicSummary) {
+          hasVerifiedToolResultObservation = true;
+        }
+        if (projection.privateObservationContent && projection.privateObservationContent.length > 0) {
+          privateFinalAnswerObservations.push(projection.privateObservationContent);
         }
         if (execution.status === "failed") return terminal("failed", projection.publicSummary, "tool_execution_failed", true);
         if (execution.status === "cancelled") return terminal("cancelled", "用户取消了当前任务。", "user_requested");
