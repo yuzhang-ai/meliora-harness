@@ -126,8 +126,15 @@ export type ReadOnlyRunLoopDependencies = Readonly<{
     invocation: NormalizedToolInvocation;
     execution: ReadOnlyToolExecution;
   }>): ReadOnlyToolProjection | Promise<ReadOnlyToolProjection>;
-  /** Reserved for a future strict Server-owned summary decoder; M0 never calls it for Provider text. */
-  projectAssistantText(input: Readonly<{ content: string }>): string | Promise<string>;
+  /**
+   * Server-owned final-answer projector. The Runtime only calls this after a
+   * tool-backed model step has been durably committed and verification exists;
+   * intermediate Provider text and reasoning never cross this boundary.
+   */
+  projectAssistantText(input: Readonly<{
+    content: string;
+    privateFinalAnswerObservations: readonly string[];
+  }>): string | Promise<string>;
   isPublicArtifact(artifactId: string): Promise<boolean>;
   ownerId: string;
   leaseTtlMs: number;
@@ -194,8 +201,6 @@ const MODEL_STEP_OUTCOME_UNKNOWN_CODE = "model_step_outcome_unknown";
 const MODEL_STEP_OUTCOME_UNKNOWN_SUMMARY = "模型步骤结果未知，已停止自动重发 Provider 请求。";
 const MODEL_STEP_OUTCOME_UNKNOWN_ACTIONS = ["从持久化事件、Provider 幂等查询或后续恢复快照确认结果后再继续。"] as const;
 const DETERMINISTIC_PROVIDER_FAILURE_CODES = new Set(["provider_authentication_failed", "provider_rate_limited"]);
-const PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION = "模型已基于私有工具结果生成回复，内容已隐藏。";
-const PROVIDER_ASSISTANT_TEXT_REDACTION = "模型响应已私有持久化，公开摘要尚未启用。";
 const defaultSummary = (definition: ToolDefinition): string => `正在执行只读工具 ${definition.name}。`;
 const isLeaseLostError = (error: unknown): boolean => error instanceof Error && error.message === "run_lease_lost";
 const isAmbiguousProviderFailure = (event: Extract<CanonicalModelEvent, { kind: "model_step_failed" }>): boolean =>
@@ -243,6 +248,7 @@ export class ReadOnlyRunLoop {
     const verificationIds: string[] = [];
     const verificationEvidenceArtifactIds: string[] = [];
     const publicEvidenceIds: string[] = [];
+    const privateFinalAnswerObservations: string[] = [input.userMessage];
     let hasPrivateToolResultObservation = false;
     const messages: CanonicalInputMessage[] = [{ role: "user", content: input.userMessage }];
     const catalogByName = new Map(input.catalog.definitions.map((definition) => [definition.name, definition]));
@@ -581,6 +587,7 @@ export class ReadOnlyRunLoop {
       }
       const completedCalls: CompletedToolCall[] = [];
       let assistantContent = "";
+      let privateReasoning = "";
       const assistantDeltas: string[] = [];
       let finishReason: Extract<CanonicalModelEvent, { kind: "model_step_completed" }>["finishReason"] | undefined;
       for (const event of modelEvents) {
@@ -588,6 +595,8 @@ export class ReadOnlyRunLoop {
         if (event.kind === "assistant_text_delta") {
           assistantContent += event.delta;
           assistantDeltas.push(event.delta);
+        } else if (event.kind === "reasoning_delta") {
+          privateReasoning += event.delta;
         } else if (event.kind === "tool_call_completed") {
           const started = modelEvents.find((candidate): candidate is Extract<CanonicalModelEvent, { kind: "tool_call_started" }> =>
             candidate.kind === "tool_call_started" && candidate.invocationId === event.invocationId,
@@ -680,16 +689,6 @@ export class ReadOnlyRunLoop {
         if (isLeaseLostError(error)) throw error;
         return terminalModelStepOutcomeUnknown();
       }
-      if (assistantDeltas.length > 0) {
-        // M0 has neither a strict assistant-output decoder nor a Server-owned
-        // summary. Provider text can echo private user input before the first
-        // tool, so no Provider-originated byte may cross into Public SSE.
-        await publish("assistant_text_delta", {
-          delta: hasPrivateToolResultObservation
-            ? PRIVATE_TOOL_RESULT_ASSISTANT_REDACTION
-            : PROVIDER_ASSISTANT_TEXT_REDACTION,
-        });
-      }
       if (assistantContent.length > 0 || completedCalls.length > 0) {
         messages.push({
           role: "assistant",
@@ -704,6 +703,8 @@ export class ReadOnlyRunLoop {
           }),
         });
       }
+      if (privateReasoning.length > 0) privateFinalAnswerObservations.push(privateReasoning);
+      if (completedCalls.length > 0 && assistantContent.length > 0) privateFinalAnswerObservations.push(assistantContent);
       if (signal.aborted) return terminal("cancelled", "用户取消了当前任务。", "user_requested");
       if (finishReason === "length" || finishReason === "content_filter" || finishReason === "unknown" || finishReason === undefined) {
         return terminal("blocked", "模型未提供可继续执行的完成原因。", "model_completion_incomplete", false, ["请缩小任务范围或重试。"]);
@@ -714,6 +715,15 @@ export class ReadOnlyRunLoop {
         await changeStatus("verifying");
         if (verificationIds.length === 0) {
           return terminal("blocked", "缺少可验证的只读工具证据。", "verification_missing", false, ["请让模型执行必要的只读检查。"]);
+        }
+        if (assistantDeltas.length > 0 && hasPrivateToolResultObservation) {
+          const projected = await this.dependencies.projectAssistantText({
+            content: assistantContent,
+            privateFinalAnswerObservations,
+          });
+          if (projected.trim().length > 0) {
+            await publish("assistant_text_delta", { delta: projected });
+          }
         }
         return terminal("completed", "只读检查已完成并已验证。");
       }
@@ -924,6 +934,7 @@ export class ReadOnlyRunLoop {
         publicEvidenceIds.push(...publicVerificationArtifactIds);
         if ((execution.outputArtifactId !== undefined || projection.modelContent !== projection.publicSummary) && projection.modelContent.length > 0) {
           hasPrivateToolResultObservation = true;
+          privateFinalAnswerObservations.push(projection.modelContent);
         }
         if (execution.status === "failed") return terminal("failed", projection.publicSummary, "tool_execution_failed", true);
         if (execution.status === "cancelled") return terminal("cancelled", "用户取消了当前任务。", "user_requested");

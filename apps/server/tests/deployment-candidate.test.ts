@@ -90,8 +90,8 @@ const submitAndReadTerminal = async (idempotencyKey: string): Promise<string> =>
   const events = await eventsResponse.text();
   assert.match(events, /"kind":"run_completed"/u);
   assert.match(events, /只读工具 git_status 已成功执行/u);
-  assert.doesNotMatch(events, /固定演示流程已完成只读 Git 状态检查/u,
-    "model-visible fixture text must remain behind the public projection");
+  assert.match(events, /固定演示流程已完成只读 Git 状态检查/u,
+    "verified final fixture text must cross the server-owned public projection");
   return created.runId;
 };
 

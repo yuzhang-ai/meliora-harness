@@ -1,6 +1,6 @@
 # WP-7A 老师首次打开体验施工卡
 
-> 状态：Candidate，门禁与独立复审通过，待提交、部署与公网 read-back
+> 状态：Production effective，公网 read-back 通过
 > 日期：2026-09-22
 > 基线：`main@2b8b22ea6bd4a1347dd3d8fbf69d0e234440757e`
 > 施工现场：`C:\codex-worktrees\meliora-product-shell-v1`
@@ -70,4 +70,8 @@
 - 根门禁：底层 TypeScript、Contracts、Provider、Runtime、Store、Server、Deploy、E3 全部通过；Web 末段因预览进程占用 `esbuild.exe` 首次未执行，关闭预览后 `npm.cmd run check:web` 完整通过。
 - 真实无密钥浏览器链路：通过；一次提交一次 POST、SSE 到终态、刷新 GET-only、私有 marker 不回显、四档无溢出。
 - 独立复审：原跨 workspace 保存 Run 的 P1 已关闭；最新结论 PASS，无剩余 P0/P1/P2。
-- 尚待：提交推送、公网部署与公网浏览器 read-back。真实 Provider 与 HarmonyOS API 26 真机仍单列 Pending。
+- 提交与合并：PR #51 已合并；`main@d2728a9eed8164f55d7d315fda5f17d5cb8e0605`。
+- 公网发布：release `59dc100805f12404a963697bc108c62248280810` 已切换为 `/srv/meliora/app/current`；它与合并后的 `main` tree `743d52d3ebedfc7ba5a344f78165fa2717552241` 完全一致。
+- 服务 read-back：`meliora.service` active，回环 `/api/health` 返回 `{"ok":true}`，Nginx 配置检查通过。
+- 公网浏览器 read-back：`https://melioracode.com` 无账号密码直接打开；1440/1100/1099/768/390px、运行面板、未实现控件隐藏、跨 workspace 旧 Run 清理与首次零 `/api/*` 请求全部通过。
+- 本次公网 read-back 未提交任务、未调用真实 Provider。真实 Provider 与 HarmonyOS API 26 真机仍单列 Pending。

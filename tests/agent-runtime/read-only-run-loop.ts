@@ -101,6 +101,7 @@ function createLoop(
   let modelCalls = 0;
   let checkpointStarts = 0;
   let assistantProjectionCalls = 0;
+  const assistantProjectionObservations: string[][] = [];
   let hostCalls = 0;
   const loop = new ReadOnlyRunLoop({
     store,
@@ -157,8 +158,9 @@ function createLoop(
       publicArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],
       publicVerificationArtifactIds: execution.status === "succeeded" ? ["artifact-read-file-summary", "private-artifact-id"] : [],
     }),
-    projectAssistantText: ({ content }) => {
+    projectAssistantText: ({ content, privateFinalAnswerObservations }) => {
       assistantProjectionCalls += 1;
+      assistantProjectionObservations.push([...privateFinalAnswerObservations]);
       return content;
     },
     isPublicArtifact: async (artifactId) => artifactId === "artifact-read-file-summary",
@@ -167,7 +169,7 @@ function createLoop(
     policyVersion: "fixture-policy-v1",
     principalId: "fixture-user",
   });
-  return { loop, store, leaseTtlMs: options.leaseTtlMs ?? 60_000, modelCalls: () => modelCalls, hostCalls: () => hostCalls, assistantProjectionCalls: () => assistantProjectionCalls };
+  return { loop, store, leaseTtlMs: options.leaseTtlMs ?? 60_000, modelCalls: () => modelCalls, hostCalls: () => hostCalls, assistantProjectionCalls: () => assistantProjectionCalls, assistantProjectionObservations: () => assistantProjectionObservations };
 }
 
 const runWithCommand = async (
@@ -227,7 +229,13 @@ const successResult = await runWithCommand(success, {
 assert.equal(successResult.outcome.status, "completed");
 assert.equal(success.modelCalls(), 2);
 assert.equal(success.hostCalls(), 1, "only a started invocation execution permit may reach Host");
-assert.equal(success.assistantProjectionCalls(), 0, "M0 must never project Provider assistant text into the public surface");
+assert.equal(success.assistantProjectionCalls(), 1, "only the verified final answer crosses the Server-owned projector");
+assert.deepEqual(success.assistantProjectionObservations(), [[
+  "检查入口文件",
+  "private model reasoning must not be projected",
+  "我先读取入口文件。",
+  "入口文件存在，读取成功。",
+]], "the final projector must receive every prior private user/model/tool observation");
 assert.equal(successResult.outcome.receiptRefs.length, 1);
 assert.equal((await success.store.readReceipt({
   runId: "run-success",
@@ -235,17 +243,16 @@ assert.equal((await success.store.readReceipt({
   receiptId: successResult.outcome.receiptRefs[0]!,
 }))?.status, "succeeded", "receipt must be durable before the outcome is accepted");
 assert.deepEqual(successResult.publicEvents.map((event) => event.kind), [
-  "run_status_changed", "run_status_changed", "assistant_text_delta", "run_status_changed", "tool_call_presented",
-  "run_status_changed", "tool_result_presented", "verification_updated", "run_status_changed", "assistant_text_delta",
-  "run_status_changed", "run_status_changed", "run_completed",
+  "run_status_changed", "run_status_changed", "run_status_changed", "tool_call_presented",
+  "run_status_changed", "tool_result_presented", "verification_updated", "run_status_changed", "run_status_changed", "assistant_text_delta",
+  "run_status_changed", "run_completed",
 ]);
 assert.equal(successResult.publicEvents.some((event) => JSON.stringify(event).includes("reasoning")), false);
 const successAssistantText = successResult.publicEvents
   .filter((event): event is Extract<(typeof successResult.publicEvents)[number], { kind: "assistant_text_delta" }> => event.kind === "assistant_text_delta")
   .map((event) => event.payload.delta)
   .join("");
-assert.match(successAssistantText, /模型响应已私有持久化，公开摘要尚未启用。/u, "pre-tool Provider text must be replaced by the fixed M0 notice");
-assert.match(successAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u, "post-tool assistant text should be fixed redaction");
+assert.equal(successAssistantText, "入口文件已读取并核验。", "only the verified post-tool final answer should be public");
 assert.equal(JSON.stringify(successResult).includes("API_KEY=secret"), false, "executor text must cross a server-owned projector");
 assert.equal(JSON.stringify(successResult).includes("private-artifact-id"), false, "private artifacts must not become public refs");
 assert.equal((await success.store.readEvents({ runId: "run-success", limit: 100 })).events.some((event) => event.visibility === "private"), true);

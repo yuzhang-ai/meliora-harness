@@ -10,6 +10,6 @@ export function resolveProductMode(environment: Readonly<Record<string, string |
   const enabled = environment.VITE_MELIORA_PRODUCT_MODE === "public";
   const candidate = environment.VITE_MELIORA_WORKSPACE_ID?.trim() ?? "";
   const workspaceId = WORKSPACE_ID.test(candidate) ? candidate : "";
-  const label = environment.VITE_MELIORA_WORKSPACE_LABEL?.trim().slice(0, 80) || "Meliora Demo";
+  const label = environment.VITE_MELIORA_WORKSPACE_LABEL?.trim().slice(0, 80) || "Meliora 源码工作区";
   return { enabled, workspaceId, workspaceLabel: label };
 }

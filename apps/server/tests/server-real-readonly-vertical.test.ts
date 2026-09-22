@@ -26,6 +26,7 @@ import { createMelioraServer } from "../src/server.js";
 import {
   createFrozenReadOnlyWorkspaceCatalog,
   createProviderBackedReadOnlyRunModel,
+  projectServerOwnedAssistantText,
   createTurnCommandSubmitter,
   type TurnCommandIds,
 } from "../src/turn-command-composition.js";
@@ -34,6 +35,32 @@ const fixedNow = "2026-09-12T04:00:00.000Z";
 const workspaceId = "workspace-provider-vertical";
 const privateMarker = "SERVER_VERTICAL_PRIVATE_MARKER";
 const execFileAsync = promisify(execFile);
+
+test("final answer projection rejects every private observation encoding", () => {
+  const privateObservation = "短私密值";
+  const base64 = Buffer.from(privateObservation, "utf8").toString("base64");
+  const base64url = base64.replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+  for (const candidate of [
+    privateObservation,
+    `回显：${privateObservation}`,
+    encodeURIComponent(privateObservation),
+    base64,
+    base64url,
+  ]) {
+    assert.match(projectServerOwnedAssistantText({
+      content: candidate,
+      privateFinalAnswerObservations: [privateObservation],
+    }), /无法安全公开/u);
+  }
+  assert.equal(projectServerOwnedAssistantText({
+    content: "入口文件已完成只读检查，未发现写入。",
+    privateFinalAnswerObservations: [privateObservation],
+  }), "入口文件已完成只读检查，未发现写入。");
+  assert.match(projectServerOwnedAssistantText({
+    content: "结果包含 pwd",
+    privateFinalAnswerObservations: ["pwd"],
+  }), /无法安全公开/u, "short embedded private observations must also fail closed");
+});
 
 const deterministicIds = (): TurnCommandIds => {
   const counters = new Map<string, number>();
@@ -462,7 +489,7 @@ test(`Server keeps pre-tool ${preToolScenario.name} private while preserving Pro
       for (const forbidden of new Set([userInput, echoedInput, "M0_PRE_TOOL_PRIVATE_USER_MARKER", encodeURIComponent(userInput), Buffer.from(userInput, "utf8").toString("base64")])) {
         assert.equal(publicSurface.includes(forbidden), false, "Provider/user private text must not reach SSE, public events, or public artifacts");
       }
-      assert.match(publicSurface, /模型响应已私有持久化，公开摘要尚未启用。/u);
+      assert.match(publicSurface, /post-tool raw provider text/u, "a safe verified final answer should be public");
       const privateEvents = await store.readEvents({ runId: created.runId, limit: 100 });
       assert.equal(privateEvents.events.some((event) => event.visibility === "private"
         && (event.payload as { kind?: unknown; delta?: unknown }).kind === "assistant_text_delta"
@@ -605,9 +632,9 @@ test(`Server redacts post-tool assistant text for ${echoScenario.name} private e
     ]) {
       assert.equal(publicSurface.includes(forbiddenValue), false, "public projection must not leak private Provider, workspace, or artifact data");
     }
-    assert.match(visibleAssistantText, /模型响应已私有持久化，公开摘要尚未启用。/u, "pre-tool Provider text must never stream publicly");
+    assert.equal(visibleAssistantText.includes("我先读取入口文件。"), false, "pre-tool Provider text must never stream publicly");
     assert.equal(visibleAssistantText.includes(attemptedAssistantText), false);
-    assert.match(visibleAssistantText, /模型已基于私有工具结果生成回复，内容已隐藏/u);
+    assert.match(visibleAssistantText, /最终回答包含无法安全公开的内容，已隐藏/u);
     assert.ok(events.some((event) => event.kind === "run_completed"));
   } finally {
     const closingApp = app;

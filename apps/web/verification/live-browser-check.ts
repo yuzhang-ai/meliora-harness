@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import type { AddressInfo } from "node:net";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -15,6 +15,17 @@ import { createLocalMelioraServer } from "../../server/src/persistence";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright") as typeof import("playwright");
 
+async function findLoopbackPort(): Promise<number> {
+  const server = createNetServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return port;
+}
+
 async function run(): Promise<void> {
   const parent = await mkdtemp(join(tmpdir(), "meliora-live-browser-"));
   const workspaceRoot = join(parent, "workspace");
@@ -26,12 +37,13 @@ async function run(): Promise<void> {
     windowsHide: true,
   });
   let calls = 0;
+  const longFinalAnswer = `只读检查完成。${"A".repeat(400)}`;
   const model: ReadOnlyRunModelPort = { next: async ({ modelStepId }) => {
     calls += 1;
     if (calls % 2 === 1) return deepseekStreamTextSingleToolFixture.expectedEvents.map((event) => ({ ...event, modelStepId }));
     const occurredAt = new Date().toISOString();
     return [
-      { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 0, occurredAt, kind: "assistant_text_delta", delta: "只读检查完成。" },
+      { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 0, occurredAt, kind: "assistant_text_delta", delta: longFinalAnswer },
       { schemaVersion: "meliora.model-event.v1", modelStepId, streamIndex: 1, occurredAt, kind: "model_step_completed", finishReason: "stop" },
     ];
   } };
@@ -49,10 +61,11 @@ async function run(): Promise<void> {
     await new Promise<void>((resolve) => api.server.listen(0, "127.0.0.1", resolve));
     const apiPort = (api.server.address() as AddressInfo).port;
     allowedHosts.push(`127.0.0.1:${apiPort}`);
+    const webPortNumber = await findLoopbackPort();
     vite = await createViteServer({
       configFile: false,
       root: join(import.meta.dirname, ".."),
-      server: { host: "127.0.0.1", port: 0, strictPort: false, proxy: { "/api": { target: `http://127.0.0.1:${apiPort}`, changeOrigin: true } } },
+      server: { host: "127.0.0.1", port: webPortNumber, strictPort: true, proxy: { "/api": { target: `http://127.0.0.1:${apiPort}`, changeOrigin: true } } },
     });
     await vite.listen();
     const webPort = vite.httpServer!.address() as AddressInfo;
@@ -76,6 +89,7 @@ async function run(): Promise<void> {
     }
     assert.equal(requests.filter((item) => item === "POST /api/turns").length, 1);
     assert.equal(calls, 2);
+    await page.getByText(longFinalAnswer, { exact: true }).waitFor();
     assert.equal((await page.locator("body").innerText()).includes(privateMarker), false);
     await page.reload();
     await page.getByRole("heading", { name: "任务已完成" }).waitFor({ timeout: 20_000 });
@@ -108,7 +122,7 @@ async function run(): Promise<void> {
     assert.equal(requests.filter((item) => item === "POST /api/turns").length, 2);
     assert.equal(calls, 4);
     assert.deepEqual(pageErrors, []);
-    process.stdout.write("Live browser check passed: POST once per user turn, SSE terminal, refresh GET-only, pending lock, stale-run recovery, private marker absent, four widths no overflow.\n");
+    process.stdout.write("Live browser check passed: POST once per user turn, verified final answer visible, SSE terminal, refresh GET-only, pending lock, stale-run recovery, private marker absent, four widths no overflow.\n");
   } finally {
     await browser?.close();
     await vite?.close();

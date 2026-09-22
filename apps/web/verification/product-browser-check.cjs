@@ -28,8 +28,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
   page.on("response", (response) => { if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`); });
 
   await page.goto(process.env.PRODUCT_BROWSER_URL || "http://127.0.0.1:5174", { waitUntil: "networkidle" });
-  await page.getByRole("heading", { name: "想先检查什么？", exact: true }).waitFor();
-  assert.equal(await page.getByText("Meliora 演示项目", { exact: true }).count() > 0, true);
+  await page.getByRole("heading", { name: "把代码问题交给 Meliora", exact: true }).waitFor();
+  assert.equal(await page.getByText("Meliora 源码工作区", { exact: true }).count() > 0, true);
   assert.equal(await page.getByRole("button", { name: /界面预览|真实运行/ }).count(), 0);
   assert.equal(await page.getByRole("textbox", { name: "工作区 ID" }).count(), 0);
   assert.equal(await page.getByRole("button", { name: "分享" }).count(), 0);
@@ -37,7 +37,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
   assert.equal(await page.getByRole("button", { name: "语音输入" }).count(), 0);
   assert.equal(await page.getByText("Automations", { exact: true }).count(), 0);
   assert.equal(await page.getByText("只读运行", { exact: true }).count() > 0, true);
-  assert.equal(await page.getByRole("tab", { name: "运行", exact: true }).isVisible(), true);
+  assert.equal(await page.getByRole("heading", { name: "运行证据", exact: true }).isVisible(), true);
   assert.equal(await page.evaluate(() => localStorage.getItem("meliora-live-run-v1")), null);
   assert.deepEqual(apiRequests, []);
   await page.screenshot({
@@ -60,6 +60,13 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
     if (width < 1100) {
       assert.equal(await page.getByRole("button", { name: "打开运行面板", exact: true }).isVisible(), true);
     }
+    if (width === 1100) {
+      assert.equal(await page.getByRole("heading", { name: "运行证据", exact: true }).isVisible(), true);
+      assert.equal((await page.locator(".right-panel").boundingBox()).width >= 300, true);
+    }
+    if (width === 1099) {
+      assert.equal((await page.locator(".right-panel").boundingBox()).x >= width, true);
+    }
     if (width === 390) {
       await page.screenshot({
         path: path.join(process.env.BROWSER_SCREENSHOT_DIR || __dirname, `product-${width}.png`),
@@ -69,9 +76,12 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
   }
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "打开运行面板", exact: true }).click();
+  const runPanelTrigger = page.getByRole("button", { name: "打开运行面板", exact: true });
+  await runPanelTrigger.click();
   assert.equal(await page.getByRole("region", { name: "运行证据", exact: true }).isVisible(), true);
-  await page.getByRole("button", { name: "关闭运行面板", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "关闭运行面板", exact: true }).evaluate((element) => element === document.activeElement), true);
+  await page.keyboard.press("Escape");
+  assert.equal(await runPanelTrigger.evaluate((element) => element === document.activeElement), true);
 
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);

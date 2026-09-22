@@ -18,7 +18,7 @@ npm.cmd run dev
 ```powershell
 $env:VITE_MELIORA_PRODUCT_MODE='public'
 $env:VITE_MELIORA_WORKSPACE_ID='portfolio-demo'
-$env:VITE_MELIORA_WORKSPACE_LABEL='Meliora 演示项目'
+$env:VITE_MELIORA_WORKSPACE_LABEL='Meliora 源码工作区'
 npm.cmd --prefix apps/web run build
 ```
 

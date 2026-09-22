@@ -35,19 +35,27 @@ export function RightPanel(props: RightPanelProps) {
     <FileSearch2 aria-hidden="true"/>
   </div>;
 
+  if (props.productMode) return <>
+    <header className="inspector-header">
+      <div><small>运行上下文</small><h2>运行证据</h2></div>
+      <button className="icon-button right-collapse-button" aria-label="收起右栏" onClick={props.onCollapse}><PanelRightClose /></button>
+    </header>
+    <section className="run-inspector" aria-label="运行证据">
+      <div className="run-inspector-summary"><span className="inspector-icon"><ListChecks aria-hidden="true"/></span><div><small>当前状态</small><strong>{props.statusLabel || "准备就绪"}</strong></div><span className="event-count">{props.events?.length ?? 0} 条公开事件</span></div>
+      <div className="inspector-section inspector-scope"><h3><ShieldCheck aria-hidden="true"/>本次运行</h3><dl><div><dt>工作区</dt><dd>{props.projectName}</dd></div><div><dt>文件写入</dt><dd className="safe-value">已禁用</dd></div><div><dt>模型密钥</dt><dd>仅服务端持有</dd></div></dl></div>
+      <div className="inspector-section"><h3><Wrench aria-hidden="true"/>工具记录</h3>{evidence.tools.length ? <ul className="evidence-list">{evidence.tools.map((tool) => <li key={tool.invocationId}><span><strong>{tool.toolName}</strong><small>{tool.summary}</small></span><em className={`evidence-status ${tool.status}`}>{tool.status === "presented" ? "已发起" : tool.status === "succeeded" ? "成功" : tool.status === "failed" ? "失败" : "已取消"}</em></li>)}</ul> : <><p className="inspector-empty">发送任务后，这里会按顺序记录服务端批准的只读工具。</p><div className="capability-list" aria-label="可用检查"><span>Git 状态</span><span>目录与文件</span><span>文本搜索</span><span>只读 Diff</span></div></>}</div>
+      <div className="inspector-section"><h3><CheckCircle2 aria-hidden="true"/>验证结果</h3>{evidence.verifications.length ? <ul className="evidence-list">{evidence.verifications.map((verification) => <li key={verification.verificationId}><span><strong>结果验证</strong><small>只展示公开验证状态</small></span><em className={`evidence-status ${verification.status}`}>{verification.status === "passed" ? "通过" : verification.status === "failed" ? "未通过" : "未运行"}</em></li>)}</ul> : <p className="inspector-empty">任务完成验证后，会在这里留下可恢复的状态记录。</p>}{evidence.publicArtifactCount > 0 && <small className="artifact-count">已关联 {evidence.publicArtifactCount} 个公开证据引用</small>}</div>
+      <footer className="inspector-footer"><ShieldCheck aria-hidden="true"/><span>只展示 PublicRunEvent 安全投影</span></footer>
+    </section>
+  </>;
+
   return <>
     <div className="right-tabs" role="tablist" aria-label="右侧面板">
-      {props.productMode && <button ref={runTab} role="tab" aria-selected={activeTab === "run"} tabIndex={activeTab === "run" ? 0 : -1} onKeyDown={selectAdjacentTab} onClick={() => setActiveTab("run")}>运行</button>}
       <button ref={changesTab} role="tab" aria-selected={activeTab === "changes"} tabIndex={activeTab === "changes" ? 0 : -1} onKeyDown={selectAdjacentTab} onClick={() => setActiveTab("changes")}>变更</button>
       {!props.productMode && <button ref={runTab} role="tab" aria-selected={activeTab === "run"} tabIndex={activeTab === "run" ? 0 : -1} onKeyDown={selectAdjacentTab} onClick={() => setActiveTab("run")}>预览</button>}
       <span className="right-tools" aria-hidden="true"><ListChecks /><FileSearch2 /></span>
       <button className="icon-button right-collapse-button" aria-label="收起右栏" onClick={props.onCollapse}><PanelRightClose /></button>
     </div>
-    {activeTab === "changes" ? <div className="changes-empty" role="status"><FileSearch2 aria-hidden="true"/>{props.productMode ? <><h3>没有文件变更</h3><p>当前是只读任务，Meliora 不会修改项目文件。</p><small>后续写入能力会在明确审批后单独开放。</small></> : <><h3>暂无文件变更</h3><p>文件变更会随本次运行记录出现在这里。</p><small>支持文件列表与行级差异的只读查看。</small></>}</div> : props.productMode ? <section className="run-inspector" aria-label="运行证据">
-      <div className="run-inspector-summary"><span className="inspector-icon"><ListChecks aria-hidden="true"/></span><div><small>当前状态</small><strong>{props.statusLabel || "准备就绪"}</strong></div><span className="event-count">{props.events?.length ?? 0} 条公开事件</span></div>
-      <div className="inspector-section"><h3><ShieldCheck aria-hidden="true"/>权限边界</h3><p>仅使用服务端批准的只读工具。浏览器不保存模型密钥，也不能直接访问服务器文件。</p></div>
-      <div className="inspector-section"><h3><Wrench aria-hidden="true"/>工具记录</h3>{evidence.tools.length ? <ul className="evidence-list">{evidence.tools.map((tool) => <li key={tool.invocationId}><span><strong>{tool.toolName}</strong><small>{tool.summary}</small></span><em className={`evidence-status ${tool.status}`}>{tool.status === "presented" ? "已发起" : tool.status === "succeeded" ? "成功" : tool.status === "failed" ? "失败" : "已取消"}</em></li>)}</ul> : <p className="inspector-empty">运行工具后，这里会显示公开摘要。</p>}</div>
-      <div className="inspector-section"><h3><CheckCircle2 aria-hidden="true"/>验证结果</h3>{evidence.verifications.length ? <ul className="evidence-list">{evidence.verifications.map((verification) => <li key={verification.verificationId}><span><strong>结果验证</strong><small>只展示公开验证状态</small></span><em className={`evidence-status ${verification.status}`}>{verification.status === "passed" ? "通过" : verification.status === "failed" ? "未通过" : "未运行"}</em></li>)}</ul> : <p className="inspector-empty">任务完成验证后会在这里留下记录。</p>}{evidence.publicArtifactCount > 0 && <small className="artifact-count">已关联 {evidence.publicArtifactCount} 个公开证据引用</small>}</div>
-    </section> : <div className="preview-empty"><ListChecks aria-hidden="true"/><h3>界面状态预览</h3><p>{props.projectName} / {props.chatTitle}</p><small>这里仅用于无密钥 fixture 回放。</small></div>}
+    {activeTab === "changes" ? <div className="changes-empty" role="status"><FileSearch2 aria-hidden="true"/><h3>暂无文件变更</h3><p>文件变更会随本次运行记录出现在这里。</p><small>支持文件列表与行级差异的只读查看。</small></div> : <div className="preview-empty"><ListChecks aria-hidden="true"/><h3>界面状态预览</h3><p>{props.projectName} / {props.chatTitle}</p><small>这里仅用于无密钥 fixture 回放。</small></div>}
   </>;
 }
