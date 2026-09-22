@@ -1,9 +1,9 @@
 # WP-7B 产品体验与真实对话闭环施工卡
 
-> 状态：Production + follow-up Candidate（PR #52 已上线；clean Git status 语义修复待交付）
+> 状态：Production（PR #52 产品体验与 PR #53 clean Git status follow-up 均已上线）
 > 日期：2026-09-22
 > 基线：`origin/main@d2728a9eed8164f55d7d315fda5f17d5cb8e0605`
-> 当前生产 release：`7e0cac8c1a3ede6cc556b418e5d03cf2a2e380ce`
+> 当前生产 release：`81429e9b16ddf98c1eeedf2cfb305e93736af1c9`
 > 施工现场：`C:\codex-worktrees\meliora-product-experience-v2`
 > follow-up 分支：`codex/wp7b-clean-git-status`
 
@@ -89,7 +89,7 @@ VISUAL_DENSITY: 7
 - [x] PR #52 合并并完成可回滚部署与生产 read-back：release `7e0cac8c`，旧 release `59dc1008` 保留；健康、回环监听、服务状态与公网五档首屏通过。
 - [x] 真实 Provider canary 完成 `POST -> Nginx -> Server -> Command -> Provider -> git_status -> SSE -> UI`；一次 POST、Receipt/verification/终态完整，未发生重复请求。
 - [x] 定位生产配置阻塞：网关模型目录只支持 `deepseek-v4-pro` / `deepseek-v4-flash`，旧 `deepseek-chat` 不受支持；已备份环境文件并切换 `deepseek-v4-pro`，服务健康。
-- [ ] 交付 clean Git status follow-up：空 porcelain 必须成为模型可理解的固定安全事实；不再追加付费 Provider 请求，以无密钥 fixture、CI 与生产只读 read-back 收口。
+- [x] PR #53 交付 clean Git status follow-up 并完成可回滚部署：空 porcelain 成为模型可理解、可重复的固定安全事实；未追加付费 Provider 请求，以无密钥 fixture、CI、独立公开输出复审与生产五档只读 read-back 收口。
 
 ## 根因链与 Candidate 证据
 
@@ -112,4 +112,6 @@ follow-up：仅在工具成功、verification passed、artifact/content 均为�
 - `verify:product-browser` 通过：1440/1100/1099/768/390、建议仅预填、零 POST、移动运行面板可达。
 - 最终回答 projector 对任意非空 private observation 的原文、紧凑形式、percent、Base64 与 Base64url 回显 fail closed；短值嵌入用例已覆盖。
 - Terra high 三路复审均通过：视觉/交互、响应式/Harmony 兼容代码面、Public output contract 无剩余 P0/P1/P2。
+- PR #53 follow-up 的 Public output contract 复审在修复 binary/truncated/非零字节误判后 APPROVE，无剩余 P0/P1/P2；CI `e3-characterization` 与 `web-live-browser` 通过。
+- 生产 release `81429e9b`：服务 active、`NRestarts=0`、API 仅监听 `127.0.0.1:8787`、`/api/health` 正常；公网 1440/1100/1099/768/390 均 200、零 POST、无横向溢出和内部演示残留。
 - HarmonyOS API 26 仍只具备兼容代码与浏览器模拟证据，真机验收保持 Pending。
